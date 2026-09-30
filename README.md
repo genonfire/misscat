@@ -55,25 +55,55 @@ MissCat resolves `sol` as:
 
 Running `misscat` with no arguments shows usage help.
 
+Repository names are canonicalized to lowercase for local workspace and state identity, so these refer to the same repository:
+
+```text
+Genonfire/MissCat
+genonfire/misscat
+```
+
 ## Configuration
 
 MissCat ships with a bundled `default.yml`.
 
-Local profiles live in:
+Local profiles and per-repository review state live in:
 
 ```text
 ~/.config/misscat/
 ├── sol.yml
 ├── sonnet.yml
-└── state.json
+├── genonfire__typewriter.json
+└── genonfire__misscat.json
 ```
+
+A repository such as:
+
+```text
+genonfire/typewriter
+```
+
+uses:
+
+```text
+~/.config/misscat/genonfire__typewriter.json
+```
+
+Review state is tracked by:
+
+```text
+PR + HEAD SHA + profile
+```
+
+The same HEAD is reviewed only once with the same profile, but may be reviewed again with a different profile.
+
+The old global `~/.config/misscat/state.json` is not used.
 
 Example `default.yml`:
 
 ```yaml
 reviewer:
   provider: claude
-  model: sonnet
+  model: claude-sonnet-5-5
 
 prompt: |
   Read REVIEW.md and act as the first reviewer.
@@ -83,7 +113,7 @@ watch:
   active: [300, 240, 180, 120, 60]
 
 review:
-  include_drafts: false
+  include_drafts: true
 ```
 
 Example `~/.config/misscat/sol.yml`:
@@ -96,7 +126,55 @@ reviewer:
 
 The selected local profile overrides the bundled defaults.
 
-MissCat stores reviewed state in `~/.config/misscat/state.json`, keyed by repository, PR, HEAD SHA, and profile. This means the same commit can still be reviewed again with a different profile.
+## Review workspace
+
+MissCat does not review from your normal development checkout.
+
+Each repository gets its own persistent workspace:
+
+```text
+~/.cache/misscat/repos/
+└── <owner>/
+    └── <repo>/
+```
+
+For example:
+
+```text
+~/.cache/misscat/repos/genonfire/typewriter/
+```
+
+The repository is cloned only on first use. Later reviews reuse the same workspace.
+
+Before every review, MissCat:
+
+```text
+fetches the PR HEAD
+→ removes leftovers from the previous review
+→ checks out the fetched commit in detached mode
+→ verifies the exact HEAD SHA
+→ runs the reviewer
+```
+
+Fork PRs are fetched through GitHub's PR ref.
+
+Your normal working tree is never modified, so another tool may edit files or switch branches there without affecting the review.
+
+## Authentication
+
+MissCat uses the authentication already configured for Git, GitHub CLI, and the selected reviewer CLI.
+
+GitHub repository discovery uses `gh`.
+
+Persistent review workspaces use Git for clone and fetch operations, so Git must also be able to authenticate to the repository.
+
+If you use HTTPS and rely on GitHub CLI authentication, run:
+
+```bash
+gh auth setup-git
+```
+
+MissCat does not store Git credentials, GitHub tokens, or AI API keys itself.
 
 ## Reviewer backends
 
@@ -107,11 +185,19 @@ Initial backends:
 - Claude Code CLI
 - Codex CLI
 
-MissCat uses the authentication already configured in those CLIs.
+Reviewer CLIs run inside the isolated checkout of the exact PR HEAD.
 
-GitHub repository and pull request access is handled through the authenticated GitHub CLI (`gh`).
+The review behavior itself is defined by your prompt and repository instructions such as `REVIEW.md`. MissCat does not interpret review results or decide what counts as an approval or blocker.
 
-MissCat does not manage GitHub tokens or AI API keys itself.
+MissCat considers the review successful when the reviewer CLI exits successfully.
+
+## Trust boundary
+
+Reviewer CLIs run inside a checkout containing files controlled by the pull request.
+
+Use MissCat only with repositories and pull requests whose contents you trust.
+
+MissCat does not add a separate permission or fork-blocking layer.
 
 ## Adaptive polling
 
@@ -129,9 +215,28 @@ After review work is complete, MissCat gives the author some time to make change
 
 MissCat runs one review at a time.
 
-When a review finishes successfully, it immediately checks the repository again before sleeping. If another PR or new HEAD is waiting, it reviews that next. The adaptive timer starts only when there is nothing left to review.
+When a review finishes successfully, it immediately checks the repository again before sleeping. If another PR or new HEAD is waiting, it reviews that next.
 
-If a reviewer exits unsuccessfully, that HEAD is not marked reviewed and MissCat waits 5 minutes before checking again.
+The adaptive timer starts only when there is nothing left to review.
+
+If a review or workspace preparation fails, that HEAD is not marked reviewed and MissCat waits 5 minutes before checking again.
+
+## One cat per repository
+
+MissCat is intentionally single-threaded.
+
+Run at most **one MissCat process per repository**.
+
+Different repositories may run independently, but running the same repository simultaneously with multiple profiles is not supported because they would share the same review workspace and state.
+
+```text
+repository
+├── one MissCat process
+├── one review workspace
+└── one state file
+```
+
+One cat, one repository, one review at a time.
 
 ## What MissCat does
 
@@ -139,8 +244,11 @@ If a reviewer exits unsuccessfully, that HEAD is not marked reviewed and MissCat
 - Discovers PRs created after MissCat starts
 - Detects changes by PR HEAD SHA
 - Reviews every new PR HEAD once per profile
+- Supports draft PR reviews
 - Avoids duplicate reviews
 - Remembers reviewed commits across restarts
+- Uses a persistent isolated review workspace
+- Verifies the exact PR HEAD before reviewing
 - Supports multiple reviewer backends
 
 MissCat does **not** modify code, push commits, or merge PRs.
