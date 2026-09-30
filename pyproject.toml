@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "misscat"
+version = "0.1.0"
+description = "Watch GitHub pull requests and run local AI code reviews"
+requires-python = ">=3.10"
+dependencies = ["PyYAML>=6.0"]
+
+[project.scripts]
+misscat = "misscat:main"
+
+[tool.setuptools]
+py-modules = ["misscat"]
+
+[tool.setuptools.data-files]
+"share/misscat" = ["default.yml"]

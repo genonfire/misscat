@@ -1,0 +1,13 @@
+reviewer:
+  provider: claude   # claude | codex
+  model: claude-sonnet-5-5
+
+prompt: |
+  Read REVIEW.md and act as the first reviewer.
+
+watch:
+  idle: [60, 120, 180, 240, 300]     # seconds; used while nothing has been reviewed yet
+  active: [300, 240, 180, 120, 60]   # seconds; used after a PR HEAD has been reviewed
+
+review:
+  include_drafts: true
