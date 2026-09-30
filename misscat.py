@@ -344,35 +344,58 @@ def build_prompt(settings: Settings, repo: str, pr: PullRequest) -> str:
 
 def reviewer_command(settings: Settings, prompt: str) -> list[str]:
     if settings.provider == "claude":
-        return [
-            "claude",
-            "-p",
-            prompt,
-            "--model",
-            settings.model,
-            "--permission-mode",
-            "plan",
-        ]
-    return [
-        "codex",
-        "exec",
-        "--model",
-        settings.model,
-        "--sandbox",
-        "read-only",
-        "--ask-for-approval",
-        "never",
-        prompt,
-    ]
+        return ["claude", "-p", prompt, "--model", settings.model]
+    return ["codex", "exec", "--model", settings.model, prompt]
+
+
+def _run_checked(command: list[str], cwd: Path | None = None) -> str:
+    try:
+        result = subprocess.run(
+            command,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        raise GhError(f"could not run {' '.join(command[:3])}: {exc}") from exc
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"command exited with status {result.returncode}"
+        raise GhError(detail)
+    return result.stdout.strip()
+
+
+def prepare_review_workspace(repo: str, pr: PullRequest, parent: Path) -> Path:
+    """Clone the target repository and check out exactly the observed PR HEAD."""
+    checkout = parent / "repository"
+    _run_checked(
+        ["gh", "repo", "clone", repo, str(checkout), "--", "--depth=1"]
+    )
+    _run_checked(
+        ["gh", "pr", "checkout", str(pr.number), "--repo", repo, "--detach"],
+        cwd=checkout,
+    )
+    actual_head = _run_checked(["git", "rev-parse", "HEAD"], cwd=checkout)
+    if actual_head.lower() != pr.head_sha.lower():
+        raise GhError(
+            f"PR #{pr.number} changed while preparing its review "
+            f"(expected {pr.head_sha}, checked out {actual_head})"
+        )
+    return checkout
 
 
 def run_reviewer(settings: Settings, repo: str, pr: PullRequest) -> bool:
     """Wait for the configured reviewer CLI; success means a zero exit status."""
     command = reviewer_command(settings, build_prompt(settings, repo, pr))
     try:
-        result = subprocess.run(command, stdin=subprocess.DEVNULL)
-    except OSError as exc:
-        log.error("cannot start %s: %s", command[0], exc)
+        with tempfile.TemporaryDirectory(prefix="misscat-review-") as temp_dir:
+            checkout = prepare_review_workspace(repo, pr, Path(temp_dir))
+            result = subprocess.run(
+                command,
+                cwd=checkout,
+                stdin=subprocess.DEVNULL,
+            )
+    except (OSError, GhError) as exc:
+        log.error("could not prepare or start review for PR #%d: %s", pr.number, exc)
         return False
     if result.returncode != 0:
         log.error("%s exited with status %d", command[0], result.returncode)
