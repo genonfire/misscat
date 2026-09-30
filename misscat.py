@@ -4,8 +4,13 @@
 Watches a GitHub repository and runs an AI review once for every new PR HEAD.
 Single-threaded: one review at a time, then an immediate re-check before sleeping.
 
-Each review runs the reviewer CLI inside a MissCat-owned checkout of the exact PR HEAD
-(~/.cache/misscat/repos/<owner>/<repo>/); your own working tree is never touched.
+Each review runs the reviewer CLI inside a MissCat-owned checkout of the exact PR HEAD;
+your own working tree is never touched.
+
+Local layout (repository names are canonicalized to lowercase)
+  ~/.config/misscat/<profile>.yml          reviewer profiles
+  ~/.config/misscat/<owner>__<repo>.json   reviewed HEADs of one repository (PR + HEAD + profile)
+  ~/.cache/misscat/repos/<owner>/<repo>/   persistent review workspace
 
 Requirements and limits
 - Git must be able to authenticate to the reviewed repository. Existing Git/SSH auth is
@@ -36,10 +41,10 @@ import yaml
 log = logging.getLogger("misscat")
 
 CONFIG_DIR = Path.home() / ".config" / "misscat"
-STATE_FILE = CONFIG_DIR / "state.json"
 WORKSPACE_ROOT = Path.home() / ".cache" / "misscat" / "repos"
 DEFAULT_CONFIG = Path(__file__).with_name("default.yml")
-REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+OWNER_RE = re.compile(r"^[A-Za-z0-9-]+$")  # no "_": keeps the "__" in state filenames unambiguous
+NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 PROVIDERS = ("claude", "codex")
 FAILURE_WAIT = 300.0  # seconds to wait after an unsuccessful reviewer before checking again
 
@@ -181,17 +186,34 @@ def gh_open_prs(repo: str) -> list[PR]:
         raise GhError(f"unexpected gh output: {exc}") from exc
 
 
+# --------------------------------------------------------------------------- repository identity
+
+
+def canonical_repo(repo: str) -> str:
+    """Validate owner/repo and return the lowercase form used for all local identity.
+
+    GitHub names are case-insensitive, so Genonfire/MissCat and genonfire/misscat must
+    share one workspace and one state file on every platform.
+    """
+    owner, sep, name = repo.partition("/")
+    if not sep or not OWNER_RE.match(owner) or not NAME_RE.match(name) or name in (".", ".."):
+        raise MissCatError(f"repository must look like owner/repo: {repo!r}")
+    return f"{owner}/{name}".lower()
+
+
+def state_path(repo: str) -> Path:
+    owner, name = canonical_repo(repo).split("/")
+    return CONFIG_DIR / f"{owner}__{name}.json"
+
+
 # --------------------------------------------------------------------------- workspace
 
 
-def _valid_repo(repo: str) -> bool:
-    return bool(REPO_RE.match(repo)) and all(part not in (".", "..") for part in repo.split("/"))
-
-
 def workspace_path(repo: str) -> Path:
-    if not _valid_repo(repo):
-        raise WorkspaceError(f"invalid repository: {repo!r}")
-    owner, name = repo.split("/")
+    try:
+        owner, name = canonical_repo(repo).split("/")
+    except MissCatError as exc:
+        raise WorkspaceError(str(exc)) from exc
     return WORKSPACE_ROOT / owner / name
 
 
@@ -310,48 +332,49 @@ def run_cli_reviewer(settings: Settings, repo: str, pr: PR) -> bool:
 
 
 class Key(NamedTuple):
-    repo: str
     pr: int
     head: str
     profile: str | None  # None = bundled default, kept distinct from a profile named "default"
 
 
 class State:
-    """Successfully reviewed HEADs, stored in ~/.config/misscat/state.json.
+    """Successfully reviewed HEADs of one repository (~/.config/misscat/<owner>__<repo>.json).
 
-    Only completions are stored: a HEAD that is absent (failed, interrupted, never run)
-    is eligible for review. Each operation re-reads the file before writing so several
-    misscat processes (other repos or profiles) do not overwrite each other's records.
+    The repository is identified by the filename, so a record is PR + HEAD + profile.
+    Only completions are stored: a HEAD that is absent (failed, interrupted, never run) is
+    eligible for review. Loaded once at start; every successful review rewrites the file
+    atomically. One repository = one MissCat process = one state file, so there is no
+    locking and no merging.
     """
 
     def __init__(self, path: Path):
         self.path = path
+        self._reviewed = self._load()
 
-    def reviewed(self) -> set[Key]:
+    def _load(self) -> set[Key]:
         if not self.path.exists():
             return set()
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
-            return {Key(r["repo"], int(r["pr"]), r["head"], r["profile"]) for r in raw["reviewed"]}
+            return {Key(int(r["pr"]), r["head"], r["profile"]) for r in raw["reviewed"]}
         except (OSError, ValueError, KeyError, TypeError) as exc:
             raise StateError(
                 f"unreadable state file {self.path} ({exc}); fix or delete it to continue"
             ) from exc
 
-    def _write(self, keys: set[Key]) -> None:
+    def reviewed(self) -> set[Key]:
+        return self._reviewed
+
+    def add(self, key: Key) -> None:
+        self._reviewed.add(key)
+        rows = sorted(self._reviewed, key=lambda k: (k.pr, k.head, k.profile or ""))
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        rows = sorted(keys, key=lambda k: (k.repo, k.pr, k.head, k.profile or ""))
         tmp = self.path.with_name(self.path.name + ".tmp")
         tmp.write_text(
             json.dumps({"version": 1, "reviewed": [k._asdict() for k in rows]}, indent=2),
             encoding="utf-8",
         )
         os.replace(tmp, self.path)
-
-    def add(self, key: Key) -> None:
-        keys = self.reviewed()
-        keys.add(key)
-        self._write(keys)
 
 
 # --------------------------------------------------------------------------- watcher
@@ -410,7 +433,7 @@ class Watcher:
             self.sleep(FAILURE_WAIT)
 
     def _key(self, pr: PR) -> Key:
-        return Key(self.repo, pr.number, pr.head, self.profile)
+        return Key(pr.number, pr.head, self.profile)
 
     def _next_reviewable(self, prs: list[PR], done: set[Key]) -> PR | None:
         waiting = [
@@ -475,17 +498,15 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
                         datefmt="%H:%M:%S")
     try:
-        if not _valid_repo(args.repo):
-            raise MissCatError(f"repository must look like owner/repo: {args.repo!r}")
+        repo = canonical_repo(args.repo)  # canonicalize once; everything below uses this form
         settings = load_settings(args.profile)
         for tool in ("git", "gh", settings.provider):
             if shutil.which(tool) is None:
                 raise MissCatError(f"required CLI not found on PATH: {tool}")
-        state = State(STATE_FILE)
-        state.reviewed()  # fail early on a corrupt state file
-        log.info("watching %s with %s/%s (profile: %s)", args.repo, settings.provider,
+        state = State(state_path(repo))  # fails early on a corrupt state file
+        log.info("watching %s with %s/%s (profile: %s)", repo, settings.provider,
                  settings.model, args.profile or "default")
-        Watcher(args.repo, args.profile, settings, state, gh_open_prs, run_cli_reviewer).run_forever()
+        Watcher(repo, args.profile, settings, state, gh_open_prs, run_cli_reviewer).run_forever()
     except MissCatError as exc:
         print(f"misscat: {exc}", file=sys.stderr)
         return 2
