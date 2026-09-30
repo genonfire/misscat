@@ -3,6 +3,18 @@
 
 Watches a GitHub repository and runs an AI review once for every new PR HEAD.
 Single-threaded: one review at a time, then an immediate re-check before sleeping.
+
+Each review runs the reviewer CLI inside a MissCat-owned checkout of the exact PR HEAD
+(~/.cache/misscat/repos/<owner>/<repo>/); your own working tree is never touched.
+
+Requirements and limits
+- Git must be able to authenticate to the reviewed repository. Existing Git/SSH auth is
+  fine; HTTPS users relying on GitHub CLI should run `gh auth setup-git`. MissCat never
+  stores Git credentials.
+- Reviewer CLIs run inside a checkout of PR-controlled files: use MissCat only with
+  repositories and pull requests whose contents you trust.
+- Run at most one MissCat process per repository. Several profiles on the same repository
+  would share and modify the same review workspace.
 """
 from __future__ import annotations
 
@@ -25,6 +37,7 @@ log = logging.getLogger("misscat")
 
 CONFIG_DIR = Path.home() / ".config" / "misscat"
 STATE_FILE = CONFIG_DIR / "state.json"
+WORKSPACE_ROOT = Path.home() / ".cache" / "misscat" / "repos"
 DEFAULT_CONFIG = Path(__file__).with_name("default.yml")
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 PROVIDERS = ("claude", "codex")
@@ -45,6 +58,10 @@ class StateError(MissCatError):
 
 class GhError(Exception):
     pass
+
+
+class WorkspaceError(Exception):
+    """Review preparation failed; handled like a failed reviewer."""
 
 
 # --------------------------------------------------------------------------- config
@@ -164,6 +181,88 @@ def gh_open_prs(repo: str) -> list[PR]:
         raise GhError(f"unexpected gh output: {exc}") from exc
 
 
+# --------------------------------------------------------------------------- workspace
+
+
+def _valid_repo(repo: str) -> bool:
+    return bool(REPO_RE.match(repo)) and all(part not in (".", "..") for part in repo.split("/"))
+
+
+def workspace_path(repo: str) -> Path:
+    if not _valid_repo(repo):
+        raise WorkspaceError(f"invalid repository: {repo!r}")
+    owner, name = repo.split("/")
+    return WORKSPACE_ROOT / owner / name
+
+
+def _run(cmd: list[str], cwd: Path | None = None) -> str:
+    try:
+        proc = subprocess.run(
+            cmd, cwd=cwd, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},  # fail instead of waiting for a password
+        )
+    except OSError as exc:
+        raise WorkspaceError(f"{cmd[0]}: {exc}") from exc
+    if proc.returncode != 0:
+        raise WorkspaceError(f"{' '.join(cmd[:3])} failed: {proc.stderr.strip()[-300:]}")
+    return proc.stdout.strip()
+
+
+def _git(args: list[str], cwd: Path) -> str:
+    return _run(["git", *args], cwd)
+
+
+def _clone(repo: str, path: Path) -> None:
+    _run(["gh", "repo", "clone", repo, str(path)])  # follows gh's configured protocol (https/ssh)
+
+
+def _usable(path: Path) -> bool:
+    if not (path / ".git").exists():
+        return False
+    try:
+        _git(["rev-parse", "--git-dir"], path)
+    except WorkspaceError:
+        return False
+    return True
+
+
+def _remove(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    else:
+        shutil.rmtree(path)
+
+
+def prepare_workspace(repo: str, pr: PR) -> Path:
+    """Return a clean checkout of exactly pr.head, cloning only on first use."""
+    path = workspace_path(repo)
+    try:
+        if path.exists() and not _usable(path):
+            log.warning("%s is not a usable git repository, recreating it", path)
+            _remove(path)
+        if not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            log.info("cloning %s into %s", repo, path)
+            try:
+                _clone(repo, path)
+            except BaseException:  # incl. Ctrl-C: never leave a half-cloned workspace behind
+                shutil.rmtree(path, ignore_errors=True)
+                raise
+        _git(["fetch", "origin", f"refs/pull/{pr.number}/head"], path)  # works for fork PRs
+        _git(["reset", "--hard"], path)
+        _git(["clean", "-ffdx"], path)  # drop leftovers of the previous reviewer, ignored files too
+        _git(["checkout", "--detach", "FETCH_HEAD"], path)
+        head = _git(["rev-parse", "HEAD"], path)
+    except OSError as exc:
+        raise WorkspaceError(str(exc)) from exc
+    if head != pr.head:
+        raise WorkspaceError(
+            f"PR #{pr.number} changed during preparation ({pr.head[:7]} -> {head[:7]}); "
+            "the next poll will pick up the new HEAD"
+        )
+    return path
+
+
 # --------------------------------------------------------------------------- reviewer
 # Minimal backend so the watcher is runnable. Issue #2 owns the real design
 # (permissions, result posting, per-provider flags).
@@ -179,17 +278,23 @@ def build_prompt(settings: Settings, repo: str, pr: PR) -> str:
         f"Repository: {repo}\n"
         f"Pull request: #{pr.number} ({pr.url})\n"
         f"HEAD SHA: {pr.head}\n"
+        "The current directory is a checkout of exactly this HEAD.\n"
         "Review exactly this HEAD. Do not modify code, push commits, or merge."
     )
     return f"{settings.prompt.strip()}\n\n{context}"
 
 
 def run_cli_reviewer(settings: Settings, repo: str, pr: PR) -> bool:
-    """Run the reviewer CLI and wait for it to finish. True only on a clean exit."""
+    """Prepare the workspace, run the reviewer CLI in it and wait. True only on a clean exit."""
+    try:
+        workspace = prepare_workspace(repo, pr)
+    except WorkspaceError as exc:
+        log.error("PR #%d: workspace preparation failed: %s", pr.number, exc)
+        return False
     cmd = COMMANDS[settings.provider](settings.model, build_prompt(settings, repo, pr))
     try:
         proc = subprocess.run(
-            cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            cmd, cwd=workspace, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True,
         )
     except OSError as exc:
@@ -349,7 +454,16 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="misscat",
         description="Watch a GitHub repository and run an AI review on every new PR HEAD.",
-        epilog="profile is a name: 'sol' loads ~/.config/misscat/sol.yml over the defaults.",
+        epilog=(
+            "profile is a name: 'sol' loads ~/.config/misscat/sol.yml over the defaults.\n\n"
+            "Requirements and limits:\n"
+            "  - Git must authenticate to the repository (Git/SSH auth, or run\n"
+            "    `gh auth setup-git` for HTTPS). MissCat stores no credentials.\n"
+            "  - Reviewers run inside a checkout of PR-controlled files: use MissCat only\n"
+            "    with repositories and pull requests you trust.\n"
+            "  - Run at most one MissCat process per repository."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("repo", metavar="owner/repo")
     parser.add_argument("profile", metavar="profile", nargs="?")
@@ -361,10 +475,10 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
                         datefmt="%H:%M:%S")
     try:
-        if not REPO_RE.match(args.repo):
+        if not _valid_repo(args.repo):
             raise MissCatError(f"repository must look like owner/repo: {args.repo!r}")
         settings = load_settings(args.profile)
-        for tool in ("gh", settings.provider):
+        for tool in ("git", "gh", settings.provider):
             if shutil.which(tool) is None:
                 raise MissCatError(f"required CLI not found on PATH: {tool}")
         state = State(STATE_FILE)
