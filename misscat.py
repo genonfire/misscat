@@ -248,14 +248,6 @@ class State:
         keys.add(key)
         self._write(keys)
 
-    def prune(self, repo: str, profile: str | None, open_numbers: set[int]) -> None:
-        """Forget PRs of this repo/profile that are no longer open."""
-        keys = self.reviewed()
-        kept = {k for k in keys if not (k.repo == repo and k.profile == profile
-                                        and k.pr not in open_numbers)}
-        if kept != keys:
-            self._write(kept)
-
 
 # --------------------------------------------------------------------------- watcher
 
@@ -301,7 +293,6 @@ class Watcher:
             log.warning("cannot list PRs: %s", exc)
             self._sleep_adaptive()
             return
-        self.state.prune(self.repo, self.profile, {p.number for p in prs})
         if not prs and self.mode == ACTIVE:
             self.mode, self.step = IDLE, 0
         pr = self._next_reviewable(prs, self.state.reviewed())
