@@ -83,7 +83,7 @@ watch:
   active: [300, 240, 180, 120, 60]
 
 review:
-  include_drafts: false
+  include_drafts: true
 ```
 
 Example `~/.config/misscat/sol.yml`:
@@ -109,9 +109,13 @@ Initial backends:
 
 MissCat uses the authentication already configured in those CLIs.
 
+Reviewers run non-interactively. Before starting MissCat, configure the selected CLI to perform the workflow in the configured prompt and `REVIEW.md` without interactive approval, including any `gh` commands needed to submit the review. MissCat uses the CLI's existing permission settings and does not bypass them. If a required action is not permitted, the review remains incomplete and will be retried after five minutes.
+
 GitHub repository and pull request access is handled through the authenticated GitHub CLI (`gh`).
 
 MissCat does not manage GitHub tokens or AI API keys itself.
+
+Each review runs from a temporary checkout of the requested repository and PR HEAD, so it does not depend on the directory where MissCat was started.
 
 ## Adaptive polling
 
