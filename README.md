@@ -27,7 +27,7 @@ nothing changed
 
 No webhook server.  
 No API keys stored by MissCat.  
-No repeated review of the same commit.
+No repeated review of the same commit with the same profile.
 
 ## Usage
 
@@ -44,20 +44,28 @@ misscat genonfire/misscat
 Use a local reviewer profile:
 
 ```bash
-misscat genonfire/misscat sol.yml
+misscat genonfire/misscat sol
 ```
+
+MissCat resolves `sol` as:
+
+```text
+~/.config/misscat/sol.yml
+```
+
+Running `misscat` with no arguments shows usage help.
 
 ## Configuration
 
-The repository contains a committed `default.yml`.
+MissCat ships with a bundled `default.yml`.
 
-Local profiles live in `.config/`, which should be ignored by Git.
+Local profiles live in:
 
 ```text
-misscat/
-├── default.yml
-└── .config/
-    └── sol.yml
+~/.config/misscat/
+├── sol.yml
+├── sonnet.yml
+└── state.json
 ```
 
 Example `default.yml`:
@@ -78,7 +86,7 @@ review:
   include_drafts: false
 ```
 
-Example `.config/sol.yml`:
+Example `~/.config/misscat/sol.yml`:
 
 ```yaml
 reviewer:
@@ -86,7 +94,9 @@ reviewer:
   model: gpt-6-sol
 ```
 
-The selected local profile overrides `default.yml`.
+The selected local profile overrides the bundled defaults.
+
+MissCat stores reviewed state in `~/.config/misscat/state.json`, keyed by repository, PR, HEAD SHA, and profile. This means the same commit can still be reviewed again with a different profile.
 
 ## Reviewer backends
 
@@ -111,20 +121,24 @@ When there are no open PRs, MissCat gradually becomes lazy:
 1m → 2m → 3m → 4m → 5m → 5m ...
 ```
 
-After reviewing a PR, MissCat gives the author some time to make changes, then gets increasingly impatient:
+After review work is complete, MissCat gives the author some time to make changes, then gets increasingly impatient:
 
 ```text
 5m → 4m → 3m → 2m → 1m → 1m ...
 ```
 
-When a new commit is detected and reviewed, the cycle starts again.
+MissCat runs one review at a time.
+
+When a review finishes successfully, it immediately checks the repository again before sleeping. If another PR or new HEAD is waiting, it reviews that next. The adaptive timer starts only when there is nothing left to review.
+
+If a reviewer exits unsuccessfully, that HEAD is not marked reviewed and MissCat waits 5 minutes before checking again.
 
 ## What MissCat does
 
 - Watches all open PRs in a repository
 - Discovers PRs created after MissCat starts
 - Detects changes by PR HEAD SHA
-- Reviews every new PR HEAD once
+- Reviews every new PR HEAD once per profile
 - Avoids duplicate reviews
 - Remembers reviewed commits across restarts
 - Supports multiple reviewer backends
