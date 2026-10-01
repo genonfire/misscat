@@ -13,6 +13,8 @@ reviewer:
     - -c
     - sandbox_workspace_write.network_access=true
     - -c
+    - apps._default.enabled=false
+    - -c
     - model_reasoning_effort=medium
 
   # provider: codex
@@ -23,10 +25,13 @@ reviewer:
   #   - -c
   #   - sandbox_workspace_write.network_access=true
   #   - -c
+  #   - apps._default.enabled=false
+  #   - -c
   #   - model_reasoning_effort=max
 
 prompt: |
-  Read REVIEW.md and act as the first reviewer.
+  Read REVIEW.md if exist and act as the 1st reviewer.
+  Use the gh CLI for GitHub operations, including posting the review.
 
 watch:
   idle: [60, 120, 180, 240, 300]     # seconds; used while nothing has been reviewed yet

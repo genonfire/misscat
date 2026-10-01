@@ -298,11 +298,190 @@ def prepare_workspace(repo: str, pr: PR) -> Path:
 # --------------------------------------------------------------------------- reviewer
 
 # reviewer.args go before the prompt so a variadic option such as
-# `--allowedTools A B` cannot swallow it.
+# `--allowedTools A B` cannot swallow it. Structured output flags are
+# MissCat's internal transport: profiles do not need to specify them.
 COMMANDS: dict[str, Callable[[str, str, list[str]], list[str]]] = {
-    "claude": lambda model, prompt, args: ["claude", *args, "-p", prompt, "--model", model],
-    "codex": lambda model, prompt, args: ["codex", "exec", *args, "--model", model, prompt],
+    "claude": lambda model, prompt, args: [
+        "claude", *args, "-p", prompt, "--model", model,
+        "--output-format", "stream-json", "--verbose",
+    ],
+    "codex": lambda model, prompt, args: [
+        "codex", "exec", "--json", *args, "--model", model, prompt,
+    ],
 }
+
+
+def _short(value, limit: int = 120) -> str:
+    """Collapse a value to one short log line."""
+    text = " ".join(str(value or "").split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _mcp_name(item: dict) -> str:
+    server = item.get("server") or item.get("server_name")
+    tool = item.get("tool") or item.get("tool_name") or item.get("name")
+    if server and tool:
+        return f"{server}.{tool}"
+    return str(tool or server or "mcp")
+
+
+def _log_codex_event(event: dict) -> None:
+    """Log progress from `codex exec --json` without dumping tool output."""
+    kind = event.get("type")
+
+    if kind == "turn.started":
+        log.info("reviewer: working")
+        return
+    if kind == "turn.failed":
+        error = event.get("error") or {}
+        log.error("reviewer: %s", _short(error.get("message") or "turn failed"))
+        return
+    if kind == "error":
+        log.error("reviewer: %s", _short(event.get("message") or event.get("error") or "error"))
+        return
+    if kind == "turn.completed":
+        usage = event.get("usage") or {}
+        if usage:
+            log.info(
+                "reviewer: turn done (input=%s, output=%s)",
+                usage.get("input_tokens", "?"),
+                usage.get("output_tokens", "?"),
+            )
+        else:
+            log.info("reviewer: turn done")
+        return
+
+    if kind not in ("item.started", "item.completed"):
+        return
+
+    item = event.get("item") or {}
+    item_type = item.get("type")
+
+    if kind == "item.started":
+        if item_type == "command_execution":
+            log.info("exec: %s", _short(item.get("command") or "command"))
+        elif item_type == "mcp_tool_call":
+            log.info("mcp: %s started", _mcp_name(item))
+        elif item_type == "web_search":
+            query = _short(item.get("query"))
+            log.info("web search: %s", query or "started")
+        return
+
+    if item_type == "command_execution":
+        status = item.get("status") or "completed"
+        exit_code = item.get("exit_code")
+        suffix = f" ({exit_code})" if exit_code is not None else ""
+        if status == "failed" or (isinstance(exit_code, int) and exit_code != 0):
+            log.warning("exec: %s%s", status, suffix)
+        else:
+            log.info("exec: %s%s", status, suffix)
+    elif item_type == "mcp_tool_call":
+        status = item.get("status") or "completed"
+        if status == "failed":
+            log.warning("mcp: %s failed", _mcp_name(item))
+        else:
+            log.info("mcp: %s %s", _mcp_name(item), status)
+    elif item_type == "web_search":
+        log.info("web search: completed")
+
+
+def _claude_tool_label(name: str, tool_input) -> str:
+    if not isinstance(tool_input, dict):
+        return name
+    detail = (
+        tool_input.get("command")
+        or tool_input.get("file_path")
+        or tool_input.get("path")
+        or tool_input.get("query")
+        or tool_input.get("pattern")
+    )
+    return f"{name}: {_short(detail)}" if detail else name
+
+
+def _log_claude_event(event: dict, tool_names: dict[str, str]) -> None:
+    """Log progress from Claude Code stream-json without dumping message bodies."""
+    kind = event.get("type")
+
+    if kind == "system" and event.get("subtype") == "init":
+        log.info("reviewer: claude initialized")
+        return
+
+    if kind == "assistant":
+        message = event.get("message") or {}
+        for block in message.get("content") or []:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            name = str(block.get("name") or "tool")
+            tool_id = block.get("id")
+            if tool_id:
+                tool_names[str(tool_id)] = name
+            log.info("tool: %s", _claude_tool_label(name, block.get("input")))
+        return
+
+    if kind == "user":
+        message = event.get("message") or {}
+        for block in message.get("content") or []:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            tool_id = str(block.get("tool_use_id") or "")
+            name = tool_names.get(tool_id, "tool")
+            if block.get("is_error"):
+                log.warning("tool: %s failed", name)
+            else:
+                log.info("tool: %s completed", name)
+        return
+
+    if kind == "result":
+        if event.get("is_error"):
+            log.error("reviewer: claude result error")
+            return
+        turns = event.get("num_turns")
+        cost = event.get("total_cost_usd")
+        details = []
+        if turns is not None:
+            details.append(f"turns={turns}")
+        if isinstance(cost, (int, float)):
+            details.append(f"cost=${cost:.4f}")
+        log.info("reviewer: claude done%s", f" ({', '.join(details)})" if details else "")
+
+
+def _run_structured_reviewer(provider: str, cmd: list[str], workspace: Path) -> bool:
+    """Stream reviewer JSONL and expose only compact progress events."""
+    try:
+        proc = subprocess.Popen(
+            cmd, cwd=workspace, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, bufsize=1,
+        )
+    except OSError as exc:
+        log.error("cannot start %s: %s", cmd[0], exc)
+        return False
+
+    assert proc.stdout is not None
+    tail: list[str] = []
+    claude_tools: dict[str, str] = {}
+
+    for raw in proc.stdout:
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            tail.append(line)
+            tail = tail[-20:]
+            log.debug("%s: %s", provider, _short(line, 200))
+            continue
+        if provider == "codex":
+            _log_codex_event(event)
+        else:
+            _log_claude_event(event, claude_tools)
+
+    returncode = proc.wait()
+    if returncode != 0:
+        detail = " | ".join(tail)[-500:]
+        log.error("%s exited %d%s", cmd[0], returncode, f": {detail}" if detail else "")
+        return False
+    return True
 
 
 def build_prompt(settings: Settings, repo: str, pr: PR) -> str:
@@ -326,18 +505,7 @@ def run_cli_reviewer(settings: Settings, repo: str, pr: PR) -> bool:
     cmd = COMMANDS[settings.provider](
         settings.model, build_prompt(settings, repo, pr), list(settings.args)
     )
-    try:
-        proc = subprocess.run(
-            cmd, cwd=workspace, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, text=True,
-        )
-    except OSError as exc:
-        log.error("cannot start %s: %s", cmd[0], exc)
-        return False
-    if proc.returncode != 0:
-        log.error("%s exited %d: %s", cmd[0], proc.returncode, (proc.stdout or "").strip()[-500:])
-        return False
-    return True
+    return _run_structured_reviewer(settings.provider, cmd, workspace)
 
 
 # --------------------------------------------------------------------------- state

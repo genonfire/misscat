@@ -44,13 +44,13 @@ misscat genonfire/misscat
 Use a local reviewer profile:
 
 ```bash
-misscat genonfire/misscat sol
+misscat genonfire/misscat luna
 ```
 
-MissCat resolves `sol` as:
+MissCat resolves `luna` as:
 
 ```text
-~/.config/misscat/sol.yml
+~/.config/misscat/luna.yml
 ```
 
 Running `misscat` with no arguments shows usage help.
@@ -65,7 +65,7 @@ Local profiles and per-repository review state live in:
 
 ```text
 ~/.config/misscat/
-├── sol.yml
+├── luna.yml
 ├── sonnet.yml
 ├── genonfire__typewriter.json
 └── genonfire__misscat.json
@@ -89,10 +89,13 @@ reviewer:
     - -c
     - sandbox_workspace_write.network_access=true
     - -c
+    - apps._default.enabled=false
+    - -c
     - model_reasoning_effort=medium
 
 prompt: |
-  Read REVIEW.md and act as the first reviewer.
+  Read REVIEW.md if exist and act as the 1st reviewer.
+  Use the gh CLI for GitHub operations, including posting the review.
 
 watch:
   idle: [60, 120, 180, 240, 300]
@@ -113,6 +116,8 @@ reviewer:
     - workspace-write
     - -c
     - sandbox_workspace_write.network_access=true
+    - -c
+    - apps._default.enabled=false
     - -c
     - model_reasoning_effort=max
 ```
