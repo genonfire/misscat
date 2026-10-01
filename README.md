@@ -55,6 +55,39 @@ To upgrade MissCat to the latest version:
 pipx upgrade misscat
 ```
 
+## Releasing (maintainers)
+
+Releases are published to PyPI by `.github/workflows/publish.yml` when a `vMAJOR.MINOR.PATCH` tag is pushed. It uses PyPI [Trusted Publishing](https://docs.pypi.org/trusted-publishers/) (OIDC), so no PyPI token is stored in GitHub secrets.
+
+### One-time setup
+
+1. On PyPI, add a trusted publisher for the `misscat` project (Project → Publishing; for a first release use "Add a pending publisher"):
+   - Owner: `genonfire`
+   - Repository: `misscat`
+   - Workflow name: `publish.yml`
+   - Environment name: `pypi`
+2. In the GitHub repository, create an environment named `pypi` (Settings → Environments). Recommended: add required reviewers so every release needs a manual approval, and add a tag ruleset (Settings → Rules) so only maintainers can create `v*` tags. A deployment tag rule alone is not enough, since it matches the tag name, not the commit.
+
+### Release procedure
+
+1. Check that the version is not already on PyPI (versions are immutable and cannot be re-uploaded): <https://pypi.org/project/misscat/#history>
+2. Bump `version` in `pyproject.toml` **and** `__version__` in `src/misscat/__init__.py` (the workflow fails if they differ), then merge to `master`.
+3. Tag the merge commit and push the tag (the tag must equal `v` + the `pyproject.toml` version):
+
+   ```bash
+   git tag v1.0.1
+   git push origin v1.0.1
+   ```
+
+4. The workflow fails before publishing if the tagged commit is not on `master`, the tag is malformed, the tag does not match `pyproject.toml` or `__version__`, or `python -m build` / `twine check` fails.
+5. Confirm the release:
+
+   ```bash
+   pipx upgrade misscat
+   misscat --version
+   pip index versions misscat
+   ```
+
 ## Quick Start / First Run
 
 Watch a repository and review new PRs using the default profile:
