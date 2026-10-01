@@ -121,7 +121,7 @@ The selected local profile overrides the bundled defaults.
 
 When creating a local profile, use `default.yml` as the reference and specify `provider`, `model`, and `args` explicitly for that reviewer CLI. Do not rely on `args` inherited from a different provider.
 
-The `args` field under `reviewer` is passed to the selected reviewer CLI unchanged.`
+The `args` field under `reviewer` is passed to the selected reviewer CLI unchanged.
 
 Reviewed state is stored per repository and keyed by PR, HEAD SHA, and profile. The same HEAD can therefore be reviewed again with a different profile.
 
@@ -156,7 +156,8 @@ MissCat runs the selected reviewer CLI from the root of the prepared PR checkout
 
 MissCat does not parse or translate those instruction files.
 
-MissCat uses the authentication already configured in the reviewer CLI. `reviewer.args` can be used for CLI-specific execution options such as tool permissions, sandbox settings, or network access.
+MissCat uses the authentication already configured in the reviewer CLI.
+The `args` field under `reviewer` can be used for CLI-specific execution options such as tool permissions, sandbox settings, or network access.
 
 GitHub repository and pull request access is handled through the authenticated GitHub CLI (`gh`).
 
