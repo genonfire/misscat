@@ -1,4 +1,7 @@
 # MissCat
+[![PyPI](https://img.shields.io/pypi/v/misscat.svg)](https://pypi.org/project/misscat/)
+[![PyPI Downloads](https://img.shields.io/pypi/dm/misscat)](https://pypi.org/project/misscat/)
+[![Downloads](https://api.pepy.tech/badge/misscat)](https://pepy.tech/project/misscat)
 
 **Never miss a single commit.**
 
