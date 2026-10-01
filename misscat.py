@@ -450,6 +450,40 @@ def _log_claude_event(event: dict, tool_names: dict[str, str]) -> None:
         log.info("reviewer: claude done%s", f" ({', '.join(details)})" if details else "")
 
 
+def _log_gemini_event(event: dict) -> None:
+    kind = event.get("event")
+
+    if kind == "step_update":
+        step = event.get("step_update") or {}
+        step_type = step.get("step_type")
+        state = step.get("state")
+
+        if step_type == "agent_response" and state == "DONE":
+            log.info("reviewer: working")
+            return
+
+        if step_type == "tool" and state == "ACTIVE":
+            tool = step.get("tool_name") or "tool"
+            params = (step.get("tool_info") or {}).get("parameters") or {}
+            command = params.get("CommandLine")
+
+            if command:
+                log.info("reviewer: %s %s", tool, _short(command))
+            else:
+                log.info("reviewer: %s", tool)
+            return
+
+    if kind == "result":
+        result = event.get("result") or {}
+        usage = result.get("usage") or {}
+        total = usage.get("total_tokens")
+
+        if total is not None:
+            log.info("reviewer: done (tokens=%s)", total)
+        else:
+            log.info("reviewer: done")
+
+
 def _run_structured_reviewer(provider: str, cmd: list[str], workspace: Path) -> bool:
     """Stream reviewer JSONL and expose only compact progress events."""
     try:
@@ -485,6 +519,8 @@ def _run_structured_reviewer(provider: str, cmd: list[str], workspace: Path) -> 
             _log_codex_event(event)
         elif provider == "claude":
             _log_claude_event(event, claude_tools)
+        elif provider == "gemini":
+            _log_gemini_event(event)
 
     returncode = proc.wait()
     if returncode != 0:
