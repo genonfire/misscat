@@ -130,6 +130,46 @@ The `args` field under `reviewer` is passed to the selected reviewer CLI unchang
 
 Reviewed state is stored per repository and keyed by PR, HEAD SHA, and profile. The same HEAD can therefore be reviewed again with a different profile.
 
+### Gemini (Antigravity CLI)
+
+Gemini reviews use the Antigravity CLI (`agy`). Configure authentication and permissions before running MissCat.
+
+For headless reviews, configure the Antigravity CLI settings file:
+
+`~/.gemini/antigravity-cli/settings.json`
+
+```json
+{
+  "toolPermission": "proceed-in-sandbox",
+  "enableTerminalSandbox": true,
+  "permissions": {
+    "allow": [
+      "command(gh)",
+      "command(git)"
+    ]
+  }
+}
+```
+
+Preserve any existing settings when adding these fields. Ensure the repository workspace is trusted as appropriate.
+
+Example reviewer profile (`~/.config/misscat/gemini.yml`):
+
+```yaml
+reviewer:
+  provider: gemini
+  model: gemini-3.8-flash-low
+  args:
+    - --print-timeout
+    - 30m
+```
+
+**Important:** In headless mode, commands requiring interactive permission approval may be automatically denied. Antigravity can still exit successfully without posting a GitHub review.
+
+If a review finishes without appearing on GitHub, run MissCat with `--loud` to inspect reviewer activity and permission errors.
+
+Avoid `--dangerously-skip-permissions` for routine unattended operation, as it broadly bypasses tool approval checks.
+
 ## Review workspace
 
 MissCat reviews each repository in its own persistent workspace:
