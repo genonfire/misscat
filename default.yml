@@ -1,18 +1,27 @@
 reviewer:
-  provider: claude
-  model: claude-sonnet-5-5
-  args:
-    - --allowedTools
-    - "Bash(gh *)"
+  # provider: claude
+  # model: claude-sonnet-5-5
+  # args:
+  #   - --allowedTools
+  #   - "Bash(gh *)"
 
-# reviewer:
-#   provider: codex
-#   model: gpt-6-sol
-#   args:
-#     - --sandbox
-#     - workspace-write
-#     - -c
-#     - sandbox_workspace_write.network_access=true
+  provider: codex
+  model: gpt-6.1-sol
+  args:
+    - --sandbox
+    - workspace-write
+    - -c
+    - sandbox_workspace_write.network_access=true
+    - model_reasoning_effort=medium
+
+  # provider: codex
+  # model: gpt-6-luna
+  # args:
+  #   - --sandbox
+  #   - workspace-write
+  #   - -c
+  #   - sandbox_workspace_write.network_access=true
+  #   - model_reasoning_effort=max
 
 prompt: |
   Read REVIEW.md and act as the first reviewer.
@@ -23,4 +32,3 @@ watch:
 
 review:
   include_drafts: true
-

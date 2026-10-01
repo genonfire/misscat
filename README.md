@@ -75,20 +75,20 @@ Example `default.yml`:
 
 ```yaml
 reviewer:
-  provider: claude
-  model: claude-sonnet-5-5
-  args:
-    - --allowedTools
-    - "Bash(gh *)"
+  # provider: claude
+  # model: claude-sonnet-5-5
+  # args:
+  #   - --allowedTools
+  #   - "Bash(gh *)"
 
-# reviewer:
-#   provider: codex
-#   model: gpt-6-sol
-#   args:
-#     - --sandbox
-#     - workspace-write
-#     - -c
-#     - sandbox_workspace_write.network_access=true
+  provider: codex
+  model: gpt-6.1-sol
+  args:
+    - --sandbox
+    - workspace-write
+    - -c
+    - sandbox_workspace_write.network_access=true
+    - model_reasoning_effort=medium
 
 prompt: |
   Read REVIEW.md and act as the first reviewer.
@@ -101,28 +101,27 @@ review:
   include_drafts: true
 ```
 
-Example `~/.config/misscat/sol.yml`:
+Example `~/.config/misscat/luna.yml`:
 
 ```yaml
 reviewer:
   provider: codex
-  model: gpt-6-sol
+  model: gpt-6-luna
   args:
     - --sandbox
     - workspace-write
     - -c
     - sandbox_workspace_write.network_access=true
+    - model_reasoning_effort=max
 ```
 
 The selected local profile overrides the bundled defaults.
 
 When creating a local profile, use `default.yml` as the reference and specify `provider`, `model`, and `args` explicitly for that reviewer CLI. Do not rely on `args` inherited from a different provider.
 
-`reviewer.args` is passed to the selected reviewer CLI unchanged.
+The `args` field under `reviewer` is passed to the selected reviewer CLI unchanged.`
 
 Reviewed state is stored per repository and keyed by PR, HEAD SHA, and profile. The same HEAD can therefore be reviewed again with a different profile.
-
-The old global `~/.config/misscat/state.json` is no longer used.
 
 ## Review workspace
 
