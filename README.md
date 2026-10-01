@@ -29,10 +29,38 @@ No webhook server.
 No API keys stored by MissCat.  
 No repeated review of the same commit with the same profile.
 
-## Usage
+## Prerequisites
+
+Before running MissCat, ensure you have:
+
+- **Python**: Python 3.9 or newer
+- **Git**: Configured with credentials to clone and fetch the target repository (HTTPS users using GitHub CLI can run `gh auth setup-git`)
+- **GitHub CLI (`gh`)**: Installed and authenticated (`gh auth login`)
+- **At least one AI reviewer CLI**: Installed and authenticated:
+  - [Claude Code](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code) (`claude`)
+  - [Codex CLI](https://github.com/openai/codex) (`codex`)
+  - [Antigravity CLI](https://github.com/google/antigravity) (`agy`) for Gemini
+
+## Installation
+
+Install MissCat with [pipx](https://pypa.github.io/pipx/):
 
 ```bash
-misscat owner/repository
+pipx install misscat
+```
+
+To upgrade MissCat to the latest version:
+
+```bash
+pipx upgrade misscat
+```
+
+## Quick Start / First Run
+
+Watch a repository and review new PRs using the default profile:
+
+```bash
+misscat <owner/repo>
 ```
 
 Example:
@@ -41,7 +69,7 @@ Example:
 misscat genonfire/misscat
 ```
 
-Use a local reviewer profile:
+Use a specific reviewer profile:
 
 ```bash
 misscat genonfire/misscat luna
@@ -53,15 +81,25 @@ MissCat resolves `luna` as:
 ~/.config/misscat/luna.yml
 ```
 
-Running `misscat` with no arguments shows usage help.
+Running `misscat` with no arguments (or `misscat --help`) shows usage help:
+
+```bash
+misscat --help
+```
 
 Repository names are canonicalized to lowercase, so `Genonfire/MissCat` and `genonfire/misscat` refer to the same local workspace and state.
 
 ## Configuration
 
-MissCat ships with a bundled `default.yml`.
+MissCat ships with a bundled `default.yml` inside the package, so installed copies do not depend on the source checkout or current working directory.
 
-Local profiles and per-repository review state live in:
+User configuration and persistent data are kept entirely outside the package:
+
+- **Profiles**: `~/.config/misscat/<profile>.yml`
+- **Per-repository state**: `~/.config/misscat/<owner>__<repo>.json`
+- **Persistent workspace**: `~/.cache/misscat/repos/<owner>/<repo>/`
+
+Directory layout:
 
 ```text
 ~/.config/misscat/
@@ -184,9 +222,16 @@ Your normal development checkout is never touched.
 
 ## Requirements and limits
 
-- Git must be able to authenticate for clone and fetch. HTTPS users relying on GitHub CLI authentication should run `gh auth setup-git`.
-- Reviewer CLIs run inside PR-controlled checkouts. Use MissCat only with repositories and pull requests you trust.
-- Run at most one MissCat process per repository.
+- **Authentication expectations**:
+  - Git must be able to authenticate to the target repository for clone and fetch. Existing SSH keys or Git credentials work seamlessly. If using HTTPS with GitHub CLI, configure Git helper via `gh auth setup-git`. MissCat never stores Git credentials.
+  - GitHub CLI (`gh`) must be authenticated (`gh auth login`) with permissions to query pull requests.
+  - Reviewer CLIs (`claude`, `codex`, `agy`) must be logged in and configured with their respective provider accounts or API keys. MissCat uses their existing credentials.
+- **Trusted repository and PR warning**:
+  - Reviewer CLIs execute within a MissCat-managed checkout of PR-controlled files.
+  - MissCat should only be used with repositories and pull requests whose code and contributors you trust.
+- **One process per repository**:
+  - Run at most one MissCat process per repository at any given time.
+  - Multiple MissCat instances or profiles pointing to the same repository would share and conflict over the same persistent workspace (`~/.cache/misscat/repos/<owner>/<repo>/`).
 
 ## Reviewer backends
 
