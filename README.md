@@ -88,6 +88,7 @@ reviewer:
     - workspace-write
     - -c
     - sandbox_workspace_write.network_access=true
+    - -c
     - model_reasoning_effort=medium
 
 prompt: |
@@ -112,6 +113,7 @@ reviewer:
     - workspace-write
     - -c
     - sandbox_workspace_write.network_access=true
+    - -c
     - model_reasoning_effort=max
 ```
 
