@@ -66,7 +66,7 @@ Releases are published to PyPI by `.github/workflows/publish.yml` when a `vMAJOR
    - Repository: `misscat`
    - Workflow name: `publish.yml`
    - Environment name: `pypi`
-2. In the GitHub repository, create an environment named `pypi` (Settings → Environments). Recommended: restrict deployments to selected branches/tags and add required reviewers, so a `v*` tag pushed from an unreviewed commit cannot publish.
+2. In the GitHub repository, create an environment named `pypi` (Settings → Environments). Recommended: add required reviewers so every release needs a manual approval, and add a tag ruleset (Settings → Rules) so only maintainers can create `v*` tags. A deployment tag rule alone is not enough, since it matches the tag name, not the commit.
 
 ### Release procedure
 
@@ -79,7 +79,7 @@ Releases are published to PyPI by `.github/workflows/publish.yml` when a `vMAJOR
    git push origin v1.0.1
    ```
 
-4. The workflow fails before publishing if the tag is malformed, the tag does not match `pyproject.toml` or `__version__`, or `python -m build` / `twine check` fails.
+4. The workflow fails before publishing if the tagged commit is not on `master`, the tag is malformed, the tag does not match `pyproject.toml` or `__version__`, or `python -m build` / `twine check` fails.
 5. Confirm the release:
 
    ```bash

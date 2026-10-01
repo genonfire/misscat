@@ -23,6 +23,17 @@ jobs:
           fi
 
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check tagged commit is on master
+        run: |
+          git fetch --no-tags origin master
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/master; then
+            echo "::error::Tagged commit $GITHUB_SHA is not on master; merge it before releasing."
+            exit 1
+          fi
 
       - uses: actions/setup-python@v5
         with:
