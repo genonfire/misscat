@@ -75,8 +75,20 @@ Example `default.yml`:
 
 ```yaml
 reviewer:
-  provider: claude   # claude | codex
+  provider: claude
   model: claude-sonnet-5-5
+  args:
+    - --allowedTools
+    - "Bash(gh *)"
+
+# reviewer:
+#   provider: codex
+#   model: gpt-6-sol
+#   args:
+#     - --sandbox
+#     - workspace-write
+#     - -c
+#     - sandbox_workspace_write.network_access=true
 
 prompt: |
   Read REVIEW.md and act as the first reviewer.
@@ -95,9 +107,18 @@ Example `~/.config/misscat/sol.yml`:
 reviewer:
   provider: codex
   model: gpt-6-sol
+  args:
+    - --sandbox
+    - workspace-write
+    - -c
+    - sandbox_workspace_write.network_access=true
 ```
 
 The selected local profile overrides the bundled defaults.
+
+When creating a local profile, use `default.yml` as the reference and specify `provider`, `model`, and `args` explicitly for that reviewer CLI. Do not rely on `args` inherited from a different provider.
+
+`reviewer.args` is passed to the selected reviewer CLI unchanged.
 
 Reviewed state is stored per repository and keyed by PR, HEAD SHA, and profile. The same HEAD can therefore be reviewed again with a different profile.
 
@@ -130,7 +151,11 @@ Initial backends:
 - Claude Code CLI
 - Codex CLI
 
-MissCat uses the authentication already configured in those CLIs.
+MissCat runs the selected reviewer CLI from the root of the prepared PR checkout. The CLI can therefore discover and apply its own repository instructions, such as `CLAUDE.md` or `AGENTS.md`, while `REVIEW.md` defines the review behavior requested by MissCat.
+
+MissCat does not parse or translate those instruction files.
+
+MissCat uses the authentication already configured in the reviewer CLI. `reviewer.args` can be used for CLI-specific execution options such as tool permissions, sandbox settings, or network access.
 
 GitHub repository and pull request access is handled through the authenticated GitHub CLI (`gh`).
 

@@ -1,6 +1,18 @@
 reviewer:
-  provider: claude   # claude | codex
+  provider: claude
   model: claude-sonnet-5-5
+  args:
+    - --allowedTools
+    - "Bash(gh *)"
+
+# reviewer:
+#   provider: codex
+#   model: gpt-6-sol
+#   args:
+#     - --sandbox
+#     - workspace-write
+#     - -c
+#     - sandbox_workspace_write.network_access=true
 
 prompt: |
   Read REVIEW.md and act as the first reviewer.

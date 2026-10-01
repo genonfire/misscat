@@ -2,10 +2,13 @@
 """MissCat - never miss a single commit.
 
 Watches a GitHub repository and runs an AI review once for every new PR HEAD.
+One repository = one MissCat process = one workspace = one state file.
 Single-threaded: one review at a time, then an immediate re-check before sleeping.
 
-Each review runs the reviewer CLI inside a MissCat-owned checkout of the exact PR HEAD;
-your own working tree is never touched.
+Each review runs the reviewer CLI (Claude Code or Codex) from the root of a MissCat-owned
+checkout of the exact PR HEAD, so the CLI finds the repository's own instruction files
+(REVIEW.md, CLAUDE.md, AGENTS.md) by itself. MissCat never parses them and never touches
+your own working tree.
 
 Local layout (repository names are canonicalized to lowercase)
   ~/.config/misscat/<profile>.yml          reviewer profiles
@@ -46,7 +49,7 @@ DEFAULT_CONFIG = Path(__file__).with_name("default.yml")
 OWNER_RE = re.compile(r"^[A-Za-z0-9-]+$")  # no "_": keeps the "__" in state filenames unambiguous
 NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 PROVIDERS = ("claude", "codex")
-FAILURE_WAIT = 300.0  # seconds to wait after an unsuccessful reviewer before checking again
+FAILURE_WAIT = 300.0  # seconds to wait after a failed review before checking again
 
 
 class MissCatError(Exception):
@@ -112,6 +115,7 @@ class Settings:
     idle: tuple[float, ...]
     active: tuple[float, ...]
     include_drafts: bool
+    args: tuple[str, ...] = ()  # reviewer.args: extra reviewer CLI options, passed through untouched
 
 
 def _schedule(value, name: str) -> tuple[float, ...]:
@@ -125,26 +129,32 @@ def _schedule(value, name: str) -> tuple[float, ...]:
 
 def build_settings(cfg: dict) -> Settings:
     try:
-        provider, model = cfg["reviewer"]["provider"], cfg["reviewer"]["model"]
+        reviewer = cfg["reviewer"]
+        provider, model = reviewer["provider"], reviewer["model"]
+        args = reviewer["args"]
         prompt, include_drafts = cfg["prompt"], cfg["review"]["include_drafts"]
-        if provider not in PROVIDERS:
-            raise ConfigError(f"reviewer.provider must be one of {', '.join(PROVIDERS)}")
-        if not isinstance(model, str) or not model.strip():
-            raise ConfigError("reviewer.model must be a non-empty string")
-        if not isinstance(prompt, str) or not prompt.strip():
-            raise ConfigError("prompt must be a non-empty string")
-        if not isinstance(include_drafts, bool):
-            raise ConfigError("review.include_drafts must be true or false")
-        return Settings(
-            provider=provider,
-            model=model.strip(),
-            prompt=prompt,
-            idle=_schedule(cfg["watch"]["idle"], "watch.idle"),
-            active=_schedule(cfg["watch"]["active"], "watch.active"),
-            include_drafts=include_drafts,
-        )
-    except (KeyError, TypeError) as exc:
+        idle, active = cfg["watch"]["idle"], cfg["watch"]["active"]
+    except (KeyError, TypeError, AttributeError) as exc:
         raise ConfigError(f"missing or malformed config section: {exc}") from exc
+    if provider not in PROVIDERS:
+        raise ConfigError(f"reviewer.provider must be one of {', '.join(PROVIDERS)}")
+    if not isinstance(model, str) or not model.strip():
+        raise ConfigError("reviewer.model must be a non-empty string")
+    if not isinstance(args, list) or not all(isinstance(a, str) and a for a in args):
+        raise ConfigError("reviewer.args must be a list of non-empty strings (quote numbers)")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ConfigError("prompt must be a non-empty string")
+    if not isinstance(include_drafts, bool):
+        raise ConfigError("review.include_drafts must be true or false")
+    return Settings(
+        provider=provider,
+        model=model.strip(),
+        prompt=prompt,
+        idle=_schedule(idle, "watch.idle"),
+        active=_schedule(active, "watch.active"),
+        include_drafts=include_drafts,
+        args=tuple(args),
+    )
 
 
 def load_settings(profile: str | None) -> Settings:
@@ -152,6 +162,34 @@ def load_settings(profile: str | None) -> Settings:
     if profile is not None:
         cfg = deep_merge(cfg, _load_yaml(profile_path(profile)))
     return build_settings(cfg)
+
+
+# --------------------------------------------------------------------------- repository identity
+
+
+def canonical_repo(repo: str) -> str:
+    """Validate owner/repo and return the lowercase form used for all local identity.
+
+    GitHub names are case-insensitive, so Genonfire/MissCat and genonfire/misscat must
+    share one workspace and one state file on every platform.
+    """
+    owner, sep, name = repo.partition("/")
+    if not sep or not OWNER_RE.match(owner) or not NAME_RE.match(name) or name in (".", ".."):
+        raise MissCatError(f"repository must look like owner/repo: {repo!r}")
+    return f"{owner}/{name}".lower()
+
+
+def state_path(repo: str) -> Path:
+    owner, name = canonical_repo(repo).split("/")
+    return CONFIG_DIR / f"{owner}__{name}.json"
+
+
+def workspace_path(repo: str) -> Path:
+    try:
+        owner, name = canonical_repo(repo).split("/")
+    except MissCatError as exc:
+        raise WorkspaceError(str(exc)) from exc
+    return WORKSPACE_ROOT / owner / name
 
 
 # --------------------------------------------------------------------------- GitHub
@@ -186,35 +224,7 @@ def gh_open_prs(repo: str) -> list[PR]:
         raise GhError(f"unexpected gh output: {exc}") from exc
 
 
-# --------------------------------------------------------------------------- repository identity
-
-
-def canonical_repo(repo: str) -> str:
-    """Validate owner/repo and return the lowercase form used for all local identity.
-
-    GitHub names are case-insensitive, so Genonfire/MissCat and genonfire/misscat must
-    share one workspace and one state file on every platform.
-    """
-    owner, sep, name = repo.partition("/")
-    if not sep or not OWNER_RE.match(owner) or not NAME_RE.match(name) or name in (".", ".."):
-        raise MissCatError(f"repository must look like owner/repo: {repo!r}")
-    return f"{owner}/{name}".lower()
-
-
-def state_path(repo: str) -> Path:
-    owner, name = canonical_repo(repo).split("/")
-    return CONFIG_DIR / f"{owner}__{name}.json"
-
-
 # --------------------------------------------------------------------------- workspace
-
-
-def workspace_path(repo: str) -> Path:
-    try:
-        owner, name = canonical_repo(repo).split("/")
-    except MissCatError as exc:
-        raise WorkspaceError(str(exc)) from exc
-    return WORKSPACE_ROOT / owner / name
 
 
 def _run(cmd: list[str], cwd: Path | None = None) -> str:
@@ -286,12 +296,12 @@ def prepare_workspace(repo: str, pr: PR) -> Path:
 
 
 # --------------------------------------------------------------------------- reviewer
-# Minimal backend so the watcher is runnable. Issue #2 owns the real design
-# (permissions, result posting, per-provider flags).
 
-COMMANDS: dict[str, Callable[[str, str], list[str]]] = {
-    "claude": lambda model, prompt: ["claude", "-p", prompt, "--model", model],
-    "codex": lambda model, prompt: ["codex", "exec", "--model", model, prompt],
+# reviewer.args go before the prompt so a variadic option such as
+# `--allowedTools A B` cannot swallow it.
+COMMANDS: dict[str, Callable[[str, str, list[str]], list[str]]] = {
+    "claude": lambda model, prompt, args: ["claude", *args, "-p", prompt, "--model", model],
+    "codex": lambda model, prompt, args: ["codex", "exec", *args, "--model", model, prompt],
 }
 
 
@@ -313,7 +323,9 @@ def run_cli_reviewer(settings: Settings, repo: str, pr: PR) -> bool:
     except WorkspaceError as exc:
         log.error("PR #%d: workspace preparation failed: %s", pr.number, exc)
         return False
-    cmd = COMMANDS[settings.provider](settings.model, build_prompt(settings, repo, pr))
+    cmd = COMMANDS[settings.provider](
+        settings.model, build_prompt(settings, repo, pr), list(settings.args)
+    )
     try:
         proc = subprocess.run(
             cmd, cwd=workspace, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -342,9 +354,9 @@ class State:
 
     The repository is identified by the filename, so a record is PR + HEAD + profile.
     Only completions are stored: a HEAD that is absent (failed, interrupted, never run) is
-    eligible for review. Loaded once at start; every successful review rewrites the file
-    atomically. One repository = one MissCat process = one state file, so there is no
-    locking and no merging.
+    eligible for review. Completed records are never deleted. Loaded once at start; every
+    successful review rewrites the file atomically. One repository = one MissCat process =
+    one state file, so there is no locking and no merging.
     """
 
     def __init__(self, path: Path):
@@ -392,6 +404,7 @@ class Watcher:
 
     Timer: starts idle (1m -> 5m). A successful review switches it to active (5m -> 1m)
     from the start of the sequence. When no PR is open any more it falls back to idle.
+    A failed review waits FAILURE_WAIT and does not advance the timer.
     """
 
     def __init__(
@@ -423,11 +436,11 @@ class Watcher:
             return
         if not prs and self.mode == ACTIVE:
             self.mode, self.step = IDLE, 0
-        pr = self._next_reviewable(prs, self.state.reviewed())
+        pr = self._next_reviewable(prs)
         if pr is None:
             self._sleep_adaptive()
         elif self._review(pr):
-            self.mode, self.step = ACTIVE, 0  # then straight back to a fresh listing
+            self.mode, self.step = ACTIVE, 0  # then straight back to a fresh listing, no sleep
         else:
             log.warning("checking again in %s", _fmt(FAILURE_WAIT))
             self.sleep(FAILURE_WAIT)
@@ -435,7 +448,8 @@ class Watcher:
     def _key(self, pr: PR) -> Key:
         return Key(pr.number, pr.head, self.profile)
 
-    def _next_reviewable(self, prs: list[PR], done: set[Key]) -> PR | None:
+    def _next_reviewable(self, prs: list[PR]) -> PR | None:
+        done = self.state.reviewed()
         waiting = [
             p for p in sorted(prs, key=lambda p: p.number)  # oldest PR first
             if (self.s.include_drafts or not p.draft) and self._key(p) not in done
