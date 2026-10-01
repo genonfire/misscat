@@ -5,10 +5,10 @@ Watches a GitHub repository and runs an AI review once for every new PR HEAD.
 One repository = one MissCat process = one workspace = one state file.
 Single-threaded: one review at a time, then an immediate re-check before sleeping.
 
-Each review runs the reviewer CLI (Claude Code or Codex) from the root of a MissCat-owned
-checkout of the exact PR HEAD, so the CLI finds the repository's own instruction files
-(REVIEW.md, CLAUDE.md, AGENTS.md) by itself. MissCat never parses them and never touches
-your own working tree.
+Each review runs the reviewer CLI (Claude Code, Codex, or Gemini via Antigravity CLI)
+from the root of a MissCat-owned checkout of the exact PR HEAD, so the CLI finds the
+repository's own instruction files (REVIEW.md, CLAUDE.md, AGENTS.md) by itself. MissCat
+never parses them and never touches your own working tree.
 
 Local layout (repository names are canonicalized to lowercase)
   ~/.config/misscat/<profile>.yml          reviewer profiles
@@ -27,6 +27,7 @@ Requirements and limits
 from __future__ import annotations
 
 import argparse
+import importlib.resources
 import json
 import logging
 import os
@@ -41,11 +42,12 @@ from typing import Callable, NamedTuple
 
 import yaml
 
+__version__ = "1.0.0"
+
 log = logging.getLogger("misscat")
 
 CONFIG_DIR = Path.home() / ".config" / "misscat"
 WORKSPACE_ROOT = Path.home() / ".cache" / "misscat" / "repos"
-DEFAULT_CONFIG = Path(__file__).with_name("default.yml")
 OWNER_RE = re.compile(r"^[A-Za-z0-9-]+$")  # no "_": keeps the "__" in state filenames unambiguous
 NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 PROVIDERS = ("claude", "codex", "gemini")
@@ -158,8 +160,21 @@ def build_settings(cfg: dict) -> Settings:
     )
 
 
+def _load_default_config() -> dict:
+    try:
+        content = importlib.resources.files("misscat").joinpath("default.yml").read_text(encoding="utf-8")
+        data = yaml.safe_load(content)
+    except (OSError, yaml.YAMLError, TypeError) as exc:
+        raise ConfigError(f"cannot read bundled default.yml: {exc}") from exc
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ConfigError("bundled default.yml: top level must be a mapping")
+    return data
+
+
 def load_settings(profile: str | None) -> Settings:
-    cfg = _load_yaml(DEFAULT_CONFIG)
+    cfg = _load_default_config()
     if profile is not None:
         cfg = deep_merge(cfg, _load_yaml(profile_path(profile)))
     return build_settings(cfg)
@@ -727,6 +742,12 @@ def main(argv: list[str] | None = None) -> int:
         "--loud",
         action="store_true",
         help="show detailed reviewer activity",
+    )
+    parser.add_argument(
+        "-v",
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
     )
     if not argv:
         parser.print_help()
