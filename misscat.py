@@ -498,7 +498,7 @@ def _run_structured_reviewer(provider: str, cmd: list[str], workspace: Path) -> 
     assert proc.stdout is not None
     tail: list[str] = []
     claude_tools: dict[str, str] = {}
-    structured = provider in ("claude", "codex")  # other providers print plain text
+    structured = provider in ("claude", "codex", "gemini")  # other providers print plain text
 
     for raw in proc.stdout:
         line = raw.strip()
@@ -521,6 +521,8 @@ def _run_structured_reviewer(provider: str, cmd: list[str], workspace: Path) -> 
             _log_claude_event(event, claude_tools)
         elif provider == "gemini":
             _log_gemini_event(event)
+        else:
+            log.warning("unknown structured provider: %s", provider)
 
     returncode = proc.wait()
     if returncode != 0:

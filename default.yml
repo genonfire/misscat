@@ -29,9 +29,12 @@ reviewer:
   #   - -c
   #   - model_reasoning_effort=max
 
+  # reviewer:
   # provider: gemini
-  # model: gemini-3.8-flash-medium
+  # model: gemini-3.8-flash-low
   # args:
+  #   - --output-format
+  #   - stream-json
   #   - --print-timeout
   #   - 30m
 
