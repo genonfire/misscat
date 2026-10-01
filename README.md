@@ -44,13 +44,13 @@ misscat genonfire/misscat
 Use a local reviewer profile:
 
 ```bash
-misscat genonfire/misscat sol
+misscat genonfire/misscat luna
 ```
 
-MissCat resolves `sol` as:
+MissCat resolves `luna` as:
 
 ```text
-~/.config/misscat/sol.yml
+~/.config/misscat/luna.yml
 ```
 
 Running `misscat` with no arguments shows usage help.
@@ -65,7 +65,7 @@ Local profiles and per-repository review state live in:
 
 ```text
 ~/.config/misscat/
-├── sol.yml
+├── luna.yml
 ├── sonnet.yml
 ├── genonfire__typewriter.json
 └── genonfire__misscat.json
@@ -75,11 +75,27 @@ Example `default.yml`:
 
 ```yaml
 reviewer:
-  provider: claude   # claude | codex
-  model: claude-sonnet-5-5
+  # provider: claude
+  # model: claude-sonnet-5-5
+  # args:
+  #   - --allowedTools
+  #   - "Bash(gh *)"
+
+  provider: codex
+  model: gpt-6.1-sol
+  args:
+    - --sandbox
+    - workspace-write
+    - -c
+    - sandbox_workspace_write.network_access=true
+    - -c
+    - apps._default.enabled=false
+    - -c
+    - model_reasoning_effort=medium
 
 prompt: |
-  Read REVIEW.md and act as the first reviewer.
+  Read REVIEW.md if exist and act as the 1st reviewer.
+  Use the gh CLI for GitHub operations, including posting the review.
 
 watch:
   idle: [60, 120, 180, 240, 300]
@@ -89,19 +105,30 @@ review:
   include_drafts: true
 ```
 
-Example `~/.config/misscat/sol.yml`:
+Example `~/.config/misscat/luna.yml`:
 
 ```yaml
 reviewer:
   provider: codex
-  model: gpt-6-sol
+  model: gpt-6-luna
+  args:
+    - --sandbox
+    - workspace-write
+    - -c
+    - sandbox_workspace_write.network_access=true
+    - -c
+    - apps._default.enabled=false
+    - -c
+    - model_reasoning_effort=max
 ```
 
 The selected local profile overrides the bundled defaults.
 
-Reviewed state is stored per repository and keyed by PR, HEAD SHA, and profile. The same HEAD can therefore be reviewed again with a different profile.
+When creating a local profile, use `default.yml` as the reference and specify `provider`, `model`, and `args` explicitly for that reviewer CLI. Do not rely on `args` inherited from a different provider.
 
-The old global `~/.config/misscat/state.json` is no longer used.
+The `args` field under `reviewer` is passed to the selected reviewer CLI unchanged.
+
+Reviewed state is stored per repository and keyed by PR, HEAD SHA, and profile. The same HEAD can therefore be reviewed again with a different profile.
 
 ## Review workspace
 
@@ -130,7 +157,12 @@ Initial backends:
 - Claude Code CLI
 - Codex CLI
 
-MissCat uses the authentication already configured in those CLIs.
+MissCat runs the selected reviewer CLI from the root of the prepared PR checkout. The CLI can therefore discover and apply its own repository instructions, such as `CLAUDE.md` or `AGENTS.md`, while `REVIEW.md` defines the review behavior requested by MissCat.
+
+MissCat does not parse or translate those instruction files.
+
+MissCat uses the authentication already configured in the reviewer CLI.
+The `args` field under `reviewer` can be used for CLI-specific execution options such as tool permissions, sandbox settings, or network access.
 
 GitHub repository and pull request access is handled through the authenticated GitHub CLI (`gh`).
 
