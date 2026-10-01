@@ -48,7 +48,8 @@ WORKSPACE_ROOT = Path.home() / ".cache" / "misscat" / "repos"
 DEFAULT_CONFIG = Path(__file__).with_name("default.yml")
 OWNER_RE = re.compile(r"^[A-Za-z0-9-]+$")  # no "_": keeps the "__" in state filenames unambiguous
 NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
-PROVIDERS = ("claude", "codex")
+PROVIDERS = ("claude", "codex", "gemini")
+EXECUTABLES = {"claude": "claude", "codex": "codex", "gemini": "agy"}  # provider -> CLI binary
 FAILURE_WAIT = 300.0  # seconds to wait after a failed review before checking again
 
 
@@ -308,6 +309,10 @@ COMMANDS: dict[str, Callable[[str, str, list[str]], list[str]]] = {
     "codex": lambda model, prompt, args: [
         "codex", "exec", "--json", *args, "--model", model, prompt,
     ],
+    # agy (Antigravity CLI) treats everything after `-p <prompt>` as prompt text, so every
+    # flag, --model included, must come before it. Plain text output: its JSON event schema
+    # is not relied on.
+    "gemini": lambda model, prompt, args: ["agy", *args, "--model", model, "-p", prompt],
 }
 
 
@@ -459,14 +464,19 @@ def _run_structured_reviewer(provider: str, cmd: list[str], workspace: Path) -> 
     assert proc.stdout is not None
     tail: list[str] = []
     claude_tools: dict[str, str] = {}
+    structured = provider in ("claude", "codex")  # other providers print plain text
 
     for raw in proc.stdout:
         line = raw.strip()
         if not line:
             continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
+        event = None
+        if structured:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                pass
+        if not isinstance(event, dict):
             tail.append(line)
             tail = tail[-20:]
             log.debug("%s: %s", provider, _short(line, 200))
@@ -502,8 +512,11 @@ def run_cli_reviewer(settings: Settings, repo: str, pr: PR) -> bool:
     except WorkspaceError as exc:
         log.error("PR #%d: workspace preparation failed: %s", pr.number, exc)
         return False
+
     cmd = COMMANDS[settings.provider](
-        settings.model, build_prompt(settings, repo, pr), list(settings.args)
+        settings.model,
+        build_prompt(settings, repo, pr),
+        list(settings.args),
     )
     return _run_structured_reviewer(settings.provider, cmd, workspace)
 
@@ -682,7 +695,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         repo = canonical_repo(args.repo)  # canonicalize once; everything below uses this form
         settings = load_settings(args.profile)
-        for tool in ("git", "gh", settings.provider):
+        for tool in ("git", "gh", EXECUTABLES[settings.provider]):
             if shutil.which(tool) is None:
                 raise MissCatError(f"required CLI not found on PATH: {tool}")
         state = State(state_path(repo))  # fails early on a corrupt state file

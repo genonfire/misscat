@@ -29,6 +29,13 @@ reviewer:
   #   - -c
   #   - model_reasoning_effort=max
 
+  # provider: gemini
+  # model: gemini-3.8-flash-high
+  # args:
+  #   - --dangerously-skip-permissions
+  #   - --print-timeout
+  #   - 30m
+
 prompt: |
   Read REVIEW.md if exist and act as the 1st reviewer.
   Use the gh CLI for GitHub operations, including posting the review.
