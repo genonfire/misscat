@@ -48,7 +48,8 @@ WORKSPACE_ROOT = Path.home() / ".cache" / "misscat" / "repos"
 DEFAULT_CONFIG = Path(__file__).with_name("default.yml")
 OWNER_RE = re.compile(r"^[A-Za-z0-9-]+$")  # no "_": keeps the "__" in state filenames unambiguous
 NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
-PROVIDERS = ("claude", "codex")
+PROVIDERS = ("claude", "codex", "gemini")
+EXECUTABLES = {"claude": "claude", "codex": "codex", "gemini": "agy"}  # provider -> CLI binary
 FAILURE_WAIT = 300.0  # seconds to wait after a failed review before checking again
 
 
@@ -308,6 +309,10 @@ COMMANDS: dict[str, Callable[[str, str, list[str]], list[str]]] = {
     "codex": lambda model, prompt, args: [
         "codex", "exec", "--json", *args, "--model", model, prompt,
     ],
+    # agy (Antigravity CLI) treats everything after `-p <prompt>` as prompt text, so every
+    # flag, --model included, must come before it. Plain text output: its JSON event schema
+    # is not relied on.
+    "gemini": lambda model, prompt, args: ["agy", *args, "--model", model, "-p", prompt],
 }
 
 
@@ -445,6 +450,40 @@ def _log_claude_event(event: dict, tool_names: dict[str, str]) -> None:
         log.info("reviewer: claude done%s", f" ({', '.join(details)})" if details else "")
 
 
+def _log_gemini_event(event: dict) -> None:
+    kind = event.get("event")
+
+    if kind == "step_update":
+        step = event.get("step_update") or {}
+        step_type = step.get("step_type")
+        state = step.get("state")
+
+        if step_type == "agent_response" and state == "DONE":
+            log.info("reviewer: working")
+            return
+
+        if step_type == "tool" and state == "ACTIVE":
+            tool = step.get("tool_name") or "tool"
+            params = (step.get("tool_info") or {}).get("parameters") or {}
+            command = params.get("CommandLine")
+
+            if command:
+                log.info("reviewer: %s %s", tool, _short(command))
+            else:
+                log.info("reviewer: %s", tool)
+            return
+
+    if kind == "result":
+        result = event.get("result") or {}
+        usage = result.get("usage") or {}
+        total = usage.get("total_tokens")
+
+        if total is not None:
+            log.info("reviewer: done (tokens=%s)", total)
+        else:
+            log.info("reviewer: done")
+
+
 def _run_structured_reviewer(provider: str, cmd: list[str], workspace: Path) -> bool:
     """Stream reviewer JSONL and expose only compact progress events."""
     try:
@@ -459,22 +498,31 @@ def _run_structured_reviewer(provider: str, cmd: list[str], workspace: Path) -> 
     assert proc.stdout is not None
     tail: list[str] = []
     claude_tools: dict[str, str] = {}
+    structured = provider in ("claude", "codex", "gemini")  # other providers print plain text
 
     for raw in proc.stdout:
         line = raw.strip()
         if not line:
             continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
+        event = None
+        if structured:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                pass
+        if not isinstance(event, dict):
             tail.append(line)
             tail = tail[-20:]
             log.debug("%s: %s", provider, _short(line, 200))
             continue
         if provider == "codex":
             _log_codex_event(event)
-        else:
+        elif provider == "claude":
             _log_claude_event(event, claude_tools)
+        elif provider == "gemini":
+            _log_gemini_event(event)
+        else:
+            log.warning("unknown structured provider: %s", provider)
 
     returncode = proc.wait()
     if returncode != 0:
@@ -502,8 +550,11 @@ def run_cli_reviewer(settings: Settings, repo: str, pr: PR) -> bool:
     except WorkspaceError as exc:
         log.error("PR #%d: workspace preparation failed: %s", pr.number, exc)
         return False
+
     cmd = COMMANDS[settings.provider](
-        settings.model, build_prompt(settings, repo, pr), list(settings.args)
+        settings.model,
+        build_prompt(settings, repo, pr),
+        list(settings.args),
     )
     return _run_structured_reviewer(settings.provider, cmd, workspace)
 
@@ -672,17 +723,29 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("repo", metavar="owner/repo")
     parser.add_argument("profile", metavar="profile", nargs="?")
+    parser.add_argument(
+        "--loud",
+        action="store_true",
+        help="show detailed reviewer activity",
+    )
     if not argv:
         parser.print_help()
         return 2
     args = parser.parse_args(argv)
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
-                        datefmt="%H:%M:%S")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    if args.loud:
+        log.setLevel(logging.DEBUG)
+
     try:
         repo = canonical_repo(args.repo)  # canonicalize once; everything below uses this form
         settings = load_settings(args.profile)
-        for tool in ("git", "gh", settings.provider):
+        for tool in ("git", "gh", EXECUTABLES[settings.provider]):
             if shutil.which(tool) is None:
                 raise MissCatError(f"required CLI not found on PATH: {tool}")
         state = State(state_path(repo))  # fails early on a corrupt state file

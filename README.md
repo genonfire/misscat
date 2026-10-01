@@ -156,6 +156,7 @@ Initial backends:
 
 - Claude Code CLI
 - Codex CLI
+- Gemini via agy(Google Antigravity CLI)
 
 MissCat runs the selected reviewer CLI from the root of the prepared PR checkout. The CLI can therefore discover and apply its own repository instructions, such as `CLAUDE.md` or `AGENTS.md`, while `REVIEW.md` defines the review behavior requested by MissCat.
 
