@@ -30,9 +30,8 @@ reviewer:
   #   - model_reasoning_effort=max
 
   # provider: gemini
-  # model: gemini-3.8-flash-high
+  # model: gemini-3.8-flash-medium
   # args:
-  #   - --dangerously-skip-permissions
   #   - --print-timeout
   #   - 30m
 

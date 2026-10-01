@@ -483,7 +483,7 @@ def _run_structured_reviewer(provider: str, cmd: list[str], workspace: Path) -> 
             continue
         if provider == "codex":
             _log_codex_event(event)
-        else:
+        elif provider == "claude":
             _log_claude_event(event, claude_tools)
 
     returncode = proc.wait()
@@ -685,13 +685,25 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("repo", metavar="owner/repo")
     parser.add_argument("profile", metavar="profile", nargs="?")
+    parser.add_argument(
+        "--loud",
+        action="store_true",
+        help="show detailed reviewer activity",
+    )
     if not argv:
         parser.print_help()
         return 2
     args = parser.parse_args(argv)
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
-                        datefmt="%H:%M:%S")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    if args.loud:
+        log.setLevel(logging.DEBUG)
+
     try:
         repo = canonical_repo(args.repo)  # canonicalize once; everything below uses this form
         settings = load_settings(args.profile)
