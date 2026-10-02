@@ -63,6 +63,21 @@ class InitTest(unittest.TestCase):
         self.assertEqual((self.cfg / "o__r.json").read_text(), "{}")
         self.assertFalse([p for p in self.cfg.iterdir() if p.name.endswith(".tmp")])
 
+    def test_normal_init_never_replaces_concurrently_created_file(self):
+        self.cfg.mkdir(parents=True)
+        target = self.cfg / "sol.yml"
+        real_link = os.link
+
+        def racing_link(src, dst, *a, **k):
+            if Path(dst) == target:
+                target.write_text("created meanwhile\n")
+            return real_link(src, dst, *a, **k)
+
+        with mock.patch("os.link", racing_link):
+            _, skipped = misscat.install_profiles()
+        self.assertIn("sol.yml", skipped)
+        self.assertEqual(target.read_text(), "created meanwhile\n")
+
     def test_partial_directory_recovered_by_init(self):
         self.cfg.mkdir(parents=True)
         (self.cfg / "luna.yml").write_text(misscat.bundled_profiles()["luna.yml"])
@@ -93,8 +108,9 @@ class InitTest(unittest.TestCase):
             build = subprocess.run(
                 [sys.executable, "-m", "pip", "wheel", "--no-deps",
                  "-w", str(tmp / "dist"), str(ROOT)], capture_output=True, text=True)
-            if build.returncode:
-                self.skipTest(f"cannot build wheel offline: {build.stderr[-300:]}")
+            if build.returncode and os.environ.get("MISSCAT_SKIP_WHEEL_TEST"):
+                self.skipTest("wheel build explicitly skipped (MISSCAT_SKIP_WHEEL_TEST)")
+            self.assertEqual(build.returncode, 0, build.stderr[-1000:])
             wheel = next((tmp / "dist").glob("misscat-*.whl"))
             names = {Path(n).name for n in zipfile.ZipFile(wheel).namelist() if "/profiles/" in n}
             self.assertEqual(names, BUNDLED)

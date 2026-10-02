@@ -200,19 +200,29 @@ def bundled_profiles() -> dict[str, str]:
         raise ConfigError(f"cannot read bundled profiles: {exc}") from exc
 
 
-def _write_atomic(path: Path, content: str) -> None:
-    """Write via a temporary file in the same directory, then replace: no half-written YAML."""
+def _write_atomic(path: Path, content: str, overwrite: bool = True) -> bool:
+    """Write via a temporary file in the same directory: no half-written YAML.
+
+    Without `overwrite` the file is linked into place, which fails if `path` already exists
+    (even when created concurrently); returns False in that case, True once written.
+    """
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
             handle.write(content)
-        os.replace(tmp, path)
-    except BaseException:
+        if overwrite:
+            os.replace(tmp, path)
+        else:
+            try:
+                os.link(tmp, path)
+            except FileExistsError:
+                return False
+        return True
+    finally:
         try:
             os.unlink(tmp)
         except OSError:
             pass
-        raise
 
 
 def install_profiles(force: bool = False) -> tuple[list[str], list[str]]:
@@ -227,11 +237,10 @@ def install_profiles(force: bool = False) -> tuple[list[str], list[str]]:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         for name, content in profiles.items():
             target = CONFIG_DIR / name
-            if (target.exists() or target.is_symlink()) and not force:
+            if _write_atomic(target, content, overwrite=force):
+                installed.append(name)
+            else:
                 skipped.append(name)
-                continue
-            _write_atomic(target, content)
-            installed.append(name)
     except OSError as exc:
         raise ConfigError(
             f"cannot install bundled profiles into {CONFIG_DIR}: {exc}. "
