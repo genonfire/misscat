@@ -51,6 +51,8 @@ log = logging.getLogger("misscat")
 
 CONFIG_DIR = Path.home() / ".config" / "misscat"
 WORKSPACE_ROOT = Path.home() / ".cache" / "misscat" / "repos"
+LOCK_ROOT = Path.home() / ".cache" / "misscat" / "locks"  # outside CONFIG_DIR: locking must not
+# create it, or a state-only command would make the first watcher run skip profile initialization
 OWNER_RE = re.compile(r"^[A-Za-z0-9-]+$")  # no "_": keeps the "__" in state filenames unambiguous
 NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 PROVIDERS = ("claude", "codex", "gemini")
@@ -251,15 +253,9 @@ def install_profiles(force: bool = False) -> tuple[list[str], list[str]]:
     return installed, skipped
 
 
-def ensure_initial_profiles(first_run: bool | None = None) -> None:
-    """First normal run only: if CONFIG_DIR does not exist, create it and copy all profiles.
-
-    `first_run` is the caller's pre-lock observation: taking the repository lock creates
-    CONFIG_DIR, so the directory must be checked before the lock is opened.
-    """
-    if first_run is None:
-        first_run = not CONFIG_DIR.exists()
-    if not first_run:
+def ensure_initial_profiles() -> None:
+    """First normal run only: if CONFIG_DIR does not exist, create it and copy all profiles."""
+    if CONFIG_DIR.exists():
         return
     installed, _ = install_profiles()
     log.info("first run: installed profiles into %s: %s", CONFIG_DIR, ", ".join(installed) or "none")
@@ -811,7 +807,7 @@ def repository_lock(repo: str):
 
     The .lock file intentionally remains on disk; existence is NOT lock ownership.
     """
-    path = state_path(repo).with_suffix(".lock")
+    path = LOCK_ROOT / state_path(repo).with_suffix(".lock").name
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         handle = path.open("a+b")
@@ -1182,9 +1178,8 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         repo = canonical_repo(args.repo)  # canonicalize once; everything below uses this form
-        first_run = not CONFIG_DIR.exists()  # the lock below creates CONFIG_DIR
         with repository_lock(repo):
-            ensure_initial_profiles(first_run)
+            ensure_initial_profiles()
             settings = load_settings(args.profile)
             for tool in ("git", "gh", EXECUTABLES[settings.provider]):
                 if shutil.which(tool) is None:

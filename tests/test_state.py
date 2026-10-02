@@ -24,6 +24,9 @@ class StateManagerTests(unittest.TestCase):
         patcher = mock.patch.object(misscat, "CONFIG_DIR", self.config)
         patcher.start()
         self.addCleanup(patcher.stop)
+        locks = mock.patch.object(misscat, "LOCK_ROOT", Path(tmp.name) / ".cache" / "locks")
+        locks.start()
+        self.addCleanup(locks.stop)
         self.path = misscat.state_path(REPO)
 
     def write_state(self, version, rows):
@@ -78,13 +81,19 @@ class StateManagerTests(unittest.TestCase):
             self.assertFalse(state.remove_latest(misscat.Key(213, "early", "luna")))
             self.assertTrue(state.remove_latest(misscat.Key(213, "late", "luna")))
 
-    def test_first_run_installs_profiles_despite_lock_creating_config_dir(self):
-        first_run = not misscat.CONFIG_DIR.exists()
-        self.assertTrue(first_run)
+    def test_lock_does_not_create_config_dir(self):
         with misscat.repository_lock(REPO):
-            self.assertTrue(self.config.exists())  # the lock created it
-            misscat.ensure_initial_profiles(first_run)
+            self.assertFalse(self.config.exists())
+            self.assertTrue(any(misscat.LOCK_ROOT.iterdir()))
+
+    def test_state_first_then_watcher_still_installs_profiles(self):
+        with misscat.repository_lock(REPO):  # e.g. `misscat state owner/repo` as the first command
+            misscat.State(self.path)
+        self.assertFalse(self.config.exists())
+        with misscat.repository_lock(REPO):  # first watcher start
+            misscat.ensure_initial_profiles()
         self.assertTrue((self.config / "luna.yml").is_file())
+        self.assertEqual(misscat.load_settings("luna").provider, "codex")
 
     def test_timestamp_not_sha_controls_latest_and_stack_deletion(self):
         self.write_state(2, [
