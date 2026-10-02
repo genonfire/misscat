@@ -1167,12 +1167,12 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         repo = canonical_repo(args.repo)  # canonicalize once; everything below uses this form
-        ensure_initial_profiles()
-        settings = load_settings(args.profile)
-        for tool in ("git", "gh", EXECUTABLES[settings.provider]):
-            if shutil.which(tool) is None:
-                raise MissCatError(f"required CLI not found on PATH: {tool}")
         with repository_lock(repo):
+            ensure_initial_profiles()
+            settings = load_settings(args.profile)
+            for tool in ("git", "gh", EXECUTABLES[settings.provider]):
+                if shutil.which(tool) is None:
+                    raise MissCatError(f"required CLI not found on PATH: {tool}")
             state = State(state_path(repo))  # v1 resets; corrupt/unknown files fail safely
             log.info("watching %s with %s/%s (profile: %s)", repo, settings.provider,
                      settings.model, args.profile or "default")
