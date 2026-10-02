@@ -92,6 +92,8 @@ Releases are published to PyPI by `.github/workflows/publish.yml` when a `vMAJOR
 
 ## Quick Start / First Run
 
+On the first normal run, if `~/.config/misscat/` does not exist, MissCat creates it and copies the bundled reviewer profiles (`luna.yml`, `sol.yml`, `sonnet.yml`, `opus5.5medium.yml`, `gemini.yml`) into it before loading your profile. Edit them freely. If the directory already exists, nothing is copied automatically, so existing configs are preserved across upgrades. `--help` and `--version` never touch the filesystem.
+
 Watch a repository and review new PRs using the default profile:
 
 ```bash
@@ -124,6 +126,18 @@ misscat --help
 
 Repository names are canonicalized to lowercase, so `Genonfire/MissCat` and `genonfire/misscat` refer to the same local workspace and state.
 
+## Bundled profiles: `misscat init`
+
+```bash
+misscat init          # create the config dir if needed; copy only missing bundled profiles
+misscat init --force  # overwrite files named like bundled profiles with fresh copies
+```
+
+- `init` never modifies existing files. `init --force` replaces only `luna.yml`, `sol.yml`, `sonnet.yml`, `opus5.5medium.yml` and `gemini.yml`; custom profiles, per-repository state JSONs and the review cache are never touched.
+- After upgrading MissCat, new or updated bundled profiles are not applied automatically: run `misscat init` for new ones, or `misscat init --force` to reset the bundled ones (this discards your edits to them).
+- If the automatic first-run copy is interrupted, `misscat init` restores the missing profiles.
+- `default.yml` is the internal base configuration and is not copied. Each bundled profile carries its own editable copy of the default `prompt`, so you can customize a reviewer's prompt in place; `default.yml` remains the fallback.
+
 ## Configuration
 
 MissCat ships with a bundled `default.yml` inside the package, so installed copies do not depend on the source checkout or current working directory.
@@ -140,6 +154,7 @@ Directory layout:
 ~/.config/misscat/
 ├── sol.yml
 ├── sonnet.yml
+├── opus5.5medium.yml
 ├── genonfire__typewriter.json
 └── genonfire__misscat.json
 ```
