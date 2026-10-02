@@ -11,7 +11,7 @@ from unittest import mock
 import misscat
 
 ROOT = Path(__file__).resolve().parent.parent
-BUNDLED = {"luna.yml", "sol.yml", "sonnet.yml", "opus5.5medium.yml", "gemini.yml"}
+BUNDLED = {"luna.yml", "sol.yml", "sonnet.yml", "opus.yml", "gemini.yml"}
 
 
 DEFAULT_PROMPT = (
@@ -41,10 +41,15 @@ class InitTest(unittest.TestCase):
             self.assertEqual(yaml.safe_load(text)["prompt"], DEFAULT_PROMPT, name)
             misscat.build_settings(misscat.deep_merge(misscat._load_default_config(), yaml.safe_load(text)))
 
+    def test_sonnet_profile_uses_medium_effort(self):
+        import yaml
+        args = yaml.safe_load(misscat.bundled_profiles()["sonnet.yml"])["reviewer"]["args"]
+        self.assertEqual(args, ["--effort", "medium", "--allowedTools", "Bash(gh *)"])
+
     def test_opus_profile_settings_and_command(self):
         import yaml
         cfg = misscat.deep_merge(misscat._load_default_config(),
-                                 yaml.safe_load(misscat.bundled_profiles()["opus5.5medium.yml"]))
+                                 yaml.safe_load(misscat.bundled_profiles()["opus.yml"]))
         settings = misscat.build_settings(cfg)
         self.assertEqual((settings.provider, settings.model), ("claude", "claude-opus-5-5"))
         self.assertEqual(settings.args, ("--effort", "medium", "--allowedTools", "Bash(gh *)"))
