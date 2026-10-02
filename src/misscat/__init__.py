@@ -27,6 +27,8 @@ Requirements and limits
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+from datetime import datetime, timezone
 import importlib.resources
 import tempfile
 import json
@@ -49,6 +51,8 @@ log = logging.getLogger("misscat")
 
 CONFIG_DIR = Path.home() / ".config" / "misscat"
 WORKSPACE_ROOT = Path.home() / ".cache" / "misscat" / "repos"
+LOCK_ROOT = Path.home() / ".cache" / "misscat" / "locks"  # outside CONFIG_DIR: locking must not
+# create it, or a state-only command would make the first watcher run skip profile initialization
 OWNER_RE = re.compile(r"^[A-Za-z0-9-]+$")  # no "_": keeps the "__" in state filenames unambiguous
 NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 PROVIDERS = ("claude", "codex", "gemini")
@@ -683,47 +687,164 @@ def run_cli_reviewer(settings: Settings, repo: str, pr: PR) -> bool:
 class Key(NamedTuple):
     pr: int
     head: str
-    profile: str | None  # None = bundled default, kept distinct from a profile named "default"
+    profile: str | None  # None = bundled default, different from profile "default"
+
+
+@dataclass(frozen=True)
+class ReviewRecord:
+    pr: int
+    head: str
+    profile: str | None
+    reviewed_at: str  # UTC ISO 8601, recorded when the reviewer completes successfully
+
+    def key(self) -> Key:
+        return Key(self.pr, self.head, self.profile)
+
+
+def _instant(timestamp: str) -> datetime:
+    """Parse a stored reviewed_at into a timezone-aware instant (compare instants, not strings)."""
+    return datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
 
 
 class State:
-    """Successfully reviewed HEADs of one repository (~/.config/misscat/<owner>__<repo>.json).
+    """State v2: completed reviews by repository, PR, HEAD and profile.
 
-    The repository is identified by the filename, so a record is PR + HEAD + profile.
-    Only completions are stored: a HEAD that is absent (failed, interrupted, never run) is
-    eligible for review. Completed records are never deleted. Loaded once at start; every
-    successful review rewrites the file atomically. One repository = one MissCat process =
-    one state file, so there is no locking and no merging.
+    v1 contained no review timestamps; by design it is discarded on first access
+    instead of guessing review order. Call only while holding repository_lock().
     """
 
     def __init__(self, path: Path):
         self.path = path
-        self._reviewed = self._load()
+        self._records = self._load()
+        self._reviewed = {row.key() for row in self._records}
+        if len(self._records) != len(self._reviewed):
+            raise StateError(f"duplicate review records in {path}")
 
-    def _load(self) -> set[Key]:
+    def _load(self) -> list[ReviewRecord]:
         if not self.path.exists():
-            return set()
+            return []
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
-            return {Key(int(r["pr"]), r["head"], r["profile"]) for r in raw["reviewed"]}
+            if not isinstance(raw, dict):
+                raise ValueError("expected a JSON object")
+            version = raw.get("version")
+            if type(version) is int and version == 1:  # not True / 1.0, which compare equal to 1
+                log.warning(
+                    "resetting legacy State v1 in %s: previously reviewed PR HEADs become eligible "
+                    "again, so currently open PRs may be reviewed again and use reviewer tokens",
+                    self.path)
+                self._write([])
+                return []
+            if type(version) is not int or version != 2:
+                raise ValueError("unsupported state version")
+            data = raw["reviewed"]
+            if not isinstance(data, list):
+                raise ValueError("reviewed must be a list")
+            result = []
+            for item in data:
+                if (not isinstance(item, dict) or type(item.get("pr")) is not int
+                        or item["pr"] <= 0 or not isinstance(item.get("head"), str)
+                        or not item["head"] or not (item.get("profile") is None
+                        or isinstance(item["profile"], str))):
+                    raise ValueError("malformed review entry")
+                ts = item["reviewed_at"]
+                if not isinstance(ts, str):
+                    raise ValueError("reviewed_at must be a timestamp")
+                parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if parsed.tzinfo is None or parsed.utcoffset() is None:
+                    raise ValueError("reviewed_at must have a timezone")
+                result.append(ReviewRecord(item["pr"], item["head"], item["profile"], ts))
+            return result
         except (OSError, ValueError, KeyError, TypeError) as exc:
             raise StateError(
                 f"unreadable state file {self.path} ({exc}); fix or delete it to continue"
             ) from exc
 
+    def _write(self, records: list[ReviewRecord]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        rows = sorted(records, key=lambda r: (r.pr, r.head, r.profile or ""))
+        data = {"version": 2, "reviewed": [
+            {"pr": r.pr, "head": r.head, "profile": r.profile, "reviewed_at": r.reviewed_at}
+            for r in rows
+        ]}
+        _write_atomic(self.path, json.dumps(data, indent=2) + "\n")
+
     def reviewed(self) -> set[Key]:
         return self._reviewed
 
+    def records(self) -> list[ReviewRecord]:
+        return list(self._records)
+
     def add(self, key: Key) -> None:
+        if key in self._reviewed:
+            return
+        timestamp = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+        records = [*self._records, ReviewRecord(*key, timestamp)]
+        self._write(records)
+        self._records = records
         self._reviewed.add(key)
-        rows = sorted(self._reviewed, key=lambda k: (k.pr, k.head, k.profile or ""))
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_name(self.path.name + ".tmp")
-        tmp.write_text(
-            json.dumps({"version": 1, "reviewed": [k._asdict() for k in rows]}, indent=2),
-            encoding="utf-8",
-        )
-        os.replace(tmp, self.path)
+
+    def is_latest(self, key: Key) -> bool:
+        group = [r for r in self._records if (r.pr, r.profile) == (key.pr, key.profile)]
+        if not group:
+            return False
+        return max(group, key=lambda r: _instant(r.reviewed_at)).key() == key
+
+    def remove_latest(self, key: Key) -> bool:
+        """Only remove the most recent successful review for a PR+profile."""
+        if not self.is_latest(key):
+            return False
+        records = [r for r in self._records if r.key() != key]
+        self._write(records)
+        self._records = records
+        self._reviewed.remove(key)
+        return True
+
+
+@contextmanager
+def repository_lock(repo: str):
+    """Hold an OS-backed, nonblocking lock for the whole watcher or state UI lifetime.
+
+    The .lock file intentionally remains on disk; existence is NOT lock ownership.
+    """
+    path = LOCK_ROOT / state_path(repo).with_suffix(".lock").name
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = path.open("a+b")
+    except OSError as exc:
+        raise StateError(f"cannot open repository lock {path}: {exc}") from exc
+    acquired = False
+    try:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                handle.seek(0)
+                if not handle.read(1):
+                    handle.seek(0)
+                    handle.write(bytes([0]))
+                    handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except OSError as exc:
+            raise StateError(
+                f"MissCat is already using {repo}, or its lock is unavailable ({exc}). "
+                "Stop the watcher before managing state or starting another watcher."
+            ) from exc
+        yield
+    finally:
+        if acquired:
+            if os.name == "nt":
+                import msvcrt
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
 
 
 # --------------------------------------------------------------------------- watcher
@@ -820,6 +941,189 @@ class Watcher:
         self.step = min(self.step + 1, len(seq) - 1)
 
 
+# --------------------------------------------------------------------------- interactive state UI
+
+
+def run_state_ui(state: State, repo: str) -> int:
+    """Keyboard-only state manager. This deliberately does not query GitHub."""
+    from prompt_toolkit.application import Application
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.layout import Layout, Window, FormattedTextControl
+    from prompt_toolkit.styles import Style
+
+    def ordered() -> list[ReviewRecord]:
+        return sorted(state.records(), key=lambda r: (
+            r.pr, r.profile or "", -datetime.fromisoformat(
+                r.reviewed_at.replace("Z", "+00:00")
+            ).timestamp()
+        ))
+
+    rows = ordered()
+    index = 0
+    mode = "list"
+    message = ""
+    styles = Style.from_dict({
+        "header": "bold ansicyan", "selected": "reverse",
+        "muted": "ansibrightblack", "warning": "bold ansiyellow",
+    })
+
+    def current() -> ReviewRecord | None:
+        return rows[index] if rows else None
+
+    def local_time(value: str) -> str:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone().strftime(
+            "%Y-%m-%d %H:%M:%S %Z"
+        )
+
+    def redraw():
+        result = [("class:header", "MissCat — State Manager\n"),
+                  ("", f"Repository: {repo}\n\n")]
+        r = current()
+        if mode == "detail" and r:
+            result += [
+                ("class:header", "HEAD details\n\n"),
+                ("", f"PR:          #{r.pr}\nProfile:     {r.profile or 'default'}\n"),
+                ("", f"HEAD SHA:    {r.head}\n"),
+                ("", f"Reviewed at: {local_time(r.reviewed_at)}\n\n"),
+                ("class:muted", "Esc/Enter return   Q quit\n"),
+            ]
+        else:
+            if not rows:
+                result.append(("class:muted", "No recorded reviews.\n"))
+            # Show a moving window: long histories must remain navigable by arrow keys.
+            page_size = 14
+            first = max(0, min(index - page_size // 2, len(rows) - page_size))
+            last = min(len(rows), first + page_size)
+            if first:
+                result.append(("class:muted", f"… {first} earlier rows above …\n"))
+            for n in range(first, last):
+                row = rows[n]
+                latest = state.is_latest(row.key())
+                text = (f"{'>' if n == index else ' '}  #{row.pr:<5} "
+                        f"{(row.profile or 'default'):<15} {row.head[:10]}  "
+                        f"{local_time(row.reviewed_at)}"
+                        f"{'  [latest]' if latest else ''}\n")
+                result.append(("class:selected" if n == index else "", text))
+            if last < len(rows):
+                result.append(("class:muted", f"… {len(rows) - last} more rows below …\n"))
+            result += [("", "\n"), ("class:muted",
+                "↑↓ Move   Enter Details   Del/BS Remove latest   Q/Esc Quit\n")]
+            if mode == "confirm" and r:
+                result.append(("class:warning",
+                    f"\nDelete PR #{r.pr} / {r.head[:10]} / {r.profile or 'default'}? [y/N] "))
+        if message:
+            result += [("", "\n"), ("class:warning", message + "\n")]
+        return result
+
+    bindings = KeyBindings()
+
+    @bindings.add("up")
+    def move_up(event):
+        nonlocal index, message
+        if mode == "list" and rows:
+            index = max(0, index - 1)
+            message = ""
+
+    @bindings.add("down")
+    def move_down(event):
+        nonlocal index, message
+        if mode == "list" and rows:
+            index = min(len(rows) - 1, index + 1)
+            message = ""
+
+    @bindings.add("enter")
+    def enter(event):
+        nonlocal mode, message
+        if mode == "confirm":
+            mode = "list"  # default N
+        elif mode == "detail":
+            mode = "list"
+        elif current():
+            mode = "detail"
+        message = ""
+
+    def request_delete(event):
+        nonlocal mode, message
+        r = current()
+        if mode != "list" or r is None:
+            return
+        if not state.is_latest(r.key()):
+            message = "Only the most recently reviewed HEAD for this PR/profile can be removed."
+        else:
+            message = ""
+            mode = "confirm"
+
+    bindings.add("delete")(request_delete)
+    bindings.add("backspace")(request_delete)
+
+    @bindings.add("y")
+    def confirm_yes(event):
+        nonlocal mode, rows, index, message
+        if mode != "confirm":
+            return
+        r = current()
+        try:
+            if r is not None and state.remove_latest(r.key()):
+                rows = ordered()
+                index = max(0, min(index, len(rows) - 1))
+                message = "Deleted one completed review. Only a matching current PR HEAD is re-reviewed."
+            else:
+                message = "No eligible record selected."
+        except (OSError, StateError) as exc:
+            message = f"Cannot save state: {exc}"
+        mode = "list"
+
+    @bindings.add("n")
+    def confirm_no(event):
+        nonlocal mode, message
+        if mode == "confirm":
+            mode, message = "list", ""
+
+    @bindings.add("escape")
+    def escape(event):
+        nonlocal mode, message
+        if mode == "list":
+            event.app.exit()
+        else:
+            mode, message = "list", ""
+
+    @bindings.add("q")
+    @bindings.add("c-c")
+    def quit_ui(event):
+        nonlocal mode
+        if mode == "confirm":
+            mode = "list"  # cancellation
+        else:
+            event.app.exit()
+
+    app = Application(
+        layout=Layout(Window(FormattedTextControl(redraw), wrap_lines=False)),
+        key_bindings=bindings,
+        style=styles,
+        full_screen=True,
+        mouse_support=False,
+    )
+    app.run()
+    return 0
+
+
+def run_state(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="misscat state", description="Interactively inspect/remove completed review HEADs."
+    )
+    parser.add_argument("repo", metavar="owner/repo")
+    args = parser.parse_args(argv)
+    try:
+        repo = canonical_repo(args.repo)
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            raise StateError("state manager needs an interactive terminal (TTY)")
+        with repository_lock(repo):
+            return run_state_ui(State(state_path(repo)), repo)
+    except MissCatError as exc:
+        print(f"misscat: {exc}", file=sys.stderr)
+        return 2
+
+
 # --------------------------------------------------------------------------- CLI
 
 
@@ -830,7 +1134,8 @@ def main(argv: list[str] | None = None) -> int:
         description="Watch a GitHub repository and run an AI review on every new PR HEAD.",
         epilog=(
             "profile is a name: 'sol' loads ~/.config/misscat/sol.yml over the defaults.\n"
-            "`misscat init [--force]` installs the bundled profiles (see `misscat init -h`).\n\n"
+            "`misscat init [--force]` installs bundled profiles.\n"
+            "`misscat state owner/repo` opens the state manager.\n\n"
             "Requirements and limits:\n"
             "  - Git must authenticate to the repository (Git/SSH auth, or run\n"
             "    `gh auth setup-git` for HTTPS). MissCat stores no credentials.\n"
@@ -842,6 +1147,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     if argv and argv[0] == "init":
         return run_init(argv[1:])
+    if argv and argv[0] == "state":
+        return run_state(argv[1:])
     parser.add_argument("repo", metavar="owner/repo")
     parser.add_argument("profile", metavar="profile", nargs="?")
     parser.add_argument(
@@ -871,15 +1178,16 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         repo = canonical_repo(args.repo)  # canonicalize once; everything below uses this form
-        ensure_initial_profiles()
-        settings = load_settings(args.profile)
-        for tool in ("git", "gh", EXECUTABLES[settings.provider]):
-            if shutil.which(tool) is None:
-                raise MissCatError(f"required CLI not found on PATH: {tool}")
-        state = State(state_path(repo))  # fails early on a corrupt state file
-        log.info("watching %s with %s/%s (profile: %s)", repo, settings.provider,
-                 settings.model, args.profile or "default")
-        Watcher(repo, args.profile, settings, state, gh_open_prs, run_cli_reviewer).run_forever()
+        with repository_lock(repo):
+            ensure_initial_profiles()
+            settings = load_settings(args.profile)
+            for tool in ("git", "gh", EXECUTABLES[settings.provider]):
+                if shutil.which(tool) is None:
+                    raise MissCatError(f"required CLI not found on PATH: {tool}")
+            state = State(state_path(repo))  # v1 resets; corrupt/unknown files fail safely
+            log.info("watching %s with %s/%s (profile: %s)", repo, settings.provider,
+                     settings.model, args.profile or "default")
+            Watcher(repo, args.profile, settings, state, gh_open_prs, run_cli_reviewer).run_forever()
     except MissCatError as exc:
         print(f"misscat: {exc}", file=sys.stderr)
         return 2
