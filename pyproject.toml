@@ -42,4 +42,4 @@ misscat = "misscat:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-misscat = ["default.yml", "py.typed"]
+misscat = ["default.yml", "py.typed", "profiles/*.yml"]

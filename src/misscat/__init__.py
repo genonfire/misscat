@@ -11,7 +11,7 @@ repository's own instruction files (REVIEW.md, CLAUDE.md, AGENTS.md) by itself. 
 never parses them and never touches your own working tree.
 
 Local layout (repository names are canonicalized to lowercase)
-  ~/.config/misscat/<profile>.yml          reviewer profiles
+  ~/.config/misscat/<profile>.yml          reviewer profiles (bundled ones installed by `misscat init`)
   ~/.config/misscat/<owner>__<repo>.json   reviewed HEADs of one repository (PR + HEAD + profile)
   ~/.cache/misscat/repos/<owner>/<repo>/   persistent review workspace
 
@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.resources
+import tempfile
 import json
 import logging
 import os
@@ -178,6 +179,99 @@ def load_settings(profile: str | None) -> Settings:
     if profile is not None:
         cfg = deep_merge(cfg, _load_yaml(profile_path(profile)))
     return build_settings(cfg)
+
+
+# --------------------------------------------------------------------------- bundled profiles
+
+
+def bundled_profiles() -> dict[str, str]:
+    """Bundled reviewer profiles (`profiles/*.yml` in the package), name -> content.
+
+    `default.yml` is the internal base configuration and is never part of this set.
+    """
+    try:
+        root = importlib.resources.files("misscat").joinpath("profiles")
+        return {
+            item.name: item.read_text(encoding="utf-8")
+            for item in sorted(root.iterdir(), key=lambda i: i.name)
+            if item.name.endswith(".yml")
+        }
+    except (OSError, TypeError) as exc:
+        raise ConfigError(f"cannot read bundled profiles: {exc}") from exc
+
+
+def _write_atomic(path: Path, content: str) -> None:
+    """Write via a temporary file in the same directory, then replace: no half-written YAML."""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            handle.write(content)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def install_profiles(force: bool = False) -> tuple[list[str], list[str]]:
+    """Copy bundled profiles into CONFIG_DIR; return (installed, skipped).
+
+    Existing files are kept unless `force`. Other files in CONFIG_DIR are never touched.
+    """
+    profiles = bundled_profiles()
+    installed: list[str] = []
+    skipped: list[str] = []
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        for name, content in profiles.items():
+            target = CONFIG_DIR / name
+            if (target.exists() or target.is_symlink()) and not force:
+                skipped.append(name)
+                continue
+            _write_atomic(target, content)
+            installed.append(name)
+    except OSError as exc:
+        raise ConfigError(
+            f"cannot install bundled profiles into {CONFIG_DIR}: {exc}. "
+            "Fix the problem, then run `misscat init` to restore missing profiles."
+        ) from exc
+    return installed, skipped
+
+
+def ensure_initial_profiles() -> None:
+    """First normal run only: if CONFIG_DIR does not exist, create it and copy all profiles."""
+    if CONFIG_DIR.exists():
+        return
+    installed, _ = install_profiles()
+    log.info("first run: installed profiles into %s: %s", CONFIG_DIR, ", ".join(installed) or "none")
+
+
+def run_init(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="misscat init",
+        description="Copy the bundled reviewer profiles into ~/.config/misscat/. "
+        "Only missing profiles are created; existing files are left untouched.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="overwrite files named like bundled profiles with fresh copies "
+        "(other profiles are kept)",
+    )
+    args = parser.parse_args(argv)
+    try:
+        installed, skipped = install_profiles(force=args.force)
+    except MissCatError as exc:
+        print(f"misscat: {exc}", file=sys.stderr)
+        return 2
+    verb = "overwrote/created" if args.force else "installed"
+    print(f"{verb}: {', '.join(installed) or 'none'}")
+    if skipped:
+        print(f"skipped (already exist): {', '.join(skipped)}")
+    print(f"profiles directory: {CONFIG_DIR}")
+    return 0
 
 
 # --------------------------------------------------------------------------- repository identity
@@ -726,7 +820,8 @@ def main(argv: list[str] | None = None) -> int:
         prog="misscat",
         description="Watch a GitHub repository and run an AI review on every new PR HEAD.",
         epilog=(
-            "profile is a name: 'sol' loads ~/.config/misscat/sol.yml over the defaults.\n\n"
+            "profile is a name: 'sol' loads ~/.config/misscat/sol.yml over the defaults.\n"
+            "`misscat init [--force]` installs the bundled profiles (see `misscat init -h`).\n\n"
             "Requirements and limits:\n"
             "  - Git must authenticate to the repository (Git/SSH auth, or run\n"
             "    `gh auth setup-git` for HTTPS). MissCat stores no credentials.\n"
@@ -736,6 +831,8 @@ def main(argv: list[str] | None = None) -> int:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    if argv and argv[0] == "init":
+        return run_init(argv[1:])
     parser.add_argument("repo", metavar="owner/repo")
     parser.add_argument("profile", metavar="profile", nargs="?")
     parser.add_argument(
@@ -765,6 +862,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         repo = canonical_repo(args.repo)  # canonicalize once; everything below uses this form
+        ensure_initial_profiles()
         settings = load_settings(args.profile)
         for tool in ("git", "gh", EXECUTABLES[settings.provider]):
             if shutil.which(tool) is None:

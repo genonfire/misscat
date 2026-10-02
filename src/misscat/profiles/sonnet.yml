@@ -1,0 +1,6 @@
+reviewer:
+  provider: claude
+  model: claude-sonnet-5-5
+  args:
+    - --allowedTools
+    - "Bash(gh *)"
