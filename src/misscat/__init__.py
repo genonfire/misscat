@@ -45,7 +45,7 @@ from typing import Callable, NamedTuple
 
 import yaml
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 log = logging.getLogger("misscat")
 
