@@ -153,7 +153,7 @@ The manager works from local State JSON; it does not call GitHub. Removing a rec
 ### State v2 and process safety
 
 - Every successful review now stores `reviewed_at` as an ISO 8601 UTC timestamp. Display uses local time. Existing PR/HEAD/profile identity and the JSON sorting convention remain unchanged.
-- **Breaking state reset:** on first State access after this upgrade, any **v1** reviewed history is intentionally discarded and the file is rewritten as an empty **v2** State. Consequently, open PR HEADs previously marked complete become eligible for a new AI review. This may consume additional reviewer tokens. Unknown versions and corrupt State files cause errors instead of being discarded.
+- **Breaking state reset:** **stop all previously running MissCat watchers before upgrading to this version**; older watchers do not participate in the new OS locking scheme and may restore v1 records from memory. On first State access after upgrade, any **v1** reviewed history is intentionally discarded and the file is rewritten as an empty **v2** State. Consequently, open PR HEADs previously marked complete become eligible for a new AI review. This may consume additional reviewer tokens. Unknown versions and corrupt State files cause errors instead of being discarded.
 - A per-repository OS file lock prevents a watcher and a state manager—or two watchers—from running on the same repository simultaneously, even with different profiles. Stop the watcher before editing state. The `.lock` file may remain on disk after exit; the OS releases its lock when the process exits. Do not use the file's existence as an indication of an active watcher.
 - State manager needs an interactive TTY. It does not touch profile YAML files or cache workspaces.
 
