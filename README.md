@@ -107,13 +107,13 @@ misscat genonfire/misscat
 Use a specific reviewer profile:
 
 ```bash
-misscat genonfire/misscat luna
+misscat genonfire/misscat sol
 ```
 
-MissCat resolves `luna` as:
+MissCat resolves `sol` as:
 
 ```text
-~/.config/misscat/luna.yml
+~/.config/misscat/sol.yml
 ```
 
 Running `misscat` with no arguments (or `misscat --help`) shows usage help:
@@ -138,7 +138,7 @@ Directory layout:
 
 ```text
 ~/.config/misscat/
-├── luna.yml
+├── sol.yml
 ├── sonnet.yml
 ├── genonfire__typewriter.json
 └── genonfire__misscat.json
@@ -155,7 +155,7 @@ reviewer:
   #   - "Bash(gh *)"
 
   provider: codex
-  model: gpt-6.1-sol
+  model: gpt-6-luna
   args:
     - --sandbox
     - workspace-write
@@ -164,7 +164,7 @@ reviewer:
     - -c
     - apps._default.enabled=false
     - -c
-    - model_reasoning_effort=medium
+    - model_reasoning_effort=max
 
 prompt: |
   Read REVIEW.md if exist and act as the 1st reviewer.
@@ -178,12 +178,12 @@ review:
   include_drafts: true
 ```
 
-Example `~/.config/misscat/luna.yml`:
+Example `~/.config/misscat/sol.yml`:
 
 ```yaml
 reviewer:
   provider: codex
-  model: gpt-6-luna
+  model: gpt-6.1-sol
   args:
     - --sandbox
     - workspace-write
@@ -192,7 +192,7 @@ reviewer:
     - -c
     - apps._default.enabled=false
     - -c
-    - model_reasoning_effort=max
+    - model_reasoning_effort=medium
 ```
 
 The selected local profile overrides the bundled defaults.
