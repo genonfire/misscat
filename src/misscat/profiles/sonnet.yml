@@ -4,3 +4,7 @@ reviewer:
   args:
     - --allowedTools
     - "Bash(gh *)"
+
+prompt: |
+  Read REVIEW.md if exist and act as the 1st reviewer.
+  Use the gh CLI for GitHub operations, including posting the review.

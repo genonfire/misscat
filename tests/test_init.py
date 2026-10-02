@@ -11,7 +11,13 @@ from unittest import mock
 import misscat
 
 ROOT = Path(__file__).resolve().parent.parent
-BUNDLED = {"luna.yml", "sol.yml", "sonnet.yml", "gemini.yml"}
+BUNDLED = {"luna.yml", "sol.yml", "sonnet.yml", "opus5.5medium.yml", "gemini.yml"}
+
+
+DEFAULT_PROMPT = (
+    "Read REVIEW.md if exist and act as the 1st reviewer.\n"
+    "Use the gh CLI for GitHub operations, including posting the review.\n"
+)
 
 
 class InitTest(unittest.TestCase):
@@ -32,7 +38,19 @@ class InitTest(unittest.TestCase):
         for name, text in misscat.bundled_profiles().items():
             reviewer = yaml.safe_load(text)["reviewer"]
             self.assertEqual({"provider", "model", "args"}, set(reviewer), name)
+            self.assertEqual(yaml.safe_load(text)["prompt"], DEFAULT_PROMPT, name)
             misscat.build_settings(misscat.deep_merge(misscat._load_default_config(), yaml.safe_load(text)))
+
+    def test_opus_profile_settings_and_command(self):
+        import yaml
+        cfg = misscat.deep_merge(misscat._load_default_config(),
+                                 yaml.safe_load(misscat.bundled_profiles()["opus5.5medium.yml"]))
+        settings = misscat.build_settings(cfg)
+        self.assertEqual((settings.provider, settings.model), ("claude", "claude-opus-5-5"))
+        self.assertEqual(settings.args, ("--effort", "medium", "--allowedTools", "Bash(gh *)"))
+        cmd = misscat.COMMANDS[settings.provider](settings.model, "PROMPT", list(settings.args))
+        self.assertEqual(cmd[:5], ["claude", "--effort", "medium", "--allowedTools", "Bash(gh *)"])
+        self.assertEqual(cmd[5:9], ["-p", "PROMPT", "--model", "claude-opus-5-5"])
 
     def test_first_run_creates_all(self):
         misscat.ensure_initial_profiles()

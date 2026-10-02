@@ -1,11 +1,11 @@
 reviewer:
-  provider: gemini
-  model: gemini-3.8-flash-low
+  provider: claude
+  model: claude-opus-5-5
   args:
-    - --output-format
-    - stream-json
-    - --print-timeout
-    - 30m
+    - --effort
+    - medium
+    - --allowedTools
+    - "Bash(gh *)"
 
 prompt: |
   Read REVIEW.md if exist and act as the 1st reviewer.
