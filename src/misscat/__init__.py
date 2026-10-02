@@ -979,13 +979,22 @@ def run_state_ui(state: State, repo: str) -> int:
         else:
             if not rows:
                 result.append(("class:muted", "No recorded reviews.\n"))
-            for n, row in enumerate(rows):
+            # Show a moving window: long histories must remain navigable by arrow keys.
+            page_size = 14
+            first = max(0, min(index - page_size // 2, len(rows) - page_size))
+            last = min(len(rows), first + page_size)
+            if first:
+                result.append(("class:muted", f"… {first} earlier rows above …\n"))
+            for n in range(first, last):
+                row = rows[n]
                 latest = state.is_latest(row.key())
                 text = (f"{'>' if n == index else ' '}  #{row.pr:<5} "
                         f"{(row.profile or 'default'):<15} {row.head[:10]}  "
                         f"{local_time(row.reviewed_at)}"
                         f"{'  [latest]' if latest else ''}\n")
                 result.append(("class:selected" if n == index else "", text))
+            if last < len(rows):
+                result.append(("class:muted", f"… {len(rows) - last} more rows below …\n"))
             result += [("", "\n"), ("class:muted",
                 "↑↓ Move   Enter Details   Del/BS Remove latest   Q/Esc Quit\n")]
             if mode == "confirm" and r:
