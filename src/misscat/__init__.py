@@ -27,6 +27,8 @@ Requirements and limits
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+from datetime import datetime, timezone
 import importlib.resources
 import tempfile
 import json
@@ -683,47 +685,155 @@ def run_cli_reviewer(settings: Settings, repo: str, pr: PR) -> bool:
 class Key(NamedTuple):
     pr: int
     head: str
-    profile: str | None  # None = bundled default, kept distinct from a profile named "default"
+    profile: str | None  # None = bundled default, different from profile "default"
+
+
+@dataclass(frozen=True)
+class ReviewRecord:
+    pr: int
+    head: str
+    profile: str | None
+    reviewed_at: str  # UTC ISO 8601, recorded when the reviewer completes successfully
+
+    def key(self) -> Key:
+        return Key(self.pr, self.head, self.profile)
 
 
 class State:
-    """Successfully reviewed HEADs of one repository (~/.config/misscat/<owner>__<repo>.json).
+    """State v2: completed reviews by repository, PR, HEAD and profile.
 
-    The repository is identified by the filename, so a record is PR + HEAD + profile.
-    Only completions are stored: a HEAD that is absent (failed, interrupted, never run) is
-    eligible for review. Completed records are never deleted. Loaded once at start; every
-    successful review rewrites the file atomically. One repository = one MissCat process =
-    one state file, so there is no locking and no merging.
+    v1 contained no review timestamps; by design it is discarded on first access
+    instead of guessing review order. Call only while holding repository_lock().
     """
 
     def __init__(self, path: Path):
         self.path = path
-        self._reviewed = self._load()
+        self._records = self._load()
+        self._reviewed = {row.key() for row in self._records}
+        if len(self._records) != len(self._reviewed):
+            raise StateError(f"duplicate review records in {path}")
 
-    def _load(self) -> set[Key]:
+    def _load(self) -> list[ReviewRecord]:
         if not self.path.exists():
-            return set()
+            return []
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
-            return {Key(int(r["pr"]), r["head"], r["profile"]) for r in raw["reviewed"]}
+            if not isinstance(raw, dict):
+                raise ValueError("expected a JSON object")
+            if raw.get("version") == 1:
+                log.warning("resetting legacy State v1 in %s (old reviews will be eligible again)", self.path)
+                self._write([])
+                return []
+            if raw.get("version") != 2:
+                raise ValueError("unsupported state version")
+            data = raw["reviewed"]
+            if not isinstance(data, list):
+                raise ValueError("reviewed must be a list")
+            result = []
+            for item in data:
+                if (not isinstance(item, dict) or type(item.get("pr")) is not int
+                        or item["pr"] <= 0 or not isinstance(item.get("head"), str)
+                        or not item["head"] or not (item.get("profile") is None
+                        or isinstance(item["profile"], str))):
+                    raise ValueError("malformed review entry")
+                ts = item["reviewed_at"]
+                if not isinstance(ts, str):
+                    raise ValueError("reviewed_at must be a timestamp")
+                parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if parsed.tzinfo is None or parsed.utcoffset() is None:
+                    raise ValueError("reviewed_at must have a timezone")
+                result.append(ReviewRecord(item["pr"], item["head"], item["profile"], ts))
+            return result
         except (OSError, ValueError, KeyError, TypeError) as exc:
             raise StateError(
                 f"unreadable state file {self.path} ({exc}); fix or delete it to continue"
             ) from exc
 
+    def _write(self, records: list[ReviewRecord]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        rows = sorted(records, key=lambda r: (r.pr, r.head, r.profile or ""))
+        data = {"version": 2, "reviewed": [
+            {"pr": r.pr, "head": r.head, "profile": r.profile, "reviewed_at": r.reviewed_at}
+            for r in rows
+        ]}
+        _write_atomic(self.path, json.dumps(data, indent=2) + "\n")
+
     def reviewed(self) -> set[Key]:
         return self._reviewed
 
+    def records(self) -> list[ReviewRecord]:
+        return list(self._records)
+
     def add(self, key: Key) -> None:
+        if key in self._reviewed:
+            return
+        timestamp = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+        records = [*self._records, ReviewRecord(*key, timestamp)]
+        self._write(records)
+        self._records = records
         self._reviewed.add(key)
-        rows = sorted(self._reviewed, key=lambda k: (k.pr, k.head, k.profile or ""))
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_name(self.path.name + ".tmp")
-        tmp.write_text(
-            json.dumps({"version": 1, "reviewed": [k._asdict() for k in rows]}, indent=2),
-            encoding="utf-8",
-        )
-        os.replace(tmp, self.path)
+
+    def is_latest(self, key: Key) -> bool:
+        group = [r for r in self._records if (r.pr, r.profile) == (key.pr, key.profile)]
+        if not group:
+            return False
+        return max(group, key=lambda r: r.reviewed_at).key() == key
+
+    def remove_latest(self, key: Key) -> bool:
+        """Only remove the most recent successful review for a PR+profile."""
+        if not self.is_latest(key):
+            return False
+        records = [r for r in self._records if r.key() != key]
+        self._write(records)
+        self._records = records
+        self._reviewed.remove(key)
+        return True
+
+
+@contextmanager
+def repository_lock(repo: str):
+    """Hold an OS-backed, nonblocking lock for the whole watcher or state UI lifetime.
+
+    The .lock file intentionally remains on disk; existence is NOT lock ownership.
+    """
+    path = state_path(repo).with_suffix(".lock")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = path.open("a+b")
+    except OSError as exc:
+        raise StateError(f"cannot open repository lock {path}: {exc}") from exc
+    acquired = False
+    try:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                handle.seek(0)
+                if not handle.read(1):
+                    handle.seek(0)
+                    handle.write(b"\\0")
+                    handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except OSError as exc:
+            raise StateError(
+                f"MissCat is already using {repo}, or its lock is unavailable ({exc}). "
+                "Stop the watcher before managing state or starting another watcher."
+            ) from exc
+        yield
+    finally:
+        if acquired:
+            if os.name == "nt":
+                import msvcrt
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
 
 
 # --------------------------------------------------------------------------- watcher
