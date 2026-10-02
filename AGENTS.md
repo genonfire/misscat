@@ -8,7 +8,7 @@ MissCat watches a GitHub repository for new pull requests and HEAD commits, then
 ## Invariants
 - Do not modify the user's development checkout. Reviews use MissCat's dedicated workspace under `~/.cache/misscat/repos/`.
 - Track completed reviews per repository, PR, HEAD SHA, and profile. Do not mark failed or interrupted runs as reviewed.
-- Preserve user data: never silently overwrite profiles or erase review history.
+- Preserve user-owned profiles. The intentional, documented one-time State v1 → v2 reset discards legacy review history; outside that explicit reset or a confirmed user deletion, never erase review history.
 - Keep configuration, review state, and workspaces separate. Profile initialization manages profiles only, never state JSON or cached repositories.
 - Maintain provider independence: Claude, Codex, and Gemini have different CLI arguments. Do not leak one provider's defaults into another.
 - Keep the existing authentication boundary: use the user's `git`, `gh`, and reviewer CLI credentials; do not store new tokens or secrets.
