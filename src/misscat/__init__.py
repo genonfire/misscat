@@ -810,7 +810,7 @@ def repository_lock(repo: str):
                 handle.seek(0)
                 if not handle.read(1):
                     handle.seek(0)
-                    handle.write(b"\\0")
+                    handle.write(bytes([0]))
                     handle.flush()
                 handle.seek(0)
                 msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
@@ -930,6 +930,180 @@ class Watcher:
         self.step = min(self.step + 1, len(seq) - 1)
 
 
+# --------------------------------------------------------------------------- interactive state UI
+
+
+def run_state_ui(state: State, repo: str) -> int:
+    """Keyboard-only state manager. This deliberately does not query GitHub."""
+    from prompt_toolkit.application import Application
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.layout import Layout, Window, FormattedTextControl
+    from prompt_toolkit.styles import Style
+
+    def ordered() -> list[ReviewRecord]:
+        return sorted(state.records(), key=lambda r: (
+            r.pr, r.profile or "", -datetime.fromisoformat(
+                r.reviewed_at.replace("Z", "+00:00")
+            ).timestamp()
+        ))
+
+    rows = ordered()
+    index = 0
+    mode = "list"
+    message = ""
+    styles = Style.from_dict({
+        "header": "bold ansicyan", "selected": "reverse",
+        "muted": "ansibrightblack", "warning": "bold ansiyellow",
+    })
+
+    def current() -> ReviewRecord | None:
+        return rows[index] if rows else None
+
+    def local_time(value: str) -> str:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone().strftime(
+            "%Y-%m-%d %H:%M:%S %Z"
+        )
+
+    def redraw():
+        result = [("class:header", "MissCat — State Manager\n"),
+                  ("", f"Repository: {repo}\n\n")]
+        r = current()
+        if mode == "detail" and r:
+            result += [
+                ("class:header", "HEAD details\n\n"),
+                ("", f"PR:          #{r.pr}\nProfile:     {r.profile or 'default'}\n"),
+                ("", f"HEAD SHA:    {r.head}\n"),
+                ("", f"Reviewed at: {local_time(r.reviewed_at)}\n\n"),
+                ("class:muted", "Esc/Enter return   Q quit\n"),
+            ]
+        else:
+            if not rows:
+                result.append(("class:muted", "No recorded reviews.\n"))
+            for n, row in enumerate(rows):
+                latest = state.is_latest(row.key())
+                text = (f"{'>' if n == index else ' '}  #{row.pr:<5} "
+                        f"{(row.profile or 'default'):<15} {row.head[:10]}  "
+                        f"{local_time(row.reviewed_at)}"
+                        f"{'  [latest]' if latest else ''}\n")
+                result.append(("class:selected" if n == index else "", text))
+            result += [("", "\n"), ("class:muted",
+                "↑↓ Move   Enter Details   Del/BS Remove latest   Q/Esc Quit\n")]
+            if mode == "confirm" and r:
+                result.append(("class:warning",
+                    f"\nDelete PR #{r.pr} / {r.head[:10]} / {r.profile or 'default'}? [y/N] "))
+        if message:
+            result += [("", "\n"), ("class:warning", message + "\n")]
+        return result
+
+    bindings = KeyBindings()
+
+    @bindings.add("up")
+    def move_up(event):
+        nonlocal index, message
+        if mode == "list" and rows:
+            index = max(0, index - 1)
+            message = ""
+
+    @bindings.add("down")
+    def move_down(event):
+        nonlocal index, message
+        if mode == "list" and rows:
+            index = min(len(rows) - 1, index + 1)
+            message = ""
+
+    @bindings.add("enter")
+    def enter(event):
+        nonlocal mode, message
+        if mode == "confirm":
+            mode = "list"  # default N
+        elif mode == "detail":
+            mode = "list"
+        elif current():
+            mode = "detail"
+        message = ""
+
+    def request_delete(event):
+        nonlocal mode, message
+        r = current()
+        if mode != "list" or r is None:
+            return
+        if not state.is_latest(r.key()):
+            message = "Only the most recently reviewed HEAD for this PR/profile can be removed."
+        else:
+            message = ""
+            mode = "confirm"
+
+    bindings.add("delete")(request_delete)
+    bindings.add("backspace")(request_delete)
+
+    @bindings.add("y")
+    def confirm_yes(event):
+        nonlocal mode, rows, index, message
+        if mode != "confirm":
+            return
+        r = current()
+        try:
+            if r is not None and state.remove_latest(r.key()):
+                rows = ordered()
+                index = max(0, min(index, len(rows) - 1))
+                message = "Deleted one completed review. Only a matching current PR HEAD is re-reviewed."
+            else:
+                message = "No eligible record selected."
+        except (OSError, StateError) as exc:
+            message = f"Cannot save state: {exc}"
+        mode = "list"
+
+    @bindings.add("n")
+    def confirm_no(event):
+        nonlocal mode, message
+        if mode == "confirm":
+            mode, message = "list", ""
+
+    @bindings.add("escape")
+    def escape(event):
+        nonlocal mode, message
+        if mode == "list":
+            event.app.exit()
+        else:
+            mode, message = "list", ""
+
+    @bindings.add("q")
+    @bindings.add("c-c")
+    def quit_ui(event):
+        nonlocal mode
+        if mode == "confirm":
+            mode = "list"  # cancellation
+        else:
+            event.app.exit()
+
+    app = Application(
+        layout=Layout(Window(FormattedTextControl(redraw), wrap_lines=False)),
+        key_bindings=bindings,
+        style=styles,
+        full_screen=True,
+        mouse_support=False,
+    )
+    app.run()
+    return 0
+
+
+def run_state(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="misscat state", description="Interactively inspect/remove completed review HEADs."
+    )
+    parser.add_argument("repo", metavar="owner/repo")
+    args = parser.parse_args(argv)
+    try:
+        repo = canonical_repo(args.repo)
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            raise StateError("state manager needs an interactive terminal (TTY)")
+        with repository_lock(repo):
+            return run_state_ui(State(state_path(repo)), repo)
+    except MissCatError as exc:
+        print(f"misscat: {exc}", file=sys.stderr)
+        return 2
+
+
 # --------------------------------------------------------------------------- CLI
 
 
@@ -940,7 +1114,8 @@ def main(argv: list[str] | None = None) -> int:
         description="Watch a GitHub repository and run an AI review on every new PR HEAD.",
         epilog=(
             "profile is a name: 'sol' loads ~/.config/misscat/sol.yml over the defaults.\n"
-            "`misscat init [--force]` installs the bundled profiles (see `misscat init -h`).\n\n"
+            "`misscat init [--force]` installs bundled profiles.\n"
+            "`misscat state owner/repo` opens the state manager.\n\n"
             "Requirements and limits:\n"
             "  - Git must authenticate to the repository (Git/SSH auth, or run\n"
             "    `gh auth setup-git` for HTTPS). MissCat stores no credentials.\n"
@@ -952,6 +1127,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     if argv and argv[0] == "init":
         return run_init(argv[1:])
+    if argv and argv[0] == "state":
+        return run_state(argv[1:])
     parser.add_argument("repo", metavar="owner/repo")
     parser.add_argument("profile", metavar="profile", nargs="?")
     parser.add_argument(
@@ -986,10 +1163,11 @@ def main(argv: list[str] | None = None) -> int:
         for tool in ("git", "gh", EXECUTABLES[settings.provider]):
             if shutil.which(tool) is None:
                 raise MissCatError(f"required CLI not found on PATH: {tool}")
-        state = State(state_path(repo))  # fails early on a corrupt state file
-        log.info("watching %s with %s/%s (profile: %s)", repo, settings.provider,
-                 settings.model, args.profile or "default")
-        Watcher(repo, args.profile, settings, state, gh_open_prs, run_cli_reviewer).run_forever()
+        with repository_lock(repo):
+            state = State(state_path(repo))  # v1 resets; corrupt/unknown files fail safely
+            log.info("watching %s with %s/%s (profile: %s)", repo, settings.provider,
+                     settings.model, args.profile or "default")
+            Watcher(repo, args.profile, settings, state, gh_open_prs, run_cli_reviewer).run_forever()
     except MissCatError as exc:
         print(f"misscat: {exc}", file=sys.stderr)
         return 2
