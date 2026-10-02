@@ -138,6 +138,25 @@ misscat init --force  # overwrite files named like bundled profiles with fresh c
 - If the automatic first-run copy is interrupted, `misscat init` restores the missing profiles.
 - `default.yml` is the internal base configuration and is not copied. Each bundled profile carries its own editable copy of the default `prompt`, so you can customize a reviewer's prompt in place; `default.yml` remains the fallback.
 
+## Review state manager
+
+Stop the watcher before opening the terminal state manager:
+
+```bash
+misscat state genonfire/typewriter
+```
+
+Use **↑/↓** to select any completed review, **Enter** for its full HEAD SHA, profile, and local review completion time, and **Esc/Q** to exit. **Delete** or **Backspace** only operates on the *most recently reviewed entry for that PR and profile* (by `reviewed_at`), with a `[y/N]` prompt. Older entries are read-only until newer entries in that PR/profile group have been removed. Nothing is deleted on Enter or when you decline confirmation.
+
+The manager works from local State JSON; it does not call GitHub. Removing a record makes that PR/HEAD/profile combination eligible for review again, **but only when the HEAD is the PR's current open HEAD** at the next watcher run. Removing historical HEADs does not trigger review of historical commits.
+
+### State v2 and process safety
+
+- Every successful review now stores `reviewed_at` as an ISO 8601 UTC timestamp. Display uses local time. Existing PR/HEAD/profile identity and the JSON sorting convention remain unchanged.
+- **Breaking state reset:** on first State access after this upgrade, any **v1** reviewed history is intentionally discarded and the file is rewritten as an empty **v2** State. Consequently, open PR HEADs previously marked complete become eligible for a new AI review. This may consume additional reviewer tokens. Unknown versions and corrupt State files cause errors instead of being discarded.
+- A per-repository OS file lock prevents a watcher and a state manager—or two watchers—from running on the same repository simultaneously, even with different profiles. Stop the watcher before editing state. The `.lock` file may remain on disk after exit; the OS releases its lock when the process exits. Do not use the file's existence as an indication of an active watcher.
+- State manager needs an interactive TTY. It does not touch profile YAML files or cache workspaces.
+
 ## Configuration
 
 MissCat ships with a bundled `default.yml` inside the package, so installed copies do not depend on the source checkout or current working directory.
