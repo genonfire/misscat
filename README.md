@@ -1,7 +1,6 @@
 # MissCat
 [![PyPI](https://img.shields.io/pypi/v/misscat.svg)](https://pypi.org/project/misscat/)
-[![PyPI Downloads](https://img.shields.io/pypi/dm/misscat)](https://pypi.org/project/misscat/)
-[![Downloads](https://api.pepy.tech/badge/misscat)](https://pepy.tech/project/misscat)
+[![PyPI Downloads](https://static.pepy.tech/personalized-badge/misscat?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads)](https://pepy.tech/projects/misscat)
 
 **Never miss a single commit.**
 
