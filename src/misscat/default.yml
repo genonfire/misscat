@@ -5,20 +5,8 @@ reviewer:
   #   - --allowedTools
   #   - "Bash(gh *)"
 
-  provider: codex
-  model: gpt-6.1-sol
-  args:
-    - --sandbox
-    - workspace-write
-    - -c
-    - sandbox_workspace_write.network_access=true
-    - -c
-    - apps._default.enabled=false
-    - -c
-    - model_reasoning_effort=medium
-
   # provider: codex
-  # model: gpt-6-luna
+  # model: gpt-6.1-sol
   # args:
   #   - --sandbox
   #   - workspace-write
@@ -27,7 +15,19 @@ reviewer:
   #   - -c
   #   - apps._default.enabled=false
   #   - -c
-  #   - model_reasoning_effort=max
+  #   - model_reasoning_effort=medium
+
+  provider: codex
+  model: gpt-6-luna
+  args:
+    - --sandbox
+    - workspace-write
+    - -c
+    - sandbox_workspace_write.network_access=true
+    - -c
+    - apps._default.enabled=false
+    - -c
+    - model_reasoning_effort=max
 
   # reviewer:
   # provider: gemini
