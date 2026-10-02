@@ -50,6 +50,42 @@ class StateManagerTests(unittest.TestCase):
                 misscat.State(self.path)
         self.assertEqual(self.path.read_text(), "{bad json")
 
+    def test_non_integer_versions_are_rejected_without_reset(self):
+        for bad in (True, 1.0, "1", None):
+            self.config.mkdir(parents=True, exist_ok=True)
+            content = json.dumps({"version": bad, "reviewed": [row("a", "2026-10-02T09:00:00Z")]})
+            self.path.write_text(content)
+            with misscat.repository_lock(REPO):
+                with self.assertRaises(misscat.StateError, msg=repr(bad)):
+                    misscat.State(self.path)
+            self.assertEqual(self.path.read_text(), content, repr(bad))
+
+    def test_v1_reset_warns_about_token_usage(self):
+        self.write_state(1, [])
+        with misscat.repository_lock(REPO):
+            with self.assertLogs("misscat", "WARNING") as logs:
+                misscat.State(self.path)
+        self.assertIn("tokens", logs.output[0])
+
+    def test_latest_compares_instants_not_strings(self):
+        # 11:00+02:00 is 09:00Z: earlier than 10:00Z although it sorts later as a string
+        self.write_state(2, [
+            row("early", "2026-10-02T11:00:00+02:00"),
+            row("late", "2026-10-02T10:00:00+00:00"),
+        ])
+        with misscat.repository_lock(REPO):
+            state = misscat.State(self.path)
+            self.assertFalse(state.remove_latest(misscat.Key(213, "early", "luna")))
+            self.assertTrue(state.remove_latest(misscat.Key(213, "late", "luna")))
+
+    def test_first_run_installs_profiles_despite_lock_creating_config_dir(self):
+        first_run = not misscat.CONFIG_DIR.exists()
+        self.assertTrue(first_run)
+        with misscat.repository_lock(REPO):
+            self.assertTrue(self.config.exists())  # the lock created it
+            misscat.ensure_initial_profiles(first_run)
+        self.assertTrue((self.config / "luna.yml").is_file())
+
     def test_timestamp_not_sha_controls_latest_and_stack_deletion(self):
         self.write_state(2, [
             row("zzz", "2026-10-02T09:00:00Z"),

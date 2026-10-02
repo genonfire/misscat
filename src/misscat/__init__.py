@@ -251,9 +251,15 @@ def install_profiles(force: bool = False) -> tuple[list[str], list[str]]:
     return installed, skipped
 
 
-def ensure_initial_profiles() -> None:
-    """First normal run only: if CONFIG_DIR does not exist, create it and copy all profiles."""
-    if CONFIG_DIR.exists():
+def ensure_initial_profiles(first_run: bool | None = None) -> None:
+    """First normal run only: if CONFIG_DIR does not exist, create it and copy all profiles.
+
+    `first_run` is the caller's pre-lock observation: taking the repository lock creates
+    CONFIG_DIR, so the directory must be checked before the lock is opened.
+    """
+    if first_run is None:
+        first_run = not CONFIG_DIR.exists()
+    if not first_run:
         return
     installed, _ = install_profiles()
     log.info("first run: installed profiles into %s: %s", CONFIG_DIR, ", ".join(installed) or "none")
@@ -699,6 +705,11 @@ class ReviewRecord:
         return Key(self.pr, self.head, self.profile)
 
 
+def _instant(timestamp: str) -> datetime:
+    """Parse a stored reviewed_at into a timezone-aware instant (compare instants, not strings)."""
+    return datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+
+
 class State:
     """State v2: completed reviews by repository, PR, HEAD and profile.
 
@@ -720,11 +731,15 @@ class State:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
             if not isinstance(raw, dict):
                 raise ValueError("expected a JSON object")
-            if raw.get("version") == 1:
-                log.warning("resetting legacy State v1 in %s (old reviews will be eligible again)", self.path)
+            version = raw.get("version")
+            if type(version) is int and version == 1:  # not True / 1.0, which compare equal to 1
+                log.warning(
+                    "resetting legacy State v1 in %s: previously reviewed PR HEADs become eligible "
+                    "again, so currently open PRs may be reviewed again and use reviewer tokens",
+                    self.path)
                 self._write([])
                 return []
-            if raw.get("version") != 2:
+            if type(version) is not int or version != 2:
                 raise ValueError("unsupported state version")
             data = raw["reviewed"]
             if not isinstance(data, list):
@@ -777,7 +792,7 @@ class State:
         group = [r for r in self._records if (r.pr, r.profile) == (key.pr, key.profile)]
         if not group:
             return False
-        return max(group, key=lambda r: r.reviewed_at).key() == key
+        return max(group, key=lambda r: _instant(r.reviewed_at)).key() == key
 
     def remove_latest(self, key: Key) -> bool:
         """Only remove the most recent successful review for a PR+profile."""
@@ -1167,8 +1182,9 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         repo = canonical_repo(args.repo)  # canonicalize once; everything below uses this form
+        first_run = not CONFIG_DIR.exists()  # the lock below creates CONFIG_DIR
         with repository_lock(repo):
-            ensure_initial_profiles()
+            ensure_initial_profiles(first_run)
             settings = load_settings(args.profile)
             for tool in ("git", "gh", EXECUTABLES[settings.provider]):
                 if shutil.which(tool) is None:
