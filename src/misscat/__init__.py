@@ -42,6 +42,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, NamedTuple
+from urllib.parse import urlsplit
 
 import yaml
 
@@ -300,6 +301,59 @@ def canonical_repo(repo: str) -> str:
     if not sep or not OWNER_RE.match(owner) or not NAME_RE.match(name) or name in (".", ".."):
         raise MissCatError(f"repository must look like owner/repo: {repo!r}")
     return f"{owner}/{name}".lower()
+
+
+SCP_REMOTE_RE = re.compile(r"^(?:[^@/:]+@)?github\.com:(?P<path>[^/].*)$", re.IGNORECASE)
+
+
+def parse_github_remote(url: str) -> str:
+    """Return owner/repo for a github.com remote URL; never echo the URL (may hold credentials)."""
+    url = url.strip()
+    path = None
+    match = SCP_REMOTE_RE.match(url)
+    if match and "://" not in url:
+        path = match.group("path")
+    elif "://" in url:
+        try:
+            parts = urlsplit(url)
+            host = (parts.hostname or "").lower()
+        except ValueError:
+            host, parts = "", None
+        if parts and parts.scheme in ("https", "ssh", "git") and host == "github.com":
+            path = parts.path.lstrip("/")
+    if path is None:
+        raise MissCatError("origin remote is not a github.com repository")
+    path = path.rstrip("/")
+    if path.endswith(".git"):
+        path = path[: -len(".git")]
+    try:
+        return canonical_repo(path)
+    except MissCatError:
+        raise MissCatError("origin remote is not a valid github.com owner/repo") from None
+
+
+def _local_git(*args: str) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(["git", *args], capture_output=True, text=True, check=False)
+    except OSError:
+        raise MissCatError("git is not available; cannot resolve '.'") from None
+
+
+def resolve_repo_arg(arg: str) -> str:
+    """Canonical owner/repo for a CLI argument; '.' always means this checkout's origin remote.
+
+    Runs before any State, config, lock or workspace access.
+    """
+    if arg != ".":
+        return canonical_repo(arg)
+    if _local_git("rev-parse", "--is-inside-work-tree").returncode != 0:
+        raise MissCatError("'.' requires running inside a Git repository")
+    result = _local_git("remote", "get-url", "origin")
+    if result.returncode != 0 or not result.stdout.strip():
+        raise MissCatError("'.' requires an 'origin' remote in the current Git repository")
+    repo = parse_github_remote(result.stdout)
+    print(f"resolved . -> {repo}")
+    return repo
 
 
 def state_path(repo: str) -> Path:
@@ -1111,10 +1165,10 @@ def run_state(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="misscat state", description="Interactively inspect/remove completed review HEADs."
     )
-    parser.add_argument("repo", metavar="owner/repo")
+    parser.add_argument("repo", metavar="owner/repo|.")
     args = parser.parse_args(argv)
     try:
-        repo = canonical_repo(args.repo)
+        repo = resolve_repo_arg(args.repo)
         if not (sys.stdin.isatty() and sys.stdout.isatty()):
             raise StateError("state manager needs an interactive terminal (TTY)")
         with repository_lock(repo):
@@ -1135,7 +1189,9 @@ def main(argv: list[str] | None = None) -> int:
         epilog=(
             "profile is a name: 'sol' loads ~/.config/misscat/sol.yml over the defaults.\n"
             "`misscat init [--force]` installs bundled profiles.\n"
-            "`misscat state owner/repo` opens the state manager.\n\n"
+            "`misscat state owner/repo` opens the state manager.\n"
+            "'.' as the repository always means the current Git repository's `origin` remote\n"
+            "(github.com only), e.g. `misscat .`, `misscat . luna`, `misscat state .`.\n\n"
             "Requirements and limits:\n"
             "  - Git must authenticate to the repository (Git/SSH auth, or run\n"
             "    `gh auth setup-git` for HTTPS). MissCat stores no credentials.\n"
@@ -1149,7 +1205,7 @@ def main(argv: list[str] | None = None) -> int:
         return run_init(argv[1:])
     if argv and argv[0] == "state":
         return run_state(argv[1:])
-    parser.add_argument("repo", metavar="owner/repo")
+    parser.add_argument("repo", metavar="owner/repo|.")
     parser.add_argument("profile", metavar="profile", nargs="?")
     parser.add_argument(
         "--loud",
@@ -1177,7 +1233,7 @@ def main(argv: list[str] | None = None) -> int:
         log.setLevel(logging.DEBUG)
 
     try:
-        repo = canonical_repo(args.repo)  # canonicalize once; everything below uses this form
+        repo = resolve_repo_arg(args.repo)  # canonicalize once; everything below uses this form
         with repository_lock(repo):
             ensure_initial_profiles()
             settings = load_settings(args.profile)

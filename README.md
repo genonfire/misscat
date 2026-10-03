@@ -126,6 +126,18 @@ misscat --help
 
 Repository names are canonicalized to lowercase, so `Genonfire/MissCat` and `genonfire/misscat` refer to the same local workspace and state.
 
+### Using `.` for the current repository
+
+`.` **always means the GitHub repository of the current Git checkout's `origin` remote**; `upstream` and other remotes are never used.
+
+```bash
+misscat .           # watch origin's repository with the default profile
+misscat . luna      # same repository, luna profile
+misscat state .     # manage that repository's review state
+```
+
+MissCat prints `resolved . -> owner/repo` and then behaves exactly as if you had typed that name (same state, lock and workspace). It works from subdirectories and worktrees, and understands `git@github.com:owner/repo.git`, `https://github.com/owner/repo(.git)` and `ssh://git@github.com/owner/repo(.git)`. It fails, before touching any state, when outside a Git repository, when `origin` is missing, or when `origin` is not on `github.com` (SSH host aliases are not interpreted).
+
 ## Bundled profiles: `misscat init`
 
 ```bash
