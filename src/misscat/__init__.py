@@ -46,7 +46,7 @@ from urllib.parse import urlsplit
 
 import yaml
 
-__version__ = "1.1.2"
+__version__ = "1.1.3"
 
 log = logging.getLogger("misscat")
 
@@ -911,6 +911,23 @@ def _fmt(seconds: float) -> str:
     return f"{seconds // 60}m" if seconds >= 60 and seconds % 60 == 0 else f"{seconds}s"
 
 
+def _fmt_elapsed(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    minutes, secs = divmod(seconds, 60)
+    return f"{minutes}m {secs}s" if minutes else f"{secs}s"
+
+
+REVIEW_SEPARATOR = "-" * 47
+
+
+def _log_review_separator() -> None:
+    """Blank line + separator on the stream the log handlers write to, so order is kept."""
+    stream = next((h.stream for h in (*log.handlers, *logging.getLogger().handlers)
+                   if isinstance(h, logging.StreamHandler) and hasattr(h, "stream")), sys.stderr)
+    stream.write(f"\n{REVIEW_SEPARATOR}\n")
+    stream.flush()
+
+
 class Watcher:
     """One watcher, one polling timer per repository.
 
@@ -972,7 +989,9 @@ class Watcher:
         return waiting[0] if waiting else None
 
     def _review(self, pr: PR) -> bool:
+        _log_review_separator()
         log.info("PR #%d: review start (%s)", pr.number, pr.head[:7])
+        started = time.monotonic()
         try:
             ok = self.reviewer(self.s, self.repo, pr)
         except Exception:
@@ -981,10 +1000,12 @@ class Watcher:
         if ok:
             self.state.add(self._key(pr))  # only a successful review is recorded
             self.last_failed = None
-            log.info("PR #%d: review done", pr.number)
+            log.info("PR #%d: review done in %s", pr.number,
+                     _fmt_elapsed(time.monotonic() - started))
         else:
             self.last_failed = self._key(pr)
-            log.warning("PR #%d: review failed, HEAD stays eligible", pr.number)
+            log.warning("PR #%d: review failed after %s, HEAD stays eligible", pr.number,
+                        _fmt_elapsed(time.monotonic() - started))
         return ok
 
     def _sleep_adaptive(self) -> None:
