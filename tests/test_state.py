@@ -115,6 +115,39 @@ class StateManagerTests(unittest.TestCase):
             self.assertEqual(json.loads(self.path.read_text())["version"], 2)
             self.assertEqual(len(state.records()), 2)
 
+    def test_display_order_is_newest_first_across_prs_and_profiles(self):
+        self.write_state(2, [
+            row("old25", "2026-10-01T09:00:00Z", profile="luna", pr=25),
+            row("new10", "2026-10-03T09:00:00Z", profile="sol", pr=10),
+            # same instant as new10, expressed with an offset: 18:00+09:00 == 09:00Z
+            row("tieB", "2026-10-03T18:00:00+09:00", profile="luna", pr=10),
+            row("tieA", "2026-10-03T09:00:00Z", profile="luna", pr=12),
+            row("mid", "2026-10-02T23:00:00-05:00", profile="sol", pr=3),  # 10-03 04:00Z
+        ])
+        with misscat.repository_lock(REPO):
+            state = misscat.State(self.path)
+            before = self.path.read_text()
+            heads = [r.head for r in misscat.display_order(state.records())]
+            # ties: higher PR first, then profile, then head
+            self.assertEqual(heads, ["tieA", "tieB", "new10", "mid", "old25"])
+            self.assertEqual(heads, [r.head for r in misscat.display_order(
+                list(reversed(state.records())))])
+            self.assertEqual(self.path.read_text(), before)
+
+    def test_deletion_targets_actual_record_after_reordering(self):
+        self.write_state(2, [
+            row("old25", "2026-10-01T09:00:00Z", pr=25),
+            row("new10", "2026-10-03T09:00:00Z", pr=10),
+        ])
+        with misscat.repository_lock(REPO):
+            state = misscat.State(self.path)
+            shown = misscat.display_order(state.records())
+            self.assertEqual(shown[0].pr, 10)
+            self.assertTrue(state.remove_latest(shown[1].key()))
+            self.assertEqual([r.head for r in state.records()], ["new10"])
+            self.assertEqual([r["head"] for r in json.loads(self.path.read_text())["reviewed"]],
+                             ["new10"])
+
     def test_successful_review_gets_utc_timestamp(self):
         with misscat.repository_lock(REPO):
             state = misscat.State(self.path)

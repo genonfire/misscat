@@ -46,7 +46,7 @@ from urllib.parse import urlsplit
 
 import yaml
 
-__version__ = "1.1.1"
+__version__ = "1.1.2"
 
 log = logging.getLogger("misscat")
 
@@ -998,6 +998,16 @@ class Watcher:
 # --------------------------------------------------------------------------- interactive state UI
 
 
+def display_order(records: list[ReviewRecord]) -> list[ReviewRecord]:
+    """Newest completed review first across all PRs/profiles; presentation only.
+
+    Ties on the instant are broken deterministically by PR (higher first), profile, then HEAD.
+    """
+    by_tie = sorted(records, key=lambda r: (r.profile or "", r.head))
+    by_tie.sort(key=lambda r: r.pr, reverse=True)
+    return sorted(by_tie, key=lambda r: _instant(r.reviewed_at), reverse=True)
+
+
 def run_state_ui(state: State, repo: str) -> int:
     """Keyboard-only state manager. This deliberately does not query GitHub."""
     from prompt_toolkit.application import Application
@@ -1006,11 +1016,7 @@ def run_state_ui(state: State, repo: str) -> int:
     from prompt_toolkit.styles import Style
 
     def ordered() -> list[ReviewRecord]:
-        return sorted(state.records(), key=lambda r: (
-            r.pr, r.profile or "", -datetime.fromisoformat(
-                r.reviewed_at.replace("Z", "+00:00")
-            ).timestamp()
-        ))
+        return display_order(state.records())
 
     rows = ordered()
     index = 0
