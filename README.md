@@ -355,6 +355,54 @@ When a review finishes successfully, it immediately checks the repository again 
 
 If a review or workspace preparation fails, that HEAD is not marked reviewed and MissCat waits 5 minutes before checking again.
 
+## BadCat: review-state watcher and opt-in merge
+
+`pipx install misscat` also installs **BadCat**, a second CLI from the same package and version. BadCat is not an AI reviewer: it deterministically watches *submitted GitHub PR reviews*, reports state transitions, and squash-merges only when started with `--merge`.
+
+```bash
+misscat owner/repo luna     # AI review (unchanged)
+badcat owner/repo           # DEFAULT: monitor and report only; NO GitHub writes
+badcat owner/repo --merge   # monitor, report, and squash-merge eligible PRs
+badcat . --trusted-reviewer luna --required-check gate
+```
+
+- `.` resolves to the current repository's `origin` exactly as in MissCat.
+- All **open** PRs are watched, Draft or Ready alike. BadCat never reads, changes or decides from Draft status; if GitHub rejects a merge of a Draft PR, the rejection is reported and BadCat keeps watching.
+- No AI calls, no checkout, no clone. It uses your existing `gh` login (`gh auth login`); no tokens are stored. `--merge` needs a `gh` account with permission to merge.
+- Output reports transitions only (new PR, new HEAD, `WAITING`, `+1`, `-1 BLOCKED`, `+2`, `INVALID`, CI/merge waits, merged, API errors), not repeated snapshots. Polling is every 60 seconds, backing off to 5 minutes on errors.
+
+### Review header
+
+Only a **submitted review** (GitHub state `COMMENTED`; not issue comments, inline-only comments or APPROVE) counts, and only if its raw body starts with exactly:
+
+```text
++1
+HEAD: <40 lowercase hex characters>
+
+<review evidence>
+```
+
+The first line is exactly `+1`, `+2` or `-1`: no leading blank or whitespace, decoration or explanation (`-1 : FAIL (blocker found)` is `INVALID`). The second line is `HEAD: <sha>` immediately after. Evidence must follow. The header SHA, the review's `commit_id` and the PR's current HEAD must all match, so reviews of an old HEAD never carry forward.
+
+For the current HEAD a valid `+1` followed later by a valid `+2` makes the PR eligible. A `-1` anywhere on the HEAD blocks it, a malformed or contradictory review on the HEAD is `INVALID`, and `+2` alone never authorizes. A new commit requires fresh reviews.
+
+### Trust
+
+Only reviews by trusted logins count (fail closed). Use `--trusted-reviewer LOGIN` (repeatable); the default is the authenticated `gh` user. Stage 1 and Stage 2 may share one account.
+
+### Merge gate (`--merge` only)
+
+Immediately before the only write, BadCat re-reads the PR HEAD and all reviews and re-evaluates everything, then requires:
+
+- the exact-HEAD check runs and commit status to be complete and passing (pending, failed, stale or missing CI fails closed, and a skipped job is never counted as a passing one; add `--required-check NAME` for the workflow/gate your repository relies on, which must have `success`),
+- GitHub to report the PR mergeable with a clean `mergeable_state` (so branch protection is honored).
+
+It then sends a **squash** merge with the expected HEAD SHA, so GitHub rejects it if the HEAD moved. There is no fallback to an unguarded merge. A rejection is logged once and not repeated until the PR's state changes; already merged or closed PRs are handled quietly. Disable any other automatic merger for the repository when using `--merge`.
+
+### State and process safety
+
+BadCat keeps its own notification-dedupe state in `~/.config/badcat/` and its own lock in `~/.cache/badcat/locks/`, separate from MissCat's. State never authorizes a merge (GitHub is always re-read), and unreadable state is ignored. One BadCat process per repository; MissCat and BadCat can run on the same repository at the same time.
+
 ## What MissCat does
 
 - Watches all open PRs in a repository
@@ -369,3 +417,5 @@ If a review or workspace preparation fails, that HEAD is not marked reviewed and
 MissCat does **not** modify code, push commits, or merge PRs.
 
 It watches. It catches. It reviews.
+
+(BadCat is the separate, opt-in merge operator described above.)
