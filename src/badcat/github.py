@@ -45,7 +45,10 @@ class GhClient:
         sep = "&" if "?" in path else "?"
         for page in range(1, MAX_PAGES + 1):
             data = self._api(f"{path}{sep}per_page=100&page={page}")
-            chunk = data[key] if key else data
+            try:
+                chunk = data[key] if key else data
+            except (KeyError, TypeError) as exc:
+                raise GhError(f"unexpected gh output: {exc}") from exc
             if not isinstance(chunk, list):
                 raise GhError("unexpected gh output: expected a list")
             items.extend(chunk)
@@ -78,6 +81,9 @@ class GhClient:
 
     def check_runs(self, sha: str) -> list:
         return self._pages(f"repos/{self.repo}/commits/{sha}/check-runs", "check_runs")
+
+    def workflow_runs(self, sha: str) -> list:
+        return self._pages(f"repos/{self.repo}/actions/runs?head_sha={sha}", "workflow_runs")
 
     def combined_status(self, sha: str) -> dict:
         return self._api(f"repos/{self.repo}/commits/{sha}/status")

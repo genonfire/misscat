@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "misscat"
-version = "1.2.0"
+version = "1.2.1"
 description = "Watch a GitHub repository and run an AI review on every new PR HEAD (plus BadCat, a review-state watcher with opt-in merge)"
 readme = "README.md"
 requires-python = ">=3.9"

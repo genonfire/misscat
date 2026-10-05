@@ -30,6 +30,7 @@ STATE_VERSION = 1
 # is reported. Everything else (blocked, behind, dirty, unstable, unknown...) fails closed.
 MERGEABLE_STATES = ("clean", "has_hooks", "draft")
 PASSING = ("success", "neutral", "skipped")
+ACTIONS_APP = "github-actions"  # app slug of check runs created by GitHub Actions workflows
 
 
 class BadCatError(MissCatError):
@@ -126,11 +127,19 @@ def first_line(body: Optional[str]) -> str:
     return (body or "").split("\n", 1)[0].rstrip("\r")
 
 
-def ci_gate(client, head: str, required: tuple) -> Optional[str]:
-    """None when exact-HEAD CI passes, else the reason. Fails closed on anything unclear."""
+def ci_gate(client, head: str) -> Optional[str]:
+    """None when exact-HEAD CI passes, else the reason. Fails closed on anything unclear.
+
+    Every reported check run, workflow run and commit status for the HEAD must be complete and
+    passing. Evidence that CI really executed is at least one *successful* check run created by
+    GitHub Actions: skipped runs, other apps' checks and commit statuses never count as proof.
+    The API cannot say which checks a repository requires, so an *absent* CI is only detected
+    when nothing successful from Actions exists; GitHub's own mergeability stays authoritative.
+    """
     runs = client.check_runs(head)
+    workflows = client.workflow_runs(head)
     status = client.combined_status(head)
-    successes = 0
+    executed = 0
     for run in runs:
         name = run.get("name", "?")
         if run.get("head_sha") != head:
@@ -140,25 +149,27 @@ def ci_gate(client, head: str, required: tuple) -> Optional[str]:
         conclusion = run.get("conclusion")
         if conclusion not in PASSING:
             return f"check {name} {conclusion or 'indeterminate'}"
-        successes += conclusion == "success"
+        if conclusion == "success" and (run.get("app") or {}).get("slug") == ACTIONS_APP:
+            executed += 1
+    for run in workflows:
+        name = run.get("name") or run.get("id", "?")
+        if run.get("head_sha") != head:
+            return f"stale workflow run {name}"
+        if run.get("status") != "completed":
+            return f"workflow {name} pending"
+        conclusion = run.get("conclusion")
+        if conclusion not in PASSING:
+            return f"workflow {name} {conclusion or 'indeterminate'}"
     if status.get("sha") not in (None, head):
         return "stale commit status"
-    if status.get("total_count"):
-        state = status.get("state")
-        if state != "success":
-            return f"commit status {state or 'indeterminate'}"
-        successes += 1
-    for name in required:
-        matching = [r for r in runs if r.get("name") == name]
-        # a skipped job is not an executed passing one
-        if not matching or max(matching, key=lambda r: r.get("id", 0)).get("conclusion") != "success":
-            return f"required check {name} has not succeeded"
-    if not successes:
-        return "no passing CI reported"
+    if status.get("total_count") and status.get("state") != "success":
+        return f"commit status {status.get('state') or 'indeterminate'}"
+    if not executed:
+        return "no successful GitHub Actions CI reported"
     return None
 
 
-def merge_gate(client, raw: dict, head: str, required: tuple) -> Optional[str]:
+def merge_gate(client, raw: dict, head: str) -> Optional[str]:
     """None when a merge may be attempted for exactly `head`, else the reason."""
     if raw.get("merged"):
         return "already merged"
@@ -172,7 +183,7 @@ def merge_gate(client, raw: dict, head: str, required: tuple) -> Optional[str]:
         return "not mergeable"
     if raw.get("mergeable_state") not in MERGEABLE_STATES:
         return f"mergeable_state={raw.get('mergeable_state')}"
-    return ci_gate(client, head, required)
+    return ci_gate(client, head)
 
 
 class Watcher:
@@ -183,15 +194,10 @@ class Watcher:
         state: NotifyState,
         trusted: frozenset,
         merge: bool = False,
-        required: tuple = (),
         sleep: Callable[[float], None] = time.sleep,
     ):
-        if merge and not required:
-            # GitHub's required checks cannot be discovered reliably, so an unrelated passing
-            # check must never open the gate: the operator names the check that must succeed.
-            raise BadCatError("--merge requires at least one --required-check NAME")
         self.repo, self.client, self.state = repo, client, state
-        self.trusted, self.merge, self.required, self.sleep = trusted, merge, required, sleep
+        self.trusted, self.merge, self.sleep = trusted, merge, sleep
         self.errors = 0
         self.last_error: Optional[str] = None
         self.rejected: dict = {}  # PR number -> state at the last merge rejection
@@ -244,7 +250,7 @@ class Watcher:
         gate = None
         if verdict.stage == READY:
             raw = self.client.pr(pr.number)
-            gate = merge_gate(self.client, raw, pr.head, self.required)
+            gate = merge_gate(self.client, raw, pr.head)
         self._report(pr, reviews, verdict, gate)
         if verdict.stage == READY and gate is None and self.merge:
             self._merge(pr)
@@ -284,7 +290,7 @@ class Watcher:
             log.info("PR #%d: review state changed, not merging", pr.number)
             return
         raw = self.client.pr(pr.number)
-        reason = merge_gate(self.client, raw, pr.head, self.required)
+        reason = merge_gate(self.client, raw, pr.head)
         if reason is not None:
             log.info("PR #%d: not merging: %s", pr.number, reason)
             return
@@ -330,7 +336,9 @@ def main(argv: Optional[list] = None) -> int:
             "A PR is eligible when the current HEAD has a valid +1 followed by a valid +2 from a\n"
             "trusted reviewer, no -1, passing CI and a clean GitHub mergeability state.\n"
             "Trusted reviewers: --trusted-reviewer LOGIN (repeatable), default the `gh` user.\n"
-            "--merge also needs --required-check NAME (the workflow/gate that must succeed).\n"
+            "CI is discovered automatically: every check run, workflow run and commit status on the\n"
+            "HEAD must pass, and at least one GitHub Actions check must have succeeded (skipped\n"
+            "does not count). Branch protection stays authoritative for required checks.\n"
             "'.' means the current Git repository's `origin` remote (github.com only).\n"
             "Disable any other automatic merger for the repository when using --merge."
         ),
@@ -341,9 +349,6 @@ def main(argv: Optional[list] = None) -> int:
                         help="squash-merge PRs that pass every gate (default: notify only)")
     parser.add_argument("--trusted-reviewer", action="append", default=[], metavar="LOGIN",
                         help="GitHub login whose review markers count (repeatable)")
-    parser.add_argument("--required-check", action="append", default=[], metavar="NAME",
-                        help="check run that must have succeeded on the HEAD (repeatable; "
-                             "required with --merge)")
     parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {__version__}")
     if not argv:
         parser.print_help()
@@ -353,8 +358,6 @@ def main(argv: Optional[list] = None) -> int:
                         datefmt="%H:%M:%S")
     try:
         repo = resolve_repo_arg(args.repo)
-        if args.merge and not args.required_check:
-            raise BadCatError("--merge requires at least one --required-check NAME")
         if shutil.which("gh") is None:
             raise BadCatError("required CLI not found on PATH: gh")
         with merger_lock(repo):
@@ -368,8 +371,8 @@ def main(argv: Optional[list] = None) -> int:
                     raise BadCatError(f"cannot determine the authenticated gh user: {exc}") from exc
             log.info("Watching %s (%s; trusted reviewers: %s)", repo,
                      "merge enabled" if args.merge else "notify only", ", ".join(sorted(trusted)))
-            Watcher(repo, client, NotifyState(state_path(repo)), trusted, args.merge,
-                    tuple(args.required_check)).run_forever()
+            Watcher(repo, client, NotifyState(state_path(repo)), trusted,
+                    args.merge).run_forever()
     except MissCatError as exc:
         print(f"badcat: {exc}", file=sys.stderr)
         return 2
