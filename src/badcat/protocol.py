@@ -23,6 +23,9 @@ HEADER_RE = re.compile(r"\A(\+1|\+2|-1)\r?\nHEAD: ([0-9a-f]{40})\r?\n(.*)\Z", re
 LOOSE_RE = re.compile(r"\A\s*[*_`>#-]*\s*(?:\+1|\+2|-1)(?!\d)")
 
 
+NEUTRAL_STATES = ("APPROVED", "DISMISSED", "PENDING")  # never a pass, never a hold
+
+
 @dataclass(frozen=True)
 class Review:
     id: int
@@ -50,17 +53,22 @@ def evaluate(reviews: list, head: str, trusted: frozenset) -> Verdict:
 
     `trusted` holds lowercase logins; an empty set trusts nobody (fail closed).
     """
-    events = []  # markers in submission order; None = invalid review on the current HEAD
+    # markers in submission order; None = malformed marker review on the current HEAD,
+    # "?" = any other trusted review on the current HEAD (CHANGES_REQUESTED, plain comments...)
+    events = []
     untrusted = []
     for review in sorted(reviews, key=lambda r: (r.submitted_at or "", r.id)):
-        if review.state != "COMMENTED" or not review.submitted_at:
+        if not review.submitted_at or review.state in NEUTRAL_STATES:
             continue
         parsed = parse_header(review.body)
-        if parsed is None:
-            if review.commit_id == head and LOOSE_RE.match(review.body or ""):
-                event = None
-            else:
+        if review.state != "COMMENTED":
+            if review.commit_id != head:
                 continue
+            event = "?"  # never a pass, but it must not be silently outvoted by earlier passes
+        elif parsed is None:
+            if review.commit_id != head:
+                continue
+            event = None if LOOSE_RE.match(review.body or "") else "?"
         else:
             marker, sha, evidence = parsed
             if head not in (sha, review.commit_id):
@@ -78,6 +86,8 @@ def evaluate(reviews: list, head: str, trusted: frozenset) -> Verdict:
         return Verdict(INVALID, "malformed review on this HEAD")
     if "+1" in events:
         first = events.index("+1")
+        if "?" in events[first + 1:]:
+            return Verdict(INVALID, "non-pass review after +1 on this HEAD")
         if "+2" in events[first + 1:]:
             return Verdict(READY)
         return Verdict(PLUS1)

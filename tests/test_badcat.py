@@ -86,6 +86,18 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(self.stage(seq(rev("+1", A), rev("+2", A), rev("-1", A))), BLOCKED)
         self.assertEqual(self.stage(seq(rev("+1", A), rev("+2", A))), READY)
 
+    def test_non_pass_reviews_after_pass_hold_the_head(self):
+        passes = [rev("+1", A), rev("+2", A)]
+        for state, text in (("COMMENTED", "## 1차 리뷰 — 변경 요청"), ("CHANGES_REQUESTED", "## 1차 리뷰 — 변경 요청"),
+                            ("COMMENTED", ""), ("CHANGES_REQUESTED", body("+2", A))):
+            with self.subTest(state=state, text=text[:8]):
+                self.assertEqual(self.stage(seq(*passes, rev(None, A, state=state, text=text))), INVALID)
+        # before the first +1, on an old HEAD, from APPROVE, or from an untrusted user: no hold
+        self.assertEqual(self.stage(seq(rev(None, A, text="hi"), *passes)), READY)
+        self.assertEqual(self.stage(seq(*passes, rev(None, B, state="CHANGES_REQUESTED", text="x"))), READY)
+        self.assertEqual(self.stage(seq(*passes, rev(None, A, state="APPROVED", text="x"))), READY)
+        self.assertEqual(self.stage(seq(*passes, rev(None, A, login="eve", text="x"))), READY)
+
     def test_tie_break_by_id(self):
         same = "2026-01-01T00:00:00Z"
         r1 = Review(1, "me", "COMMENTED", body("+1", A), A, same)
@@ -151,7 +163,9 @@ class WatcherTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.dir = Path(tmp.name)
 
-    def watcher(self, client, merge=False, required=()):
+    def watcher(self, client, merge=False, required=None):
+        if required is None:
+            required = ("test",) if merge else ()
         return cli.Watcher("o/r", client, cli.NotifyState(self.dir / "s.json"), ME, merge, required,
                            sleep=lambda s: None)
 
@@ -302,6 +316,54 @@ class WatcherTests(unittest.TestCase):
             "INFO:badcat:PR #7: +1",
         ])
         self.assertFalse(any("INVALID" in m.upper() for m in lines))
+        self.assertEqual(c.calls, [])
+
+    def test_reviews_after_the_passes_hold_the_merge_but_print_their_first_line(self):
+        later = {
+            "COMMENTED": ("COMMENTED", "## 1차 리뷰 — 변경 요청\n\n상세"),
+            "CHANGES_REQUESTED": ("CHANGES_REQUESTED", "## 1차 리뷰 — 변경 요청\n\n상세"),
+            "empty": ("COMMENTED", ""),
+            "marker_as_changes_requested": ("CHANGES_REQUESTED", body("+2", A)),
+        }
+        for name, (state, text) in later.items():
+            with self.subTest(name):
+                passes = seq(rev("+1", A), rev("+2", A))
+                last = Review(950, "me", state, text, A, "2026-01-03T00:00:00Z")
+                c = FakeClient(reviews=passes)
+                w = self.watcher(c, merge=True)
+                c.open = True
+                # first sight records history; the late review is then announced and holds the PR
+                with self.assertLogs("badcat", level="DEBUG"):
+                    logging_marker()
+                    w.state.set(7, {"head": A, "reviews": [r.id for r in passes], "note": "", "gate": "ok"})
+                c.review_list = passes + [last]
+                _, out = self.run_cycle(w)
+                self.assertEqual(c.calls, [])
+                first = text.split("\n")[0]
+                self.assertIn(f"INFO:badcat:PR #7: {first}", out)
+                self.assertFalse(any("INVALID" in m.upper() for m in out))
+
+    def test_approval_and_earlier_comment_do_not_hold(self):
+        c = FakeClient(reviews=seq(rev(None, A, text="context for reviewers"), rev("+1", A),
+                                   rev("+2", A), rev(None, A, state="APPROVED", text="ok")))
+        self.run_cycle(self.watcher(c, merge=True))
+        self.assertEqual(len(c.calls), 1)
+
+    def test_merge_requires_an_explicit_required_check(self):
+        with self.assertRaises(cli.BadCatError):
+            cli.Watcher("o/r", FakeClient(), cli.NotifyState(self.dir / "x.json"), ME, merge=True)
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(cli.main(["o/r", "--merge"]), 2)
+        self.assertIn("--required-check", err.getvalue())
+
+    def test_unrelated_passing_check_does_not_open_the_merge_gate(self):
+        c = FakeClient()
+        c.runs = [{"name": "lint", "head_sha": A, "status": "completed", "conclusion": "success", "id": 1}]
+        self.run_cycle(self.watcher(c, merge=True, required=("ci:normal",)))
+        self.assertEqual(c.calls, [])
+        c.runs.append({"name": "ci:normal", "head_sha": A, "status": "completed",
+                       "conclusion": "skipped", "id": 2})
+        self.run_cycle(self.watcher(c, merge=True, required=("ci:normal",)))
         self.assertEqual(c.calls, [])
 
     def test_changes_requested_never_counts_toward_merge(self):

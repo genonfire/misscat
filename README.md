@@ -363,7 +363,7 @@ If a review or workspace preparation fails, that HEAD is not marked reviewed and
 misscat owner/repo luna     # AI review (unchanged)
 badcat owner/repo           # DEFAULT: monitor and report only; NO GitHub writes
 badcat owner/repo --merge   # monitor, report, and squash-merge eligible PRs
-badcat . --trusted-reviewer luna --required-check gate
+badcat . --merge --trusted-reviewer luna --required-check gate
 ```
 
 - `.` resolves to the current repository's `origin` exactly as in MissCat.
@@ -393,7 +393,7 @@ HEAD: <40 lowercase hex characters>
 
 The first line is exactly `+1`, `+2` or `-1`: no leading blank or whitespace, decoration or explanation (`-1 : FAIL (blocker found)` is printed as-is but never authorizes). The second line is `HEAD: <sha>` immediately after. Evidence must follow. The header SHA, the review's `commit_id` and the PR's current HEAD must all match, so reviews of an old HEAD never carry forward.
 
-For the current HEAD a valid `+1` followed later by a valid `+2` makes the PR eligible. A `-1` anywhere on the HEAD blocks it, a malformed or contradictory marker review on the HEAD also prevents merging, and `+2` alone never authorizes. Reviews that are not `COMMENTED` (for example `CHANGES_REQUESTED` or `APPROVED`) never count. A new commit requires fresh reviews.
+For the current HEAD a valid `+1` followed later by a valid `+2` makes the PR eligible, provided no later trusted review on that HEAD is something else: a `CHANGES_REQUESTED` or a plain/headerless `COMMENTED` review after the first `+1` holds the PR (its first line is still printed as usual) until a new HEAD is reviewed. `APPROVED` and `DISMISSED` reviews neither pass nor hold. A `-1` anywhere on the HEAD blocks it, a malformed or contradictory marker review on the HEAD also prevents merging, and `+2` alone never authorizes. Reviews that are not `COMMENTED` (for example `CHANGES_REQUESTED` or `APPROVED`) never count. A new commit requires fresh reviews.
 
 ### Trust
 
@@ -403,7 +403,7 @@ Only reviews by trusted logins count (fail closed). Use `--trusted-reviewer LOGI
 
 Immediately before the only write, BadCat re-reads the PR HEAD and all reviews and re-evaluates everything, then requires:
 
-- the exact-HEAD check runs and commit status to be complete and passing (pending, failed, stale or missing CI fails closed, and a skipped job is never counted as a passing one; add `--required-check NAME` for the workflow/gate your repository relies on, which must have `success`),
+- the exact-HEAD check runs and commit status to be complete and passing (pending, failed, stale or missing CI fails closed), and every `--required-check NAME` to have a `success` run on that HEAD (a skipped job does not count). **`--merge` refuses to start without at least one `--required-check`**: BadCat cannot reliably discover a repository's required checks, so an unrelated passing check never opens the gate,
 - GitHub to report the PR mergeable with a clean `mergeable_state` (so branch protection is honored).
 
 It then sends a **squash** merge with the expected HEAD SHA, so GitHub rejects it if the HEAD moved. There is no fallback to an unguarded merge. A rejection is logged once and not repeated until the PR's state changes; already merged or closed PRs are handled quietly. Disable any other automatic merger for the repository when using `--merge`.

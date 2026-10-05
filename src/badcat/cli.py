@@ -186,6 +186,10 @@ class Watcher:
         required: tuple = (),
         sleep: Callable[[float], None] = time.sleep,
     ):
+        if merge and not required:
+            # GitHub's required checks cannot be discovered reliably, so an unrelated passing
+            # check must never open the gate: the operator names the check that must succeed.
+            raise BadCatError("--merge requires at least one --required-check NAME")
         self.repo, self.client, self.state = repo, client, state
         self.trusted, self.merge, self.required, self.sleep = trusted, merge, required, sleep
         self.errors = 0
@@ -326,6 +330,7 @@ def main(argv: Optional[list] = None) -> int:
             "A PR is eligible when the current HEAD has a valid +1 followed by a valid +2 from a\n"
             "trusted reviewer, no -1, passing CI and a clean GitHub mergeability state.\n"
             "Trusted reviewers: --trusted-reviewer LOGIN (repeatable), default the `gh` user.\n"
+            "--merge also needs --required-check NAME (the workflow/gate that must succeed).\n"
             "'.' means the current Git repository's `origin` remote (github.com only).\n"
             "Disable any other automatic merger for the repository when using --merge."
         ),
@@ -337,7 +342,8 @@ def main(argv: Optional[list] = None) -> int:
     parser.add_argument("--trusted-reviewer", action="append", default=[], metavar="LOGIN",
                         help="GitHub login whose review markers count (repeatable)")
     parser.add_argument("--required-check", action="append", default=[], metavar="NAME",
-                        help="check run that must have succeeded on the HEAD (repeatable)")
+                        help="check run that must have succeeded on the HEAD (repeatable; "
+                             "required with --merge)")
     parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {__version__}")
     if not argv:
         parser.print_help()
@@ -347,6 +353,8 @@ def main(argv: Optional[list] = None) -> int:
                         datefmt="%H:%M:%S")
     try:
         repo = resolve_repo_arg(args.repo)
+        if args.merge and not args.required_check:
+            raise BadCatError("--merge requires at least one --required-check NAME")
         if shutil.which("gh") is None:
             raise BadCatError("required CLI not found on PATH: gh")
         with merger_lock(repo):
