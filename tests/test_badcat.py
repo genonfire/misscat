@@ -115,13 +115,19 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(evaluate(shared, A, ME).stage, READY)
 
 
+def run(name, head=A, conclusion="success", status="completed", app="github-actions", id=1):
+    return {"name": name, "head_sha": head, "status": status, "conclusion": conclusion,
+            "id": id, "app": {"slug": app}}
+
+
 class FakeClient:
     def __init__(self, head=A, draft=False, reviews=None):
         self.head, self.draft = head, draft
         self.review_list = reviews if reviews is not None else seq(rev("+1", A), rev("+2", A))
         self.raw = {"state": "open", "merged": False, "mergeable": True, "mergeable_state": "clean",
                     "draft": draft, "head": {"sha": head}}
-        self.runs = [{"name": "test", "head_sha": head, "status": "completed", "conclusion": "success", "id": 1}]
+        self.runs = [run("Validate and test Typewriter", head)]
+        self.workflows = []
         self.status = {"state": "pending", "total_count": 0, "sha": head}
         self.calls, self.fail = [], {}
         self.merge_error = None
@@ -146,6 +152,10 @@ class FakeClient:
     def check_runs(self, sha):
         return self.runs
 
+    def workflow_runs(self, sha):
+        self._maybe_fail("workflow_runs")
+        return self.workflows
+
     def combined_status(self, sha):
         return self.status
 
@@ -163,10 +173,8 @@ class WatcherTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.dir = Path(tmp.name)
 
-    def watcher(self, client, merge=False, required=None):
-        if required is None:
-            required = ("test",) if merge else ()
-        return cli.Watcher("o/r", client, cli.NotifyState(self.dir / "s.json"), ME, merge, required,
+    def watcher(self, client, merge=False):
+        return cli.Watcher("o/r", client, cli.NotifyState(self.dir / "s.json"), ME, merge,
                            sleep=lambda s: None)
 
     def run_cycle(self, w):
@@ -249,15 +257,6 @@ class WatcherTests(unittest.TestCase):
                              conflict=conflict, blocked=blocked, moved=moved).items():
             with self.subTest(name):
                 self.assertEqual(run(fn), [])
-
-    def test_required_check_must_have_succeeded_not_skipped(self):
-        c = FakeClient()
-        c.runs.append({"name": "gate", "head_sha": A, "status": "completed", "conclusion": "skipped", "id": 2})
-        self.run_cycle(self.watcher(c, merge=True, required=("gate",)))
-        self.assertEqual(c.calls, [])
-        c = FakeClient()
-        self.run_cycle(self.watcher(c, merge=True, required=("test",)))
-        self.assertEqual(len(c.calls), 1)
 
     def test_head_race_merge_rejection_is_logged_and_watching_continues(self):
         c = FakeClient()
@@ -349,22 +348,87 @@ class WatcherTests(unittest.TestCase):
         self.run_cycle(self.watcher(c, merge=True))
         self.assertEqual(len(c.calls), 1)
 
-    def test_merge_requires_an_explicit_required_check(self):
-        with self.assertRaises(cli.BadCatError):
-            cli.Watcher("o/r", FakeClient(), cli.NotifyState(self.dir / "x.json"), ME, merge=True)
-        with contextlib.redirect_stderr(io.StringIO()) as err:
-            self.assertEqual(cli.main(["o/r", "--merge"]), 2)
-        self.assertIn("--required-check", err.getvalue())
+    def test_merge_needs_no_required_check_option(self):
+        cli.Watcher("o/r", FakeClient(), cli.NotifyState(self.dir / "x.json"), ME, merge=True)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            cli.main(["o/r", "--merge", "--required-check", "x"])
 
-    def test_unrelated_passing_check_does_not_open_the_merge_gate(self):
+    def blocked_by(self, mutate):
         c = FakeClient()
-        c.runs = [{"name": "lint", "head_sha": A, "status": "completed", "conclusion": "success", "id": 1}]
-        self.run_cycle(self.watcher(c, merge=True, required=("ci:normal",)))
+        mutate(c)
+        _, out = self.run_cycle(self.watcher(c, merge=True))
         self.assertEqual(c.calls, [])
-        c.runs.append({"name": "ci:normal", "head_sha": A, "status": "completed",
-                       "conclusion": "skipped", "id": 2})
-        self.run_cycle(self.watcher(c, merge=True, required=("ci:normal",)))
+        return out
+
+    def test_any_actions_check_name_with_success_is_eligible(self):
+        for name in ("Validate and test Typewriter", "unittest (3.9)", "build"):
+            with self.subTest(name):
+                c = FakeClient()
+                c.runs = [run(name), run("unittest (3.12)", id=2)]
+                self.run_cycle(self.watcher(c, merge=True))
+                self.assertEqual(c.calls, [("merge", 7, A)])
+
+    def test_no_or_unproven_ci_never_merges(self):
+        self.blocked_by(lambda c: c.runs.clear())
+        self.blocked_by(lambda c: c.runs.__setitem__(slice(None), [run("test", conclusion="skipped")]))
+        # a green check from another app, or a green commit status, is not proof CI executed
+        self.blocked_by(lambda c: c.runs.__setitem__(slice(None), [run("lint", app="other-ci")]))
+        self.blocked_by(lambda c: (c.runs.clear(), c.status.update(state="success", total_count=1)))
+
+    def test_multiple_checks_all_must_pass(self):
+        for bad in (dict(conclusion="failure"), dict(conclusion="cancelled"),
+                    dict(conclusion="timed_out"), dict(conclusion="action_required"),
+                    dict(status="in_progress", conclusion=None), dict(head=B)):
+            with self.subTest(bad):
+                self.blocked_by(lambda c: c.runs.append(run("other", id=2, **bad)))
+        c = FakeClient()
+        c.runs.append(run("lint", id=2, conclusion="skipped"))
+        c.runs.append(run("ext", id=3, app="other-ci"))
+        self.run_cycle(self.watcher(c, merge=True))
+        self.assertEqual(len(c.calls), 1)
+
+    def test_workflow_runs_gate_even_without_check_runs_for_them(self):
+        for bad in (dict(conclusion="action_required"), dict(status="queued", conclusion=None),
+                    dict(conclusion="failure"), dict(head=B)):
+            with self.subTest(bad):
+                self.blocked_by(lambda c: c.workflows.append(run("CI", id=9, **bad)))
+        c = FakeClient()
+        c.workflows.append(run("CI", id=9))
+        self.run_cycle(self.watcher(c, merge=True))
+        self.assertEqual(len(c.calls), 1)
+
+    def test_ci_read_error_blocks_and_rerun_recovers(self):
+        c = FakeClient()
+        c.fail["workflow_runs"] = "HTTP 502"
+        w = self.watcher(c, merge=True)
+        delay, out = self.run_cycle(w)
+        self.assertEqual((c.calls, w.errors), ([], 1))
+        del c.fail["workflow_runs"]
+        c.runs[0] = run("test", conclusion="failure")
+        self.run_cycle(w)
         self.assertEqual(c.calls, [])
+        c.runs[0] = run("test")  # re-run succeeded on the same HEAD
+        self.run_cycle(w)
+        self.assertEqual(c.calls, [("merge", 7, A)])
+
+    def test_ci_is_reread_immediately_before_merge(self):
+        c = FakeClient()
+        w = self.watcher(c, merge=True)
+        calls = iter([[run("test")], [run("test", conclusion="failure")]])
+        c.check_runs = lambda sha: next(calls)
+        self.run_cycle(w)
+        self.assertEqual(c.calls, [])
+
+    def test_branch_protection_refusal_is_reported_once(self):
+        c = FakeClient()
+        c.merge_error = "Required status check is expected (HTTP 405)"
+        w = self.watcher(c, merge=True)
+        _, out = self.run_cycle(w)
+        self.assertTrue(any("merge rejected" in m for m in out))
+        with self.assertLogs("badcat", level="DEBUG"):
+            logging_marker()
+            w.cycle()
+        self.assertEqual(len(c.calls), 1)
 
     def test_changes_requested_never_counts_toward_merge(self):
         c = FakeClient(reviews=seq(rev("+1", A), rev("+2", A, state="CHANGES_REQUESTED")))
@@ -469,17 +533,17 @@ class LockAndIdentityTests(unittest.TestCase):
     def test_main_default_is_notify_only_and_uses_viewer_as_trusted(self):
         seen = {}
         class W:
-            def __init__(self, repo, client, state, trusted, merge, required):
-                seen.update(trusted=trusted, merge=merge, required=required)
+            def __init__(self, repo, client, state, trusted, merge):
+                seen.update(trusted=trusted, merge=merge)
             def run_forever(self):
                 pass
         with mock.patch.object(cli, "Watcher", W), \
              mock.patch.object(cli.shutil, "which", return_value="/usr/bin/gh"), \
              mock.patch.object(cli.GhClient, "viewer", return_value="Luna"):
             self.assertEqual(cli.main(["o/r"]), 0)
-            self.assertEqual(seen, {"trusted": frozenset({"luna"}), "merge": False, "required": ()})
-            self.assertEqual(cli.main(["o/r", "--merge", "--trusted-reviewer", "A", "--required-check", "ci"]), 0)
-            self.assertEqual(seen, {"trusted": frozenset({"a"}), "merge": True, "required": ("ci",)})
+            self.assertEqual(seen, {"trusted": frozenset({"luna"}), "merge": False})
+            self.assertEqual(cli.main(["o/r", "--merge", "--trusted-reviewer", "A"]), 0)
+            self.assertEqual(seen, {"trusted": frozenset({"a"}), "merge": True})
 
 
 class GhClientTests(unittest.TestCase):

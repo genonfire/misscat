@@ -363,7 +363,8 @@ If a review or workspace preparation fails, that HEAD is not marked reviewed and
 misscat owner/repo luna     # AI review (unchanged)
 badcat owner/repo           # DEFAULT: monitor and report only; NO GitHub writes
 badcat owner/repo --merge   # monitor, report, and squash-merge eligible PRs
-badcat . --merge --trusted-reviewer luna --required-check gate
+badcat . --merge            # same, for the current repository's origin
+badcat . --merge --trusted-reviewer luna
 ```
 
 - `.` resolves to the current repository's `origin` exactly as in MissCat.
@@ -403,7 +404,8 @@ Only reviews by trusted logins count (fail closed). Use `--trusted-reviewer LOGI
 
 Immediately before the only write, BadCat re-reads the PR HEAD and all reviews and re-evaluates everything, then requires:
 
-- the exact-HEAD check runs and commit status to be complete and passing (pending, failed, stale or missing CI fails closed), and every `--required-check NAME` to have a `success` run on that HEAD (a skipped job does not count). **`--merge` refuses to start without at least one `--required-check`**: BadCat cannot reliably discover a repository's required checks, so an unrelated passing check never opens the gate,
+- CI, discovered automatically from GitHub for the exact HEAD, with no check name to configure: every reported check run, workflow run and commit status must be complete and passing (pending, failed, cancelled, timed out, action-required, stale or unreadable CI fails closed), and at least one check run created by **GitHub Actions** must have *succeeded*. Check names are repository-defined and never matched (`Validate and test Typewriter`, `unittest (3.12)`...). Skipped runs, other apps' checks and plain commit statuses are not evidence that tests ran, so a HEAD with no CI, only skipped CI, or only an unrelated green check is never merged. A successful workflow that deliberately skips work (for example a documentation-only change) counts as normal success. CI is re-read immediately before the merge, and a re-run on the same HEAD is picked up on the next poll.
+  - *Limitation:* the API cannot tell which checks a repository *requires*, so BadCat cannot notice a required check that never started if other Actions checks passed. Enable branch protection or rulesets for required checks: GitHub then reports the PR as not mergeable (`mergeable_state` other than clean) and rejects the merge, both of which BadCat honors,
 - GitHub to report the PR mergeable with a clean `mergeable_state` (so branch protection is honored).
 
 It then sends a **squash** merge with the expected HEAD SHA, so GitHub rejects it if the HEAD moved. There is no fallback to an unguarded merge. A rejection is logged once and not repeated until the PR's state changes; already merged or closed PRs are handled quietly. Disable any other automatic merger for the repository when using `--merge`.
