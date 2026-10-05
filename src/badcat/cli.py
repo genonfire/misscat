@@ -16,7 +16,7 @@ from misscat import GhError, MissCatError, _write_atomic, resolve_repo_arg
 
 from . import __version__
 from .github import GhClient, OpenPR
-from .protocol import BLOCKED, INVALID, PLUS1, READY, WAITING, Verdict, evaluate
+from .protocol import READY, WAITING, Verdict, evaluate
 
 log = logging.getLogger("badcat")
 
@@ -119,6 +119,11 @@ class NotifyState:
             _write_atomic(self.path, json.dumps({"version": STATE_VERSION, "prs": self.prs}))
         except OSError as exc:
             log.warning("cannot save notification state: %s", exc)
+
+
+def first_line(body: Optional[str]) -> str:
+    """The review body's first line exactly as written (empty stays empty)."""
+    return (body or "").split("\n", 1)[0].rstrip("\r")
 
 
 def ci_gate(client, head: str, required: tuple) -> Optional[str]:
@@ -230,36 +235,38 @@ class Watcher:
         return evaluate(self.client.reviews(number), head, self.trusted)
 
     def _process(self, pr: OpenPR) -> None:
-        verdict = self._verdict(pr.number, pr.head)
+        reviews = self.client.reviews(pr.number)
+        verdict = evaluate(reviews, pr.head, self.trusted)
         gate = None
-        raw = None
         if verdict.stage == READY:
             raw = self.client.pr(pr.number)
             gate = merge_gate(self.client, raw, pr.head, self.required)
-        self._report(pr, verdict, gate)
+        self._report(pr, reviews, verdict, gate)
         if verdict.stage == READY and gate is None and self.merge:
             self._merge(pr)
 
-    def _report(self, pr: OpenPR, verdict: Verdict, gate: Optional[str]) -> None:
-        short, prev = pr.head[:7], self.state.get(pr.number)
-        stage = f"{verdict.stage} {verdict.detail}".strip()
-        gate_text = "ok" if gate is None else gate
+    def _report(self, pr: OpenPR, reviews: list, verdict: Verdict, gate: Optional[str]) -> None:
+        """Log transitions. A review is announced by its literal first line, whatever it says;
+        strict protocol validation (evaluate) is separate and never affects what is printed."""
+        prev = self.state.get(pr.number)
         if prev is None:
-            log.info("PR #%d: new (%s)", pr.number, short)
+            log.info("PR #%d: new (%s)", pr.number, pr.head[:7])
         elif prev.get("head") != pr.head:
-            log.info("PR #%d: new HEAD (%s)", pr.number, short)
-        if prev is None or prev.get("head") != pr.head or prev.get("stage") != stage:
-            label = {
-                WAITING: "WAITING", PLUS1: "+1", BLOCKED: "-1 BLOCKED", READY: "+2",
-                INVALID: "INVALID review",
-            }[verdict.stage]
-            detail = f": {verdict.detail}" if verdict.detail and verdict.stage != BLOCKED else ""
-            level = logging.WARNING if verdict.stage in (BLOCKED, INVALID) else logging.INFO
-            log.log(level, "PR #%d: %s%s (%s)", pr.number, label, detail, short)
-        entry = {"head": pr.head, "stage": stage, "gate": None}
+            log.info("PR #%d: new HEAD (%s)", pr.number, pr.head[:7])
+        seen = set(prev.get("reviews", [])) if prev is not None else None
+        submitted = sorted((r for r in reviews if r.submitted_at),
+                           key=lambda r: (r.submitted_at, r.id))
+        for review in submitted:
+            # a PR seen for the first time only records its history; later reviews are announced
+            if seen is not None and review.id not in seen:
+                log.info("PR #%d: %s", pr.number, first_line(review.body))
+        note = verdict.detail if verdict.stage == WAITING else ""
+        if note and (prev is None or prev.get("note") != note):
+            log.info("PR #%d: %s", pr.number, note)
+        entry = {"head": pr.head, "reviews": [r.id for r in submitted], "note": note, "gate": None}
         if verdict.stage == READY:
-            entry["gate"] = gate_text
-            if prev is None or prev.get("head") != pr.head or prev.get("gate") != gate_text:
+            entry["gate"] = "ok" if gate is None else gate
+            if prev is None or prev.get("head") != pr.head or prev.get("gate") != entry["gate"]:
                 if gate is None:
                     log.info("PR #%d: ready to merge%s", pr.number,
                              "" if self.merge else " (notify only)")

@@ -267,24 +267,65 @@ class WatcherTests(unittest.TestCase):
         self.assertTrue(any("merged" in m for m in out))
         self.assertNotIn("7", w.state.prs)
 
-    def test_transitions_reported_once_and_new_head_resets(self):
-        c = FakeClient(reviews=seq(rev("+1", A)))
+    def test_first_sight_records_history_then_announces_new_reviews_by_first_line(self):
+        first = seq(rev("+1", A))
+        c = FakeClient(reviews=first)
         w = self.watcher(c)
         _, out1 = self.run_cycle(w)
+        self.assertTrue(any("new (aaaaaaa)" in m for m in out1))
+        self.assertFalse(any("+1" in m for m in out1))  # history is not replayed
+        c.review_list = first + [
+            Review(900, "me", "COMMENTED", body("+2", A), A, "2026-01-02T00:00:00Z")]
         _, out2 = self.run_cycle(w)
-        self.assertTrue(any("new (aaaaaaa)" in m for m in out1) and any("+1 (aaaaaaa)" in m for m in out1))
-        self.assertFalse(any("+1 (" in m for m in out2))
-        c.head, c.raw["head"] = B, {"sha": B}
+        self.assertEqual([m for m in out2 if "dummy" not in m and "ready" not in m],
+                         ["INFO:badcat:PR #7: +2"])
         _, out3 = self.run_cycle(w)
-        self.assertTrue(any("new HEAD (bbbbbbb)" in m for m in out3))
-        self.assertTrue(any("WAITING (bbbbbbb)" in m for m in out3))
+        self.assertFalse(any("PR #7: +2" in m for m in out3))  # once only
+
+    def test_nonconforming_reviews_print_literal_first_line_without_labels(self):
+        c = FakeClient(reviews=[])
+        w = self.watcher(c)
+        self.run_cycle(w)
+        extra = [
+            Review(1, "me", "COMMENTED", f"-1 : FAIL (blocker found)\nHEAD: {A}\n\nx", A, "2026-01-01T00:00:01Z"),
+            Review(2, "me", "CHANGES_REQUESTED", "## 1차 리뷰 — 변경 요청\n\n상세", A, "2026-01-01T00:00:02Z"),
+            Review(3, "me", "COMMENTED", "", A, "2026-01-01T00:00:03Z"),
+            Review(4, "me", "COMMENTED", "+1\r\nHEAD: x\r\n", A, "2026-01-01T00:00:04Z"),
+        ]
+        c.review_list = extra
+        _, out = self.run_cycle(w)
+        lines = [m for m in out if "dummy" not in m]
+        self.assertEqual(lines, [
+            "INFO:badcat:PR #7: -1 : FAIL (blocker found)",
+            "INFO:badcat:PR #7: ## 1차 리뷰 — 변경 요청",
+            "INFO:badcat:PR #7: ",
+            "INFO:badcat:PR #7: +1",
+        ])
+        self.assertFalse(any("INVALID" in m.upper() for m in lines))
+        self.assertEqual(c.calls, [])
+
+    def test_changes_requested_never_counts_toward_merge(self):
+        c = FakeClient(reviews=seq(rev("+1", A), rev("+2", A, state="CHANGES_REQUESTED")))
+        self.run_cycle(self.watcher(c, merge=True))
+        self.assertEqual(c.calls, [])
+
+    def test_new_head_reported_and_old_reviews_not_replayed(self):
+        c = FakeClient(reviews=seq(rev("+1", A)))
+        w = self.watcher(c)
+        self.run_cycle(w)
+        c.head, c.raw["head"] = B, {"sha": B}
+        _, out = self.run_cycle(w)
+        self.assertTrue(any("new HEAD (bbbbbbb)" in m for m in out))
+        self.assertFalse(any("PR #7: +1" in m for m in out))
 
     def test_restart_does_not_repeat_notifications(self):
-        c = FakeClient(reviews=seq(rev("+1", A)))
+        first = seq(rev("+1", A))
+        c = FakeClient(reviews=first)
         self.run_cycle(self.watcher(c))
-        w2 = self.watcher(c)
-        _, out = self.run_cycle(w2)
-        self.assertFalse(any("+1 (" in m or "new" in m for m in out))
+        c.review_list = first + [Review(901, "me", "COMMENTED", body("+2", A), A, "2026-01-02T00:00:00Z")]
+        self.run_cycle(self.watcher(c))
+        _, out = self.run_cycle(self.watcher(c))  # a third process: nothing new
+        self.assertFalse(any("PR #7: +" in m or "new" in m for m in out))
 
     def test_api_errors_backoff_dedupe_and_recover(self):
         c = FakeClient()

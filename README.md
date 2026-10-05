@@ -369,7 +369,16 @@ badcat . --trusted-reviewer luna --required-check gate
 - `.` resolves to the current repository's `origin` exactly as in MissCat.
 - All **open** PRs are watched, Draft or Ready alike. BadCat never reads, changes or decides from Draft status; if GitHub rejects a merge of a Draft PR, the rejection is reported and BadCat keeps watching.
 - No AI calls, no checkout, no clone. It uses your existing `gh` login (`gh auth login`); no tokens are stored. `--merge` needs a `gh` account with permission to merge.
-- Output reports transitions only (new PR, new HEAD, `WAITING`, `+1`, `-1 BLOCKED`, `+2`, `INVALID`, CI/merge waits, merged, API errors), not repeated snapshots. Polling is every 60 seconds, backing off to 5 minutes on errors.
+- Output reports transitions only, not repeated snapshots: new PR, new HEAD, each newly submitted review, CI/merge waits and readiness, merged or closed, and API errors. Each new review is announced as one line carrying its **literal first line**, whatever it says (`PR #290: +1`, `PR #292: ## 1차 리뷰 — 변경 요청`); no `INVALID` label or explanation is added to a nonconforming review. What is printed is separate from the strict validation below. When BadCat sees a PR for the first time it records the existing reviews silently and announces only later ones. Polling is every 60 seconds, backing off to 5 minutes on errors.
+
+```text
+10:00:00 INFO Watching owner/repo (notify only; trusted reviewers: luna)
+10:01:12 INFO PR #290: +1
+10:03:25 INFO PR #290: -1
+10:10:42 INFO PR #290: new HEAD (e4f5678)
+10:15:08 INFO PR #290: +2
+10:15:09 INFO PR #290: ready to merge (notify only)
+```
 
 ### Review header
 
@@ -382,9 +391,9 @@ HEAD: <40 lowercase hex characters>
 <review evidence>
 ```
 
-The first line is exactly `+1`, `+2` or `-1`: no leading blank or whitespace, decoration or explanation (`-1 : FAIL (blocker found)` is `INVALID`). The second line is `HEAD: <sha>` immediately after. Evidence must follow. The header SHA, the review's `commit_id` and the PR's current HEAD must all match, so reviews of an old HEAD never carry forward.
+The first line is exactly `+1`, `+2` or `-1`: no leading blank or whitespace, decoration or explanation (`-1 : FAIL (blocker found)` is printed as-is but never authorizes). The second line is `HEAD: <sha>` immediately after. Evidence must follow. The header SHA, the review's `commit_id` and the PR's current HEAD must all match, so reviews of an old HEAD never carry forward.
 
-For the current HEAD a valid `+1` followed later by a valid `+2` makes the PR eligible. A `-1` anywhere on the HEAD blocks it, a malformed or contradictory review on the HEAD is `INVALID`, and `+2` alone never authorizes. A new commit requires fresh reviews.
+For the current HEAD a valid `+1` followed later by a valid `+2` makes the PR eligible. A `-1` anywhere on the HEAD blocks it, a malformed or contradictory marker review on the HEAD also prevents merging, and `+2` alone never authorizes. Reviews that are not `COMMENTED` (for example `CHANGES_REQUESTED` or `APPROVED`) never count. A new commit requires fresh reviews.
 
 ### Trust
 
