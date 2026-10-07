@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>BadCat</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <img src="icons/icon48.png" width="48" height="48" alt="">
+    <span class="title">BadCat</span>
+    <span class="status" id="status"><i class="dot"></i><span id="status-text">Sleeping</span></span>
+  </header>
+  <label for="repo">Repository</label>
+  <input id="repo" type="text" placeholder="owner/repo" spellcheck="false" autocomplete="off" autocapitalize="off">
+  <button id="toggle" type="button">Catch 'em all, Meow!</button>
+  <p id="error" role="alert" hidden></p>
+  <script src="shared.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>
