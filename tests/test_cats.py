@@ -193,6 +193,51 @@ class BatchTests(WatcherBase):
         self.assertEqual(sorted(started), [103, 104])
         self.assertEqual(self.reviewed(), {101, 102, 103, 104})
 
+    def labeled_prs(self, urgent=(), no_review=()):
+        return [m.PR(n, f"sha{n}", False, "u", "t", n in urgent, n in no_review)
+                for n in (101, 102, 103, 104)]
+
+    def test_no_review_pr_is_excluded(self):
+        self.assertEqual(self.selected(4, self.labeled_prs(no_review=(102,))), [101, 103, 104])
+
+    def test_no_review_beats_urgent(self):
+        self.assertEqual(self.selected(2, self.labeled_prs(urgent=(103,), no_review=(103,))), [101, 102])
+
+    def test_no_review_does_not_consume_a_cat_slot(self):
+        self.assertEqual(self.selected(2, self.labeled_prs(no_review=(101,))), [102, 103])
+
+    def test_no_review_is_not_recorded_and_label_removal_restores_eligibility(self):
+        started = []
+        current = [self.labeled_prs(no_review=(101, 102, 103, 104))]
+        w = m.Watcher(REPO, "luna", self.cfg, self.state, lambda repo: current[0],
+                      lambda s, r, pr, ws: started.append(pr.number) or True,
+                      sleep=lambda s: None, cats=2)
+        w.cycle()
+        self.assertEqual(started, [])
+        self.assertEqual(self.reviewed(), set())
+        current[0] = self.labeled_prs(no_review=(102, 103, 104))  # label removed from 101
+        w.cycle()
+        self.assertEqual(started, [101])
+        self.assertEqual(self.reviewed(), {101})
+
+    def test_no_review_added_mid_batch_observed_only_on_next_listing(self):
+        current = [self.labeled_prs()]
+        started = []
+
+        def reviewer(s, r, pr, ws):
+            current[0] = self.labeled_prs(no_review=(101, 103))  # label added while running
+            started.append(pr.number)
+            return True
+
+        w = m.Watcher(REPO, "luna", self.cfg, self.state, lambda repo: current[0], reviewer,
+                      sleep=lambda s: None, cats=2)
+        w.cycle()
+        self.assertEqual(sorted(started), [101, 102])  # in-flight review not cancelled
+        self.assertEqual(self.reviewed(), {101, 102})
+        started.clear()
+        w.cycle()
+        self.assertEqual(started, [104])
+
     def test_failed_head_fairness_within_each_priority_class(self):
         prs = self.urgent_prs(101, 102)
         w = self.watcher(lambda s, r, pr, ws: True, 4, prs)
@@ -204,15 +249,18 @@ class BatchTests(WatcherBase):
             {"number": 1, "headRefOid": "a", "isDraft": False, "url": "u", "title": "t",
              "labels": [{"name": "urgent", "color": "f00"}]},
             {"number": 2, "headRefOid": "b", "isDraft": False, "url": "u", "title": "t",
-             "labels": [{"name": "Urgent-ish"}]},
+             "labels": [{"name": "Urgent-ish"}, {"name": "No-Review"}]},
             {"number": 3, "headRefOid": "c", "isDraft": False, "url": "u", "title": "t", "labels": []},
+            {"number": 4, "headRefOid": "d", "isDraft": False, "url": "u", "title": "t",
+             "labels": [{"name": "no-review"}, {"name": "urgent"}]},
         ])
         proc = mock.Mock(returncode=0, stdout=out, stderr="")
         with mock.patch.object(m.subprocess, "run", return_value=proc) as run:
             prs = m.gh_open_prs(REPO)
         self.assertEqual(run.call_count, 1)
         self.assertIn("labels", run.call_args[0][0][-1])
-        self.assertEqual([p.urgent for p in prs], [True, False, False])
+        self.assertEqual([p.urgent for p in prs], [True, False, False, True])
+        self.assertEqual([p.no_review for p in prs], [False, False, False, True])
 
     def test_workspace_failure_fails_only_that_pr(self):
         ws = FakeWorkspaces(fail={102})
