@@ -354,7 +354,7 @@ By default MissCat runs one review at a time.
 
 When a review finishes successfully, it immediately checks the repository again before sleeping. If another PR or new HEAD is waiting, it reviews that next.
 
-If a review or workspace preparation fails, that HEAD is not marked reviewed and MissCat waits 5 minutes before checking again.
+If a review or workspace preparation fails, that HEAD is not marked reviewed. When every review of the batch failed (with the default single review, that one), MissCat waits 5 minutes before checking again; if at least one review succeeded, it re-lists PRs immediately (see `--cat` below).
 
 ### Backlog bursts: `--cat=N`
 
