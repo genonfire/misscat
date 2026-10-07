@@ -16,6 +16,8 @@ MissCat watches a GitHub repository for new pull requests and HEAD commits, then
 ## BadCat
 `src/badcat/` is a second CLI in the same package and release. It is a deterministic review-state watcher, not an AI reviewer, and the only component that may write to GitHub (squash merge, only with `--merge`). The MissCat invariants above stay true for MissCat: BadCat has its own state (`~/.config/badcat/`), lock (`~/.cache/badcat/locks/`), no workspace, and never touches MissCat's. Its default mode must perform no GitHub writes, a merge must re-read GitHub and pass every gate with a HEAD-SHA guard, and cached state must never authorize a merge.
 
+`src/badcat_host/` (`badcat-host`) is a separate, read-only Chrome Native Messaging host with its own poll loop and state (`~/.config/badcat-host/`). It imports only `badcat.github` and `badcat.protocol` — never `badcat.cli` or any merge code — and BadCat must not depend on it. It must never write to GitHub, never touch stdout except with protocol frames, accept only the minimal start/stop protocol, and never log or expose credentials or `gh` error text. The Chrome extension is not part of the wheel.
+
 ## Changes
 - Prefer small, explicit changes over abstractions or new dependencies.
 - Preserve existing CLI behavior unless the issue explicitly changes it.
