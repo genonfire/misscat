@@ -17,13 +17,13 @@ from pathlib import Path
 from unittest import mock
 
 import misscat
-from badcat import host
 from badcat.github import OpenPR
 from badcat.protocol import Review
+from badcat_host import host
 
 A, B = "a" * 40, "b" * 40
 EXT = "a" * 32
-logging.getLogger("badcat").addHandler(logging.NullHandler())
+logging.getLogger("badcat_host").addHandler(logging.NullHandler())
 
 
 def body(marker, sha):
@@ -153,11 +153,11 @@ class WatcherTests(unittest.TestCase):
         client = FakeClient(reviews=[review(1, "+1", A)])
         w = self.watcher(client)
         client.fail["open_prs"] = "HTTP 502"
-        with self.assertLogs("badcat", level="WARNING"):
+        with self.assertLogs("badcat_host", level="WARNING"):
             delay = w.cycle()
         self.assertGreaterEqual(delay, 60)
         client.fail = {"reviews": "timed out"}
-        with self.assertLogs("badcat", level="WARNING"):
+        with self.assertLogs("badcat_host", level="WARNING"):
             w.cycle()
         self.assertEqual(self.events, [])
         client.fail = {}
@@ -187,7 +187,7 @@ class WatcherTests(unittest.TestCase):
                 client = FakeClient(reviews=[review(1, "+1", A)])
                 client.fail[stage] = secret
                 w = self.watcher(client)
-                with self.assertLogs("badcat", level="WARNING") as cm:
+                with self.assertLogs("badcat_host", level="WARNING") as cm:
                     w.cycle()
                 text = "\n".join(cm.output)
                 self.assertNotIn("ghp_secret", text)
@@ -199,7 +199,7 @@ class WatcherTests(unittest.TestCase):
         self.path.parent.mkdir(parents=True)
         for text in ("{nope", json.dumps({"version": 9, "emitted": {}}), "[]"):
             self.path.write_text(text)
-            with self.assertLogs("badcat.host", level="WARNING"):
+            with self.assertLogs("badcat_host", level="WARNING"):
                 self.assertEqual(host.EmittedState(self.path).prs, {})
 
     def test_client_has_no_write_surface(self):
@@ -246,7 +246,7 @@ class Connection:
         test.addCleanup(tmp.cleanup)
         patches = [mock.patch.object(host, "state_path",
                                      lambda repo: Path(tmp.name) / f"{repo.replace('/', '__')}.json"),
-                   mock.patch("badcat.poll.POLL_INTERVAL", 0.02)]
+                   mock.patch("badcat_host.poll.POLL_INTERVAL", 0.02)]
         for p in patches:
             p.start()
             test.addCleanup(p.stop)
@@ -329,7 +329,7 @@ class ServeTests(unittest.TestCase):
         client = FakeClient(reviews=[review(1, "+1", A)])
         client.fail["viewer"] = "HTTP 401 token ghp_secret"
         conn = Connection(self, client)
-        with self.assertLogs("badcat", level="WARNING") as cm:
+        with self.assertLogs("badcat_host", level="WARNING") as cm:
             conn.send({"type": "start", "repo": "o/r"})
             got = conn.wait_frames(1)
         self.assertEqual(got, [{"error": "cannot determine the authenticated gh user"}])
@@ -364,7 +364,7 @@ class ServeTests(unittest.TestCase):
         self.addCleanup(stdin.close)
         client = FakeClient(reviews=[review(1, "+1", A)])
         with mock.patch.object(host, "state_path", lambda r: Path(tempfile.mkdtemp()) / "s.json"), \
-             mock.patch("badcat.poll.POLL_INTERVAL", 0.02):
+             mock.patch("badcat_host.poll.POLL_INTERVAL", 0.02):
             result = []
             t = threading.Thread(target=lambda: result.append(
                 host.serve(stdin, Gone(), lambda repo: client)))
@@ -381,7 +381,7 @@ class ProcessTests(unittest.TestCase):
     def run_host(self, data, env=None):
         with tempfile.TemporaryDirectory() as home:
             proc = subprocess.run(
-                [sys.executable, "-m", "badcat.host"], input=data, capture_output=True, timeout=30,
+                [sys.executable, "-m", "badcat_host.host"], input=data, capture_output=True, timeout=30,
                 env={**os.environ, "HOME": home, **(env or {})})
         return proc
 
@@ -399,7 +399,7 @@ class ProcessTests(unittest.TestCase):
 
     def test_chrome_origin_argument_is_accepted(self):
         with tempfile.TemporaryDirectory() as home:
-            proc = subprocess.run([sys.executable, "-m", "badcat.host", f"chrome-extension://{EXT}/"],
+            proc = subprocess.run([sys.executable, "-m", "badcat_host.host", f"chrome-extension://{EXT}/"],
                                   input=b"", capture_output=True, timeout=30,
                                   env={**os.environ, "HOME": home})
         self.assertEqual((proc.returncode, proc.stdout), (0, b""))
@@ -408,7 +408,7 @@ class ProcessTests(unittest.TestCase):
         script = (
             "import sys\n"
             "from unittest import mock\n"
-            "from badcat import host\n"
+            "from badcat_host import host\n"
             "def fake(stdin, stdout, *a):\n"
             "    print('stray output')\n"
             "    stdout.write(host.encode_frame({'ok': 1})); stdout.flush(); return 0\n"
@@ -421,7 +421,7 @@ class ProcessTests(unittest.TestCase):
         self.assertIn(b"stray output", proc.stderr)
 
     def test_version_and_help(self):
-        proc = subprocess.run([sys.executable, "-m", "badcat.host", "--version"],
+        proc = subprocess.run([sys.executable, "-m", "badcat_host.host", "--version"],
                               capture_output=True, text=True, timeout=30)
         self.assertEqual(proc.stdout.strip(), f"badcat-host {misscat.__version__}")
 
@@ -505,12 +505,20 @@ class PackagingTests(unittest.TestCase):
             with zipfile.ZipFile(wheel) as z:
                 names = z.namelist()
                 eps = z.read(next(n for n in names if n.endswith("entry_points.txt"))).decode()
-        for module in ("host", "poll", "cli", "protocol"):
-            self.assertIn(f"badcat/{module}.py", names)
-        for line in ("badcat-host = badcat.host:main", "badcat = badcat.cli:main",
+        for module in ("badcat/cli.py", "badcat/protocol.py", "badcat_host/host.py",
+                       "badcat_host/poll.py"):
+            self.assertIn(module, names)
+        self.assertNotIn("badcat/poll.py", names)
+        for line in ("badcat-host = badcat_host.host:main", "badcat = badcat.cli:main",
                      "misscat = misscat:main"):
             self.assertIn(line, eps)
         self.assertFalse([n for n in names if "extension" in n.lower()])  # no Chrome extension
+
+    def test_host_does_not_depend_on_the_badcat_cli(self):
+        code = ("import sys, badcat_host.host; "
+                "print([m for m in sys.modules if m in ('badcat.cli',)])")
+        proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=30)
+        self.assertEqual(proc.stdout.strip(), "[]", proc.stderr)
 
     def test_existing_clis_still_run(self):
         for module in ("misscat", "badcat.cli"):

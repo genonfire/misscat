@@ -39,7 +39,7 @@ Issues = "https://github.com/genonfire/misscat/issues"
 [project.scripts]
 misscat = "misscat:main"
 badcat = "badcat.cli:main"
-badcat-host = "badcat.host:main"
+badcat-host = "badcat_host.host:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

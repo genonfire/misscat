@@ -16,13 +16,14 @@ from misscat import GhError, MissCatError, _write_atomic, resolve_repo_arg
 
 from . import __version__
 from .github import GhClient, OpenPR
-from .poll import ERROR_BACKOFF, POLL_INTERVAL, Poller  # noqa: F401  (re-exported)
 from .protocol import READY, WAITING, Verdict, evaluate
 
 log = logging.getLogger("badcat")
 
 CONFIG_DIR = Path.home() / ".config" / "badcat"  # separate from MissCat's state
 LOCK_ROOT = Path.home() / ".cache" / "badcat" / "locks"
+POLL_INTERVAL = 60.0
+ERROR_BACKOFF = (60.0, 120.0, 300.0)
 STATE_VERSION = 1
 # GitHub's own mergeable_state values that do not contradict a merge. "draft" is GitHub's
 # literal label, not a BadCat decision: the merge is still attempted and GitHub's rejection
@@ -185,7 +186,7 @@ def merge_gate(client, raw: dict, head: str) -> Optional[str]:
     return ci_gate(client, head)
 
 
-class Watcher(Poller):
+class Watcher:
     def __init__(
         self,
         repo: str,
@@ -195,13 +196,50 @@ class Watcher(Poller):
         merge: bool = False,
         sleep: Callable[[float], None] = time.sleep,
     ):
-        super().__init__(client, sleep)
-        self.repo, self.state = repo, state
-        self.trusted, self.merge = trusted, merge
+        self.repo, self.client, self.state = repo, client, state
+        self.trusted, self.merge, self.sleep = trusted, merge, sleep
+        self.errors = 0
+        self.last_error: Optional[str] = None
         self.rejected: dict = {}  # PR number -> state at the last merge rejection
 
-    def _tracked(self):
-        return [int(key) for key in self.state.prs]
+    def run_forever(self) -> None:
+        while True:
+            self.sleep(self.cycle())
+
+    def cycle(self) -> float:
+        """One poll; returns the delay before the next one."""
+        try:
+            prs = self.client.open_prs()
+            ok = True
+            for pr in sorted(prs, key=lambda p: p.number):
+                ok = self._guard(pr.number, self._process, pr) and ok
+            open_numbers = {p.number for p in prs}
+            for key in list(self.state.prs):
+                if int(key) not in open_numbers:
+                    ok = self._guard(int(key), self._finished, int(key)) and ok
+        except GhError as exc:
+            self._error("cannot list PRs", exc)
+            ok = False
+        if ok:
+            self.errors, self.last_error = 0, None
+            return POLL_INTERVAL
+        delay = ERROR_BACKOFF[min(self.errors, len(ERROR_BACKOFF) - 1)]
+        self.errors += 1
+        return delay
+
+    def _guard(self, number: int, fn: Callable, *args) -> bool:
+        try:
+            fn(*args)
+            return True
+        except GhError as exc:
+            self._error(f"PR #{number}", exc)
+            return False
+
+    def _error(self, what: str, exc: Exception) -> None:
+        message = f"{what}: {exc}"
+        if message != self.last_error:  # report a persisting error once
+            log.warning("%s", message)
+        self.last_error = message
 
     def _verdict(self, number: int, head: str) -> Verdict:
         return evaluate(self.client.reviews(number), head, self.trusted)

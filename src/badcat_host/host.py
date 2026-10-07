@@ -27,13 +27,15 @@ from typing import BinaryIO, Callable, Optional
 
 from misscat import GhError, MissCatError, NAME_RE, OWNER_RE, _write_atomic, canonical_repo
 
-from . import __version__
-from . import cli as _cli
-from .github import GhClient, OpenPR
-from .poll import Poller
-from .protocol import PLUS1, evaluate
+from badcat.github import GhClient, OpenPR
+from badcat.protocol import PLUS1, evaluate
 
-log = logging.getLogger("badcat.host")
+from . import __version__
+from .poll import Poller
+
+log = logging.getLogger("badcat_host")
+
+STATE_DIR = Path.home() / ".config" / "badcat-host"  # its own state, separate from BadCat's
 
 HOST_NAME = "com.genonfire.badcat_host"
 MAX_INCOMING = 64 * 1024  # requests are tiny; anything larger is a protocol violation
@@ -242,8 +244,8 @@ def validate_repo(value) -> str:
     return canonical_repo(value)
 
 
-def state_path(repo: str):
-    return _cli.CONFIG_DIR / "host" / f"{_cli._stem(repo)}.json"
+def state_path(repo: str) -> Path:
+    return STATE_DIR / f"{repo.replace('/', '__')}.json"
 
 
 def serve(stdin: BinaryIO, stdout: BinaryIO,

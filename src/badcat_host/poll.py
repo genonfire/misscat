@@ -1,4 +1,4 @@
-"""The poll/backoff loop shared by `badcat` and `badcat-host`. Subclasses decide what a PR means."""
+"""The host's poll/backoff loop (same cadence as BadCat's: 60 s, backing off to 5 min on errors)."""
 from __future__ import annotations
 
 import logging
@@ -7,7 +7,7 @@ from typing import Callable, Iterable, Optional
 
 from misscat import GhError
 
-log = logging.getLogger("badcat")
+log = logging.getLogger("badcat_host")
 
 POLL_INTERVAL = 60.0
 ERROR_BACKOFF = (60.0, 120.0, 300.0)
