@@ -435,8 +435,8 @@ host -> client  {"repo": "owner/repo", "pr": 123, "head": "<40-char SHA>", "stat
 host -> client  {"error": "<message>"}                     rejected request or failed start
 ```
 
-- An event is sent when the PR's current HEAD has a valid `+1` from the authenticated `gh` user and nothing later holds it (a `+1` followed by `+2` is already past that state and is not reported). It is sent **once per PR + HEAD**; a new HEAD emits again once it reaches `+1`. The already-reported HEADs are remembered in `~/.config/badcat/host/` so reconnecting does not repeat events (this state only dedupes; it never authorizes anything).
-- Polling, backoff and error handling are BadCat's (every 60 seconds, backing off to 5 minutes). Any GitHub error fails closed: no event is sent until the next successful poll shows `+1`.
+- An event is sent when the PR's current HEAD has a valid `+1` from the authenticated `gh` user and nothing later holds it (a `+1` followed by `+2` is already past that state and is not reported). It is sent **once per PR + HEAD**; a new HEAD emits again once it reaches `+1`. The already-reported HEADs are remembered in `~/.config/badcat/host/` (also after a PR closes, so a reopened PR with the same HEAD does not repeat) so reconnecting does not repeat events (this state only dedupes; it never authorizes anything).
+- Polling, backoff and error handling are BadCat's (every 60 seconds, backing off to 5 minutes). Any GitHub error fails closed: no event is sent until the next successful poll shows `+1`. Logs on stderr never include `gh`'s error text (only the HTTP status), since it could echo credentials.
 - Repository names are validated strictly; nothing else is accepted from the client and no command is ever executed on its behalf.
 
 ## What MissCat does

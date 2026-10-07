@@ -131,16 +131,22 @@ class EmittedState:
         self.prs.setdefault(str(number), []).append(head)
         self._save()
 
-    def drop(self, number: int) -> None:
-        if self.prs.pop(str(number), None) is not None:
-            self._save()
-
     def _save(self) -> None:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             _write_atomic(self.path, json.dumps({"version": STATE_VERSION, "emitted": self.prs}))
         except OSError as exc:
             log.warning("cannot save host state: %s", exc)
+
+
+HTTP_STATUS_RE = re.compile(r"\bHTTP (\d{3})\b")
+
+
+def describe_gh_error(exc: Exception) -> str:
+    """A log-safe description of a gh failure: gh's own text may echo credentials, so only the
+    HTTP status (if any) is kept."""
+    match = HTTP_STATUS_RE.search(str(exc))
+    return f"gh request failed (HTTP {match.group(1)})" if match else "gh request failed"
 
 
 class ReviewStateWatcher(Poller):
@@ -152,7 +158,10 @@ class ReviewStateWatcher(Poller):
         self.repo, self.state, self.trusted, self.emit = repo, state, trusted, emit
 
     def _tracked(self):
-        return [int(key) for key in self.state.prs]
+        return []  # reported (PR, HEAD) pairs are kept for good: a reopened PR must not re-emit
+
+    def _detail(self, exc: Exception) -> str:
+        return describe_gh_error(exc)
 
     def _process(self, pr: OpenPR) -> None:
         if self.state.has(pr.number, pr.head):
@@ -165,7 +174,7 @@ class ReviewStateWatcher(Poller):
         log.info("PR #%d: +1 (%s)", pr.number, pr.head[:7])
 
     def _finished(self, number: int) -> None:
-        self.state.drop(number)
+        pass  # never called: nothing is tracked for removal
 
 
 class Monitor:
@@ -197,7 +206,7 @@ class Monitor:
             try:
                 trusted = frozenset({self.client.viewer().lower()})
             except (GhError, KeyError) as exc:
-                log.warning("cannot determine the authenticated gh user: %s", exc)
+                log.warning("cannot determine the authenticated gh user: %s", describe_gh_error(exc))
                 self._report("cannot determine the authenticated gh user")
                 return
             log.info("Watching %s (trusted reviewer: %s)", self.repo, ", ".join(sorted(trusted)))
@@ -210,8 +219,8 @@ class Monitor:
         except ConnectionClosed as exc:
             log.info("connection closed: %s", exc)
             self._stop.set()
-        except Exception:  # keep the host alive and the stream clean; detail goes to stderr
-            log.exception("monitor failed")
+        except Exception as exc:  # keep the host alive and the stream clean; no message/traceback:
+            log.error("monitor failed (%s)", type(exc).__name__)  # it could echo gh output
             self._report("monitoring stopped unexpectedly")
 
     def _report(self, message: str) -> None:

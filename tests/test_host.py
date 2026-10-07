@@ -165,16 +165,35 @@ class WatcherTests(unittest.TestCase):
         self.assertEqual(self.events, [event()])
         self.assertEqual(w.errors, 0)
 
-    def test_closed_pr_is_forgotten_but_a_reopened_head_is_new_state(self):
+    def test_closed_then_reopened_same_head_does_not_emit_again(self):
         client = FakeClient(reviews=[review(1, "+1", A)])
         w = self.watcher(client)
         w.cycle()
         client.open = False
         w.cycle()
-        self.assertEqual(w.state.prs, {})
-        client.open = True
+        client.open = True  # reopened with the same HEAD
         w.cycle()
-        self.assertEqual(len(self.events), 2)
+        self.assertEqual(self.events, [event()])
+        self.assertTrue(host.EmittedState(self.path).has(7, A))  # also across a restart
+        client.head = B
+        client.review_list = [review(1, "+1", A), review(2, "+1", B)]
+        w.cycle()
+        self.assertEqual(self.events, [event(), event(head=B)])
+
+    def test_gh_errors_are_logged_without_gh_text(self):
+        secret = "HTTP 401: Bad credentials token ghp_secret Authorization: Bearer abc"
+        for stage in ("open_prs", "reviews"):
+            with self.subTest(stage):
+                client = FakeClient(reviews=[review(1, "+1", A)])
+                client.fail[stage] = secret
+                w = self.watcher(client)
+                with self.assertLogs("badcat", level="WARNING") as cm:
+                    w.cycle()
+                text = "\n".join(cm.output)
+                self.assertNotIn("ghp_secret", text)
+                self.assertNotIn("Bearer", text)
+                self.assertIn("HTTP 401", text)
+        self.assertEqual(host.describe_gh_error(misscat.GhError("boom ghp_x")), "gh request failed")
 
     def test_unreadable_state_is_ignored(self):
         self.path.parent.mkdir(parents=True)
@@ -310,10 +329,12 @@ class ServeTests(unittest.TestCase):
         client = FakeClient(reviews=[review(1, "+1", A)])
         client.fail["viewer"] = "HTTP 401 token ghp_secret"
         conn = Connection(self, client)
-        conn.send({"type": "start", "repo": "o/r"})
-        got = conn.wait_frames(1)
+        with self.assertLogs("badcat", level="WARNING") as cm:
+            conn.send({"type": "start", "repo": "o/r"})
+            got = conn.wait_frames(1)
         self.assertEqual(got, [{"error": "cannot determine the authenticated gh user"}])
         self.assertNotIn(b"ghp_secret", conn.out.getvalue())  # no gh detail reaches the client
+        self.assertNotIn("ghp_secret", "\n".join(cm.output))  # nor the log
         del client.fail["viewer"]
         conn.send({"type": "start", "repo": "o/r"})
         self.assertEqual(conn.wait_frames(2)[1:], [event()])

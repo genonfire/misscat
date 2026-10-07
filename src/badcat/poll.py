@@ -65,8 +65,12 @@ class Poller:
             self._error(f"PR #{number}", exc)
             return False
 
+    def _detail(self, exc: Exception) -> str:
+        """How an error is logged; subclasses may redact it."""
+        return str(exc)
+
     def _error(self, what: str, exc: Exception) -> None:
-        message = f"{what}: {exc}"
+        message = f"{what}: {self._detail(exc)}"
         if message != self.last_error:  # report a persisting error once
             log.warning("%s", message)
         self.last_error = message
