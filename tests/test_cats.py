@@ -1,4 +1,5 @@
 """Backlog burst reviews: batches, the batch barrier, and persistent cat worktrees."""
+import json
 import os
 import subprocess
 import tempfile
@@ -154,6 +155,64 @@ class BatchTests(WatcherBase):
         calls.clear()
         w.cycle()  # 103, 104 are ahead of the failed 101
         self.assertEqual(sorted(calls), [103, 104])
+
+    def urgent_prs(self, *urgent):
+        return [m.PR(n, f"sha{n}", False, "u", "t", n in urgent) for n in (101, 102, 103, 104)]
+
+    def selected(self, cats, prs, w=None):
+        w = w or self.watcher(lambda s, r, pr, ws: True, cats, prs)
+        return [p.number for p in w._next_batch(prs)]
+
+    def test_no_urgent_keeps_oldest_first(self):
+        self.assertEqual(self.selected(2, self.urgent_prs()), [101, 102])
+
+    def test_urgent_jumps_ahead_and_fills_remaining_with_normal(self):
+        self.assertEqual(self.selected(2, self.urgent_prs(103)), [103, 101])
+
+    def test_multiple_urgent_oldest_first(self):
+        self.assertEqual(self.selected(3, self.urgent_prs(104, 102)), [102, 104, 101])
+
+    def test_more_urgent_than_cats_only_urgent(self):
+        self.assertEqual(self.selected(2, self.urgent_prs(102, 103, 104)), [102, 103])
+
+    def test_urgent_added_mid_batch_observed_only_on_next_listing(self):
+        current = [self.urgent_prs()]
+        started = []
+
+        def reviewer(s, r, pr, ws):
+            current[0] = self.urgent_prs(104)  # label added while the batch is running
+            started.append(pr.number)
+            return True
+
+        w = m.Watcher(REPO, "luna", self.cfg, self.state, lambda repo: current[0], reviewer,
+                      sleep=lambda s: None, cats=2)
+        w.cycle()
+        self.assertEqual(sorted(started), [101, 102])  # running batch unchanged
+        started.clear()
+        w.cycle()
+        self.assertEqual(sorted(started), [103, 104])
+        self.assertEqual(self.reviewed(), {101, 102, 103, 104})
+
+    def test_failed_head_fairness_within_each_priority_class(self):
+        prs = self.urgent_prs(101, 102)
+        w = self.watcher(lambda s, r, pr, ws: True, 4, prs)
+        w.failed = {w._key(prs[0]), w._key(prs[2])}  # urgent 101 and normal 103 failed
+        self.assertEqual(self.selected(4, prs, w), [102, 101, 104, 103])
+
+    def test_labels_parsed_from_single_gh_listing(self):
+        out = json.dumps([
+            {"number": 1, "headRefOid": "a", "isDraft": False, "url": "u", "title": "t",
+             "labels": [{"name": "urgent", "color": "f00"}]},
+            {"number": 2, "headRefOid": "b", "isDraft": False, "url": "u", "title": "t",
+             "labels": [{"name": "Urgent-ish"}]},
+            {"number": 3, "headRefOid": "c", "isDraft": False, "url": "u", "title": "t", "labels": []},
+        ])
+        proc = mock.Mock(returncode=0, stdout=out, stderr="")
+        with mock.patch.object(m.subprocess, "run", return_value=proc) as run:
+            prs = m.gh_open_prs(REPO)
+        self.assertEqual(run.call_count, 1)
+        self.assertIn("labels", run.call_args[0][0][-1])
+        self.assertEqual([p.urgent for p in prs], [True, False, False])
 
     def test_workspace_failure_fails_only_that_pr(self):
         ws = FakeWorkspaces(fail={102})
