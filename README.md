@@ -414,6 +414,31 @@ It then sends a **squash** merge with the expected HEAD SHA, so GitHub rejects i
 
 BadCat keeps its own notification-dedupe state in `~/.config/badcat/` and its own lock in `~/.cache/badcat/locks/`, separate from MissCat's. State never authorizes a merge (GitHub is always re-read), and unreadable state is ignored. One BadCat process per repository; MissCat and BadCat can run on the same repository at the same time.
 
+## badcat-host: Chrome Native Messaging host
+
+`pipx install misscat` also installs **`badcat-host`**, a small local host that reuses BadCat's strict review protocol and tells a local client (first: a future BadCat Chrome extension) when a PR HEAD reaches a valid `+1`. It is **read-only**: it never merges, reviews, or changes anything on GitHub, and it only uses your existing `gh` login (no tokens are read, sent or stored). The Chrome extension itself is not part of this package.
+
+Register it once for your user (macOS, no `sudo`), passing the extension's ID from `chrome://extensions`:
+
+```bash
+badcat-host install --extension-id <32-character-extension-id>
+```
+
+This writes `~/Library/Application Support/Google/Chrome/NativeMessagingHosts/com.genonfire.badcat_host.json`, allowing only `chrome-extension://<id>/` to start the host. Chrome launches `badcat-host` itself; it speaks Chrome's length-prefixed JSON on stdin/stdout (stdout carries protocol frames only, logs go to stderr) and exits when the connection closes.
+
+Protocol (the whole of it):
+
+```text
+client -> host  {"type": "start", "repo": "owner/repo"}   monitor one repo (replaces the previous one)
+client -> host  {"type": "stop"}
+host -> client  {"repo": "owner/repo", "pr": 123, "head": "<40-char SHA>", "status": "+1"}
+host -> client  {"error": "<message>"}                     rejected request or failed start
+```
+
+- An event is sent when the PR's current HEAD has a valid `+1` from the authenticated `gh` user and nothing later holds it (a `+1` followed by `+2` is already past that state and is not reported). It is sent **once per PR + HEAD**; a new HEAD emits again once it reaches `+1`. The already-reported HEADs are remembered in `~/.config/badcat/host/` so reconnecting does not repeat events (this state only dedupes; it never authorizes anything).
+- Polling, backoff and error handling are BadCat's (every 60 seconds, backing off to 5 minutes). Any GitHub error fails closed: no event is sent until the next successful poll shows `+1`.
+- Repository names are validated strictly; nothing else is accepted from the client and no command is ever executed on its behalf.
+
 ## What MissCat does
 
 - Watches all open PRs in a repository
