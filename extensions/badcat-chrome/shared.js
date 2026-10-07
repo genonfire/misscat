@@ -55,7 +55,7 @@
       throw new Error('invalid PR number');
     }
     // Phrased so ChatGPT finishes any task in progress before starting the review.
-    return '현재 작업 끝났으면 PR#' + pr + ' 리뷰해.';
+    return '현재 작업 끝났으면 PR #' + pr + ' 리뷰해.';
   }
 
   const api = {

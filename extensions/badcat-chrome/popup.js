@@ -39,7 +39,7 @@
     try {
       return await chrome.runtime.sendMessage(message);
     } catch (e) {
-      return { ok: false, error: 'BadCat background is not responding.' };
+      return { ok: false, error: 'MissCat background is not responding.' };
     }
   }
 

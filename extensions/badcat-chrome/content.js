@@ -6,9 +6,9 @@
   const { isConversationUrl, reviewMessage } = self.BadCatShared;
 
   // ChatGPT's composer is a ProseMirror contenteditable. Match on semantic attributes only (no class
-  // names or localized aria-labels); the send button is the submit button inside the composer's own form.
+  // names or localized aria-labels); the send button is the submit button in the composer's own form (it sits outside [data-composer-input]).
   const COMPOSER = '[contenteditable="true"][data-composer-markdown]';
-  const COMPOSER_CONTAINER = 'form, [data-composer-input]';
+  const COMPOSER_FORM = 'form'; // wraps both the [data-composer-input] block and the footer with the send button
   const SEND_BUTTON = 'button[type="submit"]';
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -45,9 +45,8 @@
   }
 
   function findSendButton(composer) {
-    const parent = composer.parentElement;
-    const container = parent && parent.closest(COMPOSER_CONTAINER);
-    return container ? container.querySelector(SEND_BUTTON) : null;
+    const form = composer.closest(COMPOSER_FORM);
+    return form ? form.querySelector(SEND_BUTTON) : null;
   }
 
   function pressEnter(el) {

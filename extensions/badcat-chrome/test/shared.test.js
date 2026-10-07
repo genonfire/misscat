@@ -39,7 +39,7 @@ test('parseEvent accepts only a well-formed +1 for the watched repo', () => {
 });
 
 test('reviewMessage is fixed text built from a validated integer', () => {
-  assert.equal(S.reviewMessage(123), '현재 작업 끝났으면 PR#123 리뷰해.');
+  assert.equal(S.reviewMessage(123), '현재 작업 끝났으면 PR #123 리뷰해.');
   for (const bad of ['1; rm -rf', '12', 0, -3, 1.2, NaN, null]) {
     assert.throws(() => S.reviewMessage(bad), /invalid PR number/);
   }

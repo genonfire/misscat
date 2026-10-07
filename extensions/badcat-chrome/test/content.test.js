@@ -2,12 +2,14 @@
 // install). The tiny selector engine below evaluates the real selectors from content.js against that
 // tree, so if a selector stops matching the real structure these tests fail.
 //
-//   <form>                                   <- composer container
-//     <div>
-//       <div contenteditable="true" data-composer-markdown class="ProseMirror"><p>…</p></div>
+//   <form>                                       <- common container
+//     <div data-composer-input>                  <- nearest ancestor of the editor; the send button is NOT inside it
+//       <div><div contenteditable="true" data-composer-markdown class="ProseMirror"><p>…</p></div></div>
 //     </div>
-//     <button type="button">  (attach / voice / stop: never the send button)
-//     <button type="submit">  (send)
+//     <footer>
+//       <button type="button">  (attach / voice / stop: never the send button)
+//       <button type="submit">  (send)
+//     </footer>
 //   </form>
 //   plus decoys elsewhere: another contenteditable, another form's submit button, a legacy #prompt-textarea.
 const test = require('node:test');
@@ -17,7 +19,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 
 const GOOD_URL = 'https://chatgpt.com/c/abc-123';
-const TEXT = '현재 작업 끝났으면 PR#123 리뷰해.';
+const TEXT = '현재 작업 끝났으면 PR #123 리뷰해.';
 
 // --- minimal DOM: elements with attributes, parent links, and selectors of the form
 // "a, b" where each part is `tag?[attr]*` / `[attr="value"]` (no combinators, no classes, no ids).
@@ -84,9 +86,8 @@ function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubm
   legacy.click = () => {};
 
   const form = node('form', {}, [
-    node('div', {}, composer ? [editor] : [otherEditable]),
-    stopOrVoice,
-    ...(sendButton ? [send] : []),
+    node('div', { 'data-composer-input': '' }, [node('div', {}, composer ? [editor] : [otherEditable])]),
+    node('footer', {}, [stopOrVoice, ...(sendButton ? [send] : [])]),
   ]);
   const page = node('body', {}, [node('form', {}, [otherSubmit]), legacy, ...(composer ? [otherEditable] : []), form]);
 
@@ -138,7 +139,7 @@ test('finds the composer by its data-composer-markdown contenteditable, not by #
   assert.equal(t.log.fills.length, 1); // the other contenteditable and the legacy textarea were left alone
 });
 
-test('puts exactly "현재 작업 끝났으면 PR#123 리뷰해." in the composer and submits it with Enter', async () => {
+test('puts exactly "현재 작업 끝났으면 PR #123 리뷰해." in the composer and submits it with Enter', async () => {
   const t = boot();
   const res = await t.send({ type: 'badcat:handoff', pr: 123 });
   assert.equal(res.ok, true);
@@ -174,38 +175,38 @@ test('a failed submission leaves the text in the composer', async () => {
 });
 
 test('a pending handoff is kept and the next PR is appended after one space, then submitted', async () => {
-  const t = boot({ initial: '현재 작업 끝났으면 PR#365 리뷰해.', enterSubmits: false });
+  const t = boot({ initial: '현재 작업 끝났으면 PR #365 리뷰해.', enterSubmits: false });
   t.setEnterSubmits(true);
   const res = await t.send({ type: 'badcat:handoff', pr: 366 });
   assert.equal(res.ok, true);
-  assert.deepEqual(t.log.submitted, ['현재 작업 끝났으면 PR#365 리뷰해. 현재 작업 끝났으면 PR#366 리뷰해.']);
+  assert.deepEqual(t.log.submitted, ['현재 작업 끝났으면 PR #365 리뷰해. 현재 작업 끝났으면 PR #366 리뷰해.']);
 });
 
 test('an empty composer gets just the command', async () => {
   const t = boot({ initial: '   ' });
   assert.equal((await t.send({ type: 'badcat:handoff', pr: 365 })).ok, true);
-  assert.deepEqual(t.log.submitted, ['현재 작업 끝났으면 PR#365 리뷰해.']);
+  assert.deepEqual(t.log.submitted, ['현재 작업 끝났으면 PR #365 리뷰해.']);
 });
 
 test('a retry or duplicate event does not append the same handoff twice', async () => {
   const t = boot({ enterSubmits: false });
   await t.send({ type: 'badcat:handoff', pr: 5 });
   await t.send({ type: 'badcat:handoff', pr: 5 });
-  assert.equal(t.text(), '현재 작업 끝났으면 PR#5 리뷰해.');
+  assert.equal(t.text(), '현재 작업 끝났으면 PR #5 리뷰해.');
   await t.send({ type: 'badcat:handoff', pr: 6 });
-  assert.equal(t.text(), '현재 작업 끝났으면 PR#5 리뷰해. 현재 작업 끝났으면 PR#6 리뷰해.');
+  assert.equal(t.text(), '현재 작업 끝났으면 PR #5 리뷰해. 현재 작업 끝났으면 PR #6 리뷰해.');
   await t.send({ type: 'badcat:handoff', pr: 6 });
   await t.send({ type: 'badcat:handoff', pr: 5 });
-  assert.equal(t.text(), '현재 작업 끝났으면 PR#5 리뷰해. 현재 작업 끝났으면 PR#6 리뷰해.');
+  assert.equal(t.text(), '현재 작업 끝났으면 PR #5 리뷰해. 현재 작업 끝났으면 PR #6 리뷰해.');
   t.setEnterSubmits(true);
   assert.equal((await t.send({ type: 'badcat:handoff', pr: 5 })).ok, true);
-  assert.deepEqual(t.log.submitted, ['현재 작업 끝났으면 PR#5 리뷰해. 현재 작업 끝났으면 PR#6 리뷰해.']);
+  assert.deepEqual(t.log.submitted, ['현재 작업 끝났으면 PR #5 리뷰해. 현재 작업 끝났으면 PR #6 리뷰해.']);
 });
 
 test('PR #5 is not mistaken for already pending when only PR #15 is', async () => {
-  const t = boot({ initial: '현재 작업 끝났으면 PR#15 리뷰해.', enterSubmits: false });
+  const t = boot({ initial: '현재 작업 끝났으면 PR #15 리뷰해.', enterSubmits: false });
   await t.send({ type: 'badcat:handoff', pr: 5 });
-  assert.equal(t.text(), '현재 작업 끝났으면 PR#15 리뷰해. 현재 작업 끝났으면 PR#5 리뷰해.');
+  assert.equal(t.text(), '현재 작업 끝났으면 PR #15 리뷰해. 현재 작업 끝났으면 PR #5 리뷰해.');
 });
 
 test('fails when the composer cannot be found or the page is not a conversation', async () => {
