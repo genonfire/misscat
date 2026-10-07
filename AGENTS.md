@@ -6,7 +6,7 @@ Guidance for coding agents working on MissCat.
 MissCat watches a GitHub repository for new pull requests and HEAD commits, then delegates code review to a configured AI CLI. Keep it a small, predictable orchestration tool—not a code editor, review judge, or merge bot.
 
 ## Invariants
-- Do not modify the user's development checkout. Reviews use MissCat's dedicated workspace under `~/.cache/misscat/repos/`.
+- Do not modify the user's development checkout. Reviews run only in MissCat's persistent `cat-N` worktrees under `~/.cache/misscat/cats/<owner>/<repo>/`. The control clone under `~/.cache/misscat/repos/<owner>/<repo>/` is never a reviewer workspace; it stays clean on the default branch, and only the main process touches it and the shared Git metadata.
 - Track completed reviews per repository, PR, HEAD SHA, and profile. Do not mark failed or interrupted runs as reviewed.
 - Preserve user-owned profiles. The intentional, documented one-time State v1 → v2 reset discards legacy review history; outside that explicit reset or a confirmed user deletion, never erase review history.
 - Keep configuration, review state, and workspaces separate. Profile initialization manages profiles only, never state JSON or cached repositories.

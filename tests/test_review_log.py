@@ -70,7 +70,7 @@ class ReviewLogTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("WARNING PR #78: review failed after 42s, HEAD stays eligible", out)
         self.assertEqual(state.reviewed(), set())
-        self.assertEqual(watcher.last_failed, m.Key(78, self.pr.head, "luna"))
+        self.assertEqual(watcher.failed, {m.Key(78, self.pr.head, "luna")})
 
     def test_exception_is_failure_with_elapsed(self):
         def boom(*a):

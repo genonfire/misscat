@@ -185,7 +185,7 @@ class StateManagerTests(unittest.TestCase):
             calls = []
             watcher = m.Watcher(REPO, "luna", cfg, state,
                                 lambda repo: [pr],
-                                lambda settings, repo, item: calls.append(item.head) or True,
+                                lambda settings, repo, item, workspace: calls.append(item.head) or True,
                                 sleep=lambda delay: None)
             watcher.cycle()
             self.assertEqual(calls, [])
@@ -195,7 +195,7 @@ class StateManagerTests(unittest.TestCase):
             calls = []
             watcher = m.Watcher(REPO, "luna", cfg, reloaded,
                                 lambda repo: [pr],
-                                lambda settings, repo, item: calls.append(item.head) or True,
+                                lambda settings, repo, item, workspace: calls.append(item.head) or True,
                                 sleep=lambda delay: None)
             watcher.cycle()
             self.assertEqual(calls, ["current"])

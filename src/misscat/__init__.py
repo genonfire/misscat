@@ -3,17 +3,19 @@
 
 Watches a GitHub repository and runs an AI review once for every new PR HEAD.
 One repository = one MissCat process = one workspace = one state file.
-Single-threaded: one review at a time, then an immediate re-check before sleeping.
+One review at a time by default (`--cat=N` reviews up to N waiting PR HEADs in a batch, one
+persistent worktree per cat, and waits for the whole batch); then an immediate re-check.
 
 Each review runs the reviewer CLI (Claude Code, Codex, or Gemini via Antigravity CLI)
-from the root of a MissCat-owned checkout of the exact PR HEAD, so the CLI finds the
+from the root of a MissCat-owned worktree of the exact PR HEAD, so the CLI finds the
 repository's own instruction files (REVIEW.md, CLAUDE.md, AGENTS.md) by itself. MissCat
 never parses them and never touches your own working tree.
 
 Local layout (repository names are canonicalized to lowercase)
   ~/.config/misscat/<profile>.yml          reviewer profiles (bundled ones installed by `misscat init`)
   ~/.config/misscat/<owner>__<repo>.json   reviewed HEADs of one repository (PR + HEAD + profile)
-  ~/.cache/misscat/repos/<owner>/<repo>/   persistent review workspace
+  ~/.cache/misscat/repos/<owner>/<repo>/   control clone (default branch, never reviewed in)
+  ~/.cache/misscat/cats/<owner>/<repo>/cat-N/   persistent review worktrees
 
 Requirements and limits
 - Git must be able to authenticate to the reviewed repository. Existing Git/SSH auth is
@@ -31,6 +33,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 import importlib.resources
 import tempfile
+import threading
 import json
 import logging
 import os
@@ -51,7 +54,8 @@ __version__ = "1.3.0"
 log = logging.getLogger("misscat")
 
 CONFIG_DIR = Path.home() / ".config" / "misscat"
-WORKSPACE_ROOT = Path.home() / ".cache" / "misscat" / "repos"
+WORKSPACE_ROOT = Path.home() / ".cache" / "misscat" / "repos"  # control clones
+CAT_ROOT = Path.home() / ".cache" / "misscat" / "cats"  # persistent cat-N worktrees
 LOCK_ROOT = Path.home() / ".cache" / "misscat" / "locks"  # outside CONFIG_DIR: locking must not
 # create it, or a state-only command would make the first watcher run skip profile initialization
 OWNER_RE = re.compile(r"^[A-Za-z0-9-]+$")  # no "_": keeps the "__" in state filenames unambiguous
@@ -442,34 +446,95 @@ def _remove(path: Path) -> None:
         shutil.rmtree(path)
 
 
-def prepare_workspace(repo: str, pr: PR) -> Path:
-    """Return a clean checkout of exactly pr.head, cloning only on first use."""
-    path = workspace_path(repo)
+def cat_root(repo: str) -> Path:
+    """Directory holding the persistent cat worktrees of one repository."""
     try:
+        owner, name = canonical_repo(repo).split("/")
+    except MissCatError as exc:
+        raise WorkspaceError(str(exc)) from exc
+    return CAT_ROOT / owner / name
+
+
+class Workspaces:
+    """The control clone plus persistent `cat-N` worktrees of one repository.
+
+    The control clone is never used by a reviewer: it only fetches and stays on the default
+    branch HEAD. Each cat is a detached worktree that is cleaned and moved to the exact PR
+    HEAD before a review. Only the main MissCat process touches this shared Git metadata,
+    one step at a time; reviewers run solely inside their own cat worktree.
+    """
+
+    def __init__(self, repo: str, cats: int = 1):
+        self.repo, self.cats = repo, cats
+        self.control = workspace_path(repo)
+        self.root = cat_root(repo)
+
+    def cat_path(self, cat: int) -> Path:
+        return self.root / f"cat-{cat}"
+
+    def sync(self) -> None:
+        """Ensure the control clone and cat-1..cat-N exist; leave control on the default HEAD.
+
+        Only missing pieces are created. Cats beyond `cats` stay on disk untouched.
+        """
+        path = self.control
+        try:
+            if path.exists() and not _usable(path):
+                log.warning("%s is not a usable git repository, recreating it", path)
+                _remove(path)
+            if not path.exists():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                log.info("cloning %s into %s", self.repo, path)
+                try:
+                    _clone(self.repo, path)
+                except BaseException:  # incl. Ctrl-C: never leave a half-cloned workspace behind
+                    shutil.rmtree(path, ignore_errors=True)
+                    raise
+            _git(["fetch", "origin"], path)
+            _git(["remote", "set-head", "origin", "--auto"], path)
+            remote_head = _git(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], path)
+            _git(["reset", "--hard"], path)
+            _git(["clean", "-ffdx"], path)
+            _git(["checkout", "-f", "-B", remote_head.split("/", 1)[1], remote_head], path)
+            for cat in range(1, self.cats + 1):
+                self._ensure_cat(cat)
+        except OSError as exc:
+            raise WorkspaceError(str(exc)) from exc
+
+    def _ensure_cat(self, cat: int) -> Path:
+        path = self.cat_path(cat)
         if path.exists() and not _usable(path):
-            log.warning("%s is not a usable git repository, recreating it", path)
+            log.warning("%s is not a usable worktree, recreating it", path)
             _remove(path)
         if not path.exists():
             path.parent.mkdir(parents=True, exist_ok=True)
-            log.info("cloning %s into %s", repo, path)
-            try:
-                _clone(repo, path)
-            except BaseException:  # incl. Ctrl-C: never leave a half-cloned workspace behind
-                shutil.rmtree(path, ignore_errors=True)
-                raise
-        _git(["fetch", "origin", f"refs/pull/{pr.number}/head"], path)  # works for fork PRs
-        _git(["reset", "--hard"], path)
-        _git(["clean", "-ffdx"], path)  # drop leftovers of the previous reviewer, ignored files too
-        _git(["checkout", "--detach", "FETCH_HEAD"], path)
-        head = _git(["rev-parse", "HEAD"], path)
-    except OSError as exc:
-        raise WorkspaceError(str(exc)) from exc
-    if head != pr.head:
-        raise WorkspaceError(
-            f"PR #{pr.number} changed during preparation ({pr.head[:7]} -> {head[:7]}); "
-            "the next poll will pick up the new HEAD"
-        )
-    return path
+            _git(["worktree", "prune"], self.control)
+            log.info("adding worktree cat-%d at %s", cat, path)
+            _git(["worktree", "add", "--force", "--detach", str(path)], self.control)
+        return path
+
+    def prepare(self, pr: PR, cat: int) -> Path:
+        """Return cat-N cleaned and detached at exactly pr.head."""
+        try:
+            _git(["fetch", "origin", f"refs/pull/{pr.number}/head"], self.control)  # fork PRs too
+            fetched = _git(["rev-parse", "FETCH_HEAD^{commit}"], self.control)
+            self._check_head(pr, fetched)
+            path = self._ensure_cat(cat)
+            _git(["reset", "--hard"], path)
+            _git(["clean", "-ffdx"], path)  # drop leftovers of the previous reviewer, ignored files too
+            _git(["checkout", "--detach", fetched], path)
+            self._check_head(pr, _git(["rev-parse", "HEAD"], path))
+        except OSError as exc:
+            raise WorkspaceError(str(exc)) from exc
+        return path
+
+    @staticmethod
+    def _check_head(pr: PR, head: str) -> None:
+        if head != pr.head:
+            raise WorkspaceError(
+                f"PR #{pr.number} changed during preparation ({pr.head[:7]} -> {head[:7]}); "
+                "the next poll will pick up the new HEAD"
+            )
 
 
 # --------------------------------------------------------------------------- reviewer
@@ -719,14 +784,8 @@ def build_prompt(settings: Settings, repo: str, pr: PR) -> str:
     return f"{settings.prompt.strip()}\n\n{context}"
 
 
-def run_cli_reviewer(settings: Settings, repo: str, pr: PR) -> bool:
-    """Prepare the workspace, run the reviewer CLI in it and wait. True only on a clean exit."""
-    try:
-        workspace = prepare_workspace(repo, pr)
-    except WorkspaceError as exc:
-        log.error("PR #%d: workspace preparation failed: %s", pr.number, exc)
-        return False
-
+def run_cli_reviewer(settings: Settings, repo: str, pr: PR, workspace: Path) -> bool:
+    """Run the reviewer CLI in the prepared cat worktree and wait. True only on a clean exit."""
     cmd = COMMANDS[settings.provider](
         settings.model,
         build_prompt(settings, repo, pr),
@@ -933,7 +992,11 @@ class Watcher:
 
     Timer: starts idle (1m -> 5m). A successful review switches it to active (5m -> 1m)
     from the start of the sequence. When no PR is open any more it falls back to idle.
-    A failed review waits FAILURE_WAIT and does not advance the timer.
+    A batch in which every review failed waits FAILURE_WAIT and does not advance the timer.
+
+    Reviews run in batches of at most `cats` PR HEADs, one cat worktree each, concurrently.
+    The batch is a barrier: nothing new starts until every reviewer of the batch has
+    finished; only then are successes recorded (here, sequentially) and PRs listed again.
     """
 
     def __init__(
@@ -943,20 +1006,23 @@ class Watcher:
         settings: Settings,
         state: State,
         list_prs: Callable[[str], list[PR]],
-        reviewer: Callable[[Settings, str, PR], bool],
+        reviewer: Callable[[Settings, str, PR, Path | None], bool],
         sleep: Callable[[float], None] = time.sleep,
+        cats: int = 1,
+        workspaces: Workspaces | None = None,
     ):
         self.repo, self.profile, self.s, self.state = repo, profile, settings, state
         self.list_prs, self.reviewer, self.sleep = list_prs, reviewer, sleep
+        self.cats, self.workspaces = cats, workspaces
         self.mode, self.step = IDLE, 0
-        self.last_failed: Key | None = None
+        self.failed: set[Key] = set()  # failed in the previous batch: they go last next time
 
     def run_forever(self) -> None:
         while True:
             self.cycle()
 
     def cycle(self) -> None:
-        """One iteration: review one PR HEAD if any is waiting, otherwise sleep."""
+        """One iteration: review a batch of waiting PR HEADs if any, otherwise sleep."""
         try:
             prs = self.list_prs(self.repo)
         except GhError as exc:
@@ -965,10 +1031,10 @@ class Watcher:
             return
         if not prs and self.mode == ACTIVE:
             self.mode, self.step = IDLE, 0
-        pr = self._next_reviewable(prs)
-        if pr is None:
+        batch = self._next_batch(prs)
+        if not batch:
             self._sleep_adaptive()
-        elif self._review(pr):
+        elif any(self._review_batch(batch)):
             self.mode, self.step = ACTIVE, 0  # then straight back to a fresh listing, no sleep
         else:
             log.warning("checking again in %s", _fmt(FAILURE_WAIT))
@@ -977,36 +1043,81 @@ class Watcher:
     def _key(self, pr: PR) -> Key:
         return Key(pr.number, pr.head, self.profile)
 
-    def _next_reviewable(self, prs: list[PR]) -> PR | None:
+    def _next_batch(self, prs: list[PR]) -> list[PR]:
         done = self.state.reviewed()
         waiting = [
             p for p in sorted(prs, key=lambda p: p.number)  # oldest PR first
             if (self.s.include_drafts or not p.draft) and self._key(p) not in done
         ]
-        for pr in waiting:  # the PR that just failed goes last so it cannot starve the others
-            if self._key(pr) != self.last_failed:
-                return pr
-        return waiting[0] if waiting else None
+        # HEADs that just failed go last so they cannot starve the others
+        ordered = ([p for p in waiting if self._key(p) not in self.failed]
+                   + [p for p in waiting if self._key(p) in self.failed])
+        return ordered[: self.cats]
 
     def _review(self, pr: PR) -> bool:
+        return self._review_batch([pr])[0]
+
+    def _review_batch(self, batch: list[PR]) -> list[bool]:
+        """Review `batch` concurrently, wait for all of it, then record the successes."""
+        tag = (lambda n: f" [cat-{n}]") if self.cats > 1 else (lambda n: "")
         _log_review_separator()
-        log.info("PR #%d: review start (%s)", pr.number, pr.head[:7])
-        started = time.monotonic()
+        for n, pr in enumerate(batch, 1):
+            log.info("PR #%d: review start (%s)%s", pr.number, pr.head[:7], tag(n))
+        started = [time.monotonic() for _ in batch]
+        workspaces: list[Path | None] = [None] * len(batch)
+        results: list[bool | None] = [None] * len(batch)  # None = not run yet
+        elapsed: list[float | None] = [None] * len(batch)
+
+        # Shared Git metadata (control clone fetches, worktree creation) is only touched here,
+        # one step at a time; a preparation failure fails only that PR.
         try:
-            ok = self.reviewer(self.s, self.repo, pr)
-        except Exception:
-            log.exception("PR #%d: reviewer crashed", pr.number)
-            ok = False
-        if ok:
-            self.state.add(self._key(pr))  # only a successful review is recorded
-            self.last_failed = None
-            log.info("PR #%d: review done in %s", pr.number,
-                     _fmt_elapsed(time.monotonic() - started))
-        else:
-            self.last_failed = self._key(pr)
-            log.warning("PR #%d: review failed after %s, HEAD stays eligible", pr.number,
-                        _fmt_elapsed(time.monotonic() - started))
-        return ok
+            if self.workspaces is not None:
+                self.workspaces.sync()
+        except WorkspaceError as exc:
+            log.error("workspace preparation failed: %s", exc)
+            results = [False] * len(batch)
+        for i, pr in enumerate(batch):
+            if results[i] is not None or self.workspaces is None:
+                continue
+            try:
+                workspaces[i] = self.workspaces.prepare(pr, i + 1)
+            except WorkspaceError as exc:
+                log.error("PR #%d: workspace preparation failed: %s", pr.number, exc)
+                results[i] = False
+
+        def run(i: int) -> None:
+            try:
+                results[i] = bool(self.reviewer(self.s, self.repo, batch[i], workspaces[i]))
+            except Exception:
+                log.exception("PR #%d: reviewer crashed", batch[i].number)
+                results[i] = False
+            elapsed[i] = time.monotonic() - started[i]
+
+        pending = [i for i, r in enumerate(results) if r is None]
+        if len(pending) == 1:
+            run(pending[0])
+        elif pending:
+            threads = [threading.Thread(target=run, args=(i,), name=f"cat-{i + 1}", daemon=True)
+                       for i in pending]
+            for thread in threads:
+                thread.start()
+            for thread in threads:  # batch barrier: nobody is replaced while others still review
+                thread.join()
+        for i in range(len(batch)):
+            if elapsed[i] is None:  # failed before a reviewer started
+                elapsed[i] = time.monotonic() - started[i]
+
+        self.failed = set()
+        for n, (pr, ok) in enumerate(zip(batch, results), 1):
+            if ok:
+                self.state.add(self._key(pr))  # only a successful review is recorded
+                log.info("PR #%d: review done in %s%s", pr.number, _fmt_elapsed(elapsed[n - 1]),
+                         tag(n))
+            else:
+                self.failed.add(self._key(pr))
+                log.warning("PR #%d: review failed after %s, HEAD stays eligible%s", pr.number,
+                            _fmt_elapsed(elapsed[n - 1]), tag(n))
+        return [bool(ok) for ok in results]
 
     def _sleep_adaptive(self) -> None:
         seq = self.s.active if self.mode == ACTIVE else self.s.idle
@@ -1208,6 +1319,16 @@ def run_state(argv: list[str]) -> int:
 # --------------------------------------------------------------------------- CLI
 
 
+def _positive_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError:
+        number = 0
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"must be a whole number >= 1, not {value!r}")
+    return number
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     parser = argparse.ArgumentParser(
@@ -1240,6 +1361,14 @@ def main(argv: list[str] | None = None) -> int:
         help="show detailed reviewer activity",
     )
     parser.add_argument(
+        "--cat",
+        type=_positive_int,
+        default=1,
+        metavar="N",
+        help="review up to N waiting PR HEADs at once in a batch (default: 1); the whole "
+        "batch must finish before the next PR check",
+    )
+    parser.add_argument(
         "-v",
         "--version",
         action="version",
@@ -1252,7 +1381,8 @@ def main(argv: list[str] | None = None) -> int:
 
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
+        format="%(asctime)s %(levelname)s %(threadName)s %(message)s" if args.cat > 1
+        else "%(asctime)s %(levelname)s %(message)s",
         datefmt="%H:%M:%S",
     )
 
@@ -1270,7 +1400,13 @@ def main(argv: list[str] | None = None) -> int:
             state = State(state_path(repo))  # v1 resets; corrupt/unknown files fail safely
             log.info("watching %s with %s/%s (profile: %s)", repo, settings.provider,
                      settings.model, args.profile or "default")
-            Watcher(repo, args.profile, settings, state, gh_open_prs, run_cli_reviewer).run_forever()
+            workspaces = Workspaces(repo, args.cat)
+            try:
+                workspaces.sync()
+            except WorkspaceError as exc:  # retried before every batch, like a failed review
+                log.warning("workspace not ready yet: %s", exc)
+            Watcher(repo, args.profile, settings, state, gh_open_prs, run_cli_reviewer,
+                    cats=args.cat, workspaces=workspaces).run_forever()
     except MissCatError as exc:
         print(f"misscat: {exc}", file=sys.stderr)
         return 2
