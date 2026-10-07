@@ -80,7 +80,12 @@ async function start(repoInput, tabId) {
   return { ok: true };
 }
 
-async function stop() {
+async function stop(tabId) {
+  // Only the tab that started the session may stop it; the popup of any other tab must not.
+  const session = await getSession();
+  if (session.active && session.tabId !== tabId) {
+    return { ok: false, error: 'Watching in another tab.' };
+  }
   await deactivate(null);
   return { ok: true };
 }
@@ -164,7 +169,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     await ready;
     if (message.type === 'badcat:status') return { ok: true, session: await getSession() };
     if (message.type === 'badcat:start') return start(message.repo, message.tabId);
-    if (message.type === 'badcat:stop') return stop();
+    if (message.type === 'badcat:stop') return stop(message.tabId);
     return { ok: false, error: 'unknown message' };
   };
   run().then(sendResponse, (e) => sendResponse({ ok: false, error: String(e && e.message) }));

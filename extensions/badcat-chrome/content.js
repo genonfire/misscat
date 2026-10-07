@@ -1,11 +1,15 @@
 // Runs only on https://chatgpt.com/*. One narrow action: put the fixed handoff text into the
-// composer and submit it. It reads nothing but the composer's own text.
+// composer and submit it. It reads nothing but the composer's own text. A handoff that could not be
+// submitted (e.g. ChatGPT still answering) is left in the composer; the next handoff is appended to it.
 (function () {
   'use strict';
   const { isConversationUrl, reviewMessage } = self.BadCatShared;
 
-  const COMPOSER = '#prompt-textarea';
-  const SEND_BUTTON = 'button[data-testid="send-button"]';
+  // ChatGPT's composer is a ProseMirror contenteditable. Match on semantic attributes only (no class
+  // names or localized aria-labels); the send button is the submit button in the composer's own form (it sits outside [data-composer-input]).
+  const COMPOSER = '[contenteditable="true"][data-composer-markdown]';
+  const COMPOSER_FORM = 'form'; // wraps both the [data-composer-input] block and the footer with the send button
+  const SEND_BUTTON = 'button[type="submit"]';
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
   async function waitFor(check, timeoutMs) {
@@ -18,20 +22,31 @@
     }
   }
 
-  const readComposer = (el) => ((el.value !== undefined ? el.value : el.textContent) || '').trim();
+  const readComposer = (el) => (el.textContent || '').trim();
 
-  function setComposer(el, text) {
-    el.focus();
-    if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {
-      const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement : HTMLInputElement;
-      Object.getOwnPropertyDescriptor(proto.prototype, 'value').set.call(el, text);
-      el.dispatchEvent(new Event('input', { bubbles: true }));
-      return;
+  // True when `command` already sits in `existing` as its own space-delimited piece.
+  function containsCommand(existing, command) {
+    for (let i = existing.indexOf(command); i !== -1; i = existing.indexOf(command, i + 1)) {
+      const end = i + command.length;
+      if ((i === 0 || /\s/.test(existing[i - 1])) && (end === existing.length || /\s/.test(existing[end]))) return true;
     }
-    // ProseMirror contenteditable: replace whatever is there so a retry never duplicates the text.
+    return false;
+  }
+
+  function appendToComposer(el, existing, text) {
+    const insert = existing ? ' ' + text : text;
+    el.focus();
+    // Insert at the end so whatever is already there is kept untouched.
     const selection = window.getSelection();
     selection.selectAllChildren(el);
-    document.execCommand('insertText', false, text);
+    if (existing) selection.collapseToEnd(); // blank/whitespace-only content is simply replaced
+    document.execCommand('insertText', false, insert);
+    return existing + insert;
+  }
+
+  function findSendButton(composer) {
+    const form = composer.closest(COMPOSER_FORM);
+    return form ? form.querySelector(SEND_BUTTON) : null;
   }
 
   function pressEnter(el) {
@@ -46,20 +61,24 @@
     const composer = await waitFor(() => document.querySelector(COMPOSER), 5000);
     if (!composer) return { ok: false, error: 'composer not found' };
 
-    setComposer(composer, text);
-    if (readComposer(composer) !== text) return { ok: false, error: 'could not fill the composer' };
+    // Never discard what is already there: append after exactly one space, unless this very command
+    // is already pending (a retry or duplicate event), in which case just submit again.
+    const existing = readComposer(composer);
+    if (!containsCommand(existing, text)) {
+      const full = appendToComposer(composer, existing, text);
+      if (readComposer(composer) !== full) return { ok: false, error: 'could not fill the composer' };
+    }
 
     pressEnter(composer);
     let sent = await waitFor(() => readComposer(composer) === '', 3000);
     if (!sent) {
-      const button = document.querySelector(SEND_BUTTON);
+      const button = findSendButton(composer);
       if (button && !button.disabled) {
         button.click();
         sent = await waitFor(() => readComposer(composer) === '', 3000);
       }
     }
     if (sent) return { ok: true };
-    if (readComposer(composer) === text) setComposer(composer, ''); // do not leave a stray draft
     return { ok: false, error: 'message was not submitted' };
   }
 

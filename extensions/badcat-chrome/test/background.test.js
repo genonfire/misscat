@@ -149,12 +149,26 @@ test('a failed submit is not marked delivered, so the same event can still be ha
 test('OFF disconnects the host and stops sending', async () => {
   const t = await started();
   const port = t.natives[0];
-  await t.popup({ type: 'badcat:stop' });
+  await t.popup({ type: 'badcat:stop', tabId: 7 });
   assert.equal(port.disconnected, true);
   assert.equal(t.session().active, false);
   port.emit(plus1(9, HEAD1));
   await t.settle();
   assert.equal(t.sent.length, 0);
+});
+
+test('only the tab that started the session can stop or start it', async () => {
+  const t = await started();
+  const port = t.natives[0];
+  for (const tabId of [8, undefined, null, '7']) {
+    assert.equal((await t.popup({ type: 'badcat:stop', tabId })).ok, false, String(tabId));
+  }
+  assert.equal((await t.popup({ type: 'badcat:start', repo: 'x/y', tabId: 8 })).ok, false);
+  assert.equal(port.disconnected, false);
+  assert.equal(JSON.stringify(t.session()), JSON.stringify({ active: true, repo: 'o/r', tabId: 7, error: null }));
+  assert.equal(t.natives.length, 1);
+  assert.equal((await t.popup({ type: 'badcat:stop', tabId: 7 })).ok, true);
+  assert.equal(t.session().active, false);
 });
 
 test('closing the target tab stops the session and never picks another tab', async () => {

@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "BadCat",
+  "name": "MissCat",
   "version": "0.1.0",
   "description": "Hands a PR off to the current ChatGPT tab when badcat-host reports a valid +1. Local use only.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA39/EREyqpE8tTetAItgY38TraurIX5ZK0ygHFsF3CfVlJ6h2XwelIMoSp4W2iyXqjeGKiTHOW+XanRK1wlO5FmzlMRXQTCRo0WwzLTgoncYLRIicFJHT0jpvQybsdK6cyPj1HshlIDhD6id1O4D0u+WB0oyz2pKkk4AwH0Zndm8GDax4yEDiCMGc0a6vPB9R0kUhb8Rs3BNessxXgiOb10XIrPxkJUIKCQASi5YhJ5+Jm61wrJd8LkSv71LFWB7sKcTc0dKGOpZ18mRrdvgE8jdKeLLN576i8XcwGD9GA7AKLk7610vshIC7dC3Jwp2hrIJdApfLXBM/yVgComwihQIDAQAB",
@@ -11,7 +11,7 @@
     "service_worker": "background.js"
   },
   "action": {
-    "default_title": "BadCat",
+    "default_title": "MissCat",
     "default_popup": "popup.html",
     "default_icon": {
       "16": "icons/icon16.png",

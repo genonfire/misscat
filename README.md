@@ -439,9 +439,9 @@ host -> client  {"error": "<message>"}                     rejected request or f
 - `badcat-host` has its own poll loop, independent of BadCat's watcher: it polls every 60 seconds and backs off to 5 minutes on errors. It reuses only BadCat's `gh` client and review protocol. Any GitHub error fails closed: no event is sent until the next successful poll shows `+1`. Logs on stderr never include `gh`'s error text (only the HTTP status), since it could echo credentials.
 - Repository names are validated strictly; nothing else is accepted from the client and no command is ever executed on its behalf.
 
-### BadCat Chrome extension (+1 → ChatGPT handoff)
+### MissCat Chrome extension (+1 → ChatGPT handoff)
 
-`extensions/badcat-chrome/` is a tiny local Chrome extension (plain Manifest V3, no npm, no build step) that talks to `badcat-host` and, when a PR reaches a valid `+1`, types `PR #<number> 리뷰해` into your **current** ChatGPT conversation tab and presses Enter. It is open source in this repository but is **not** part of the Python wheel and is not published to the Chrome Web Store.
+`extensions/badcat-chrome/` is a tiny local Chrome extension named **MissCat** in Chrome (the directory keeps its `badcat` name because it works with `badcat-host`) (plain Manifest V3, no npm, no build step) that talks to `badcat-host` and, when a PR reaches a valid `+1`, types `현재 작업 끝났으면 PR #<number> 리뷰해.` into your **current** ChatGPT conversation tab and presses Enter. It is open source in this repository but is **not** part of the Python wheel and is not published to the Chrome Web Store.
 
 1. `chrome://extensions` → enable *Developer mode* → *Load unpacked* → pick `extensions/badcat-chrome/`.
 2. Register the native host for this extension (its ID is fixed by the `key` in `manifest.json`):
@@ -450,10 +450,10 @@ host -> client  {"error": "<message>"}                     rejected request or f
 badcat-host install --extension-id iiaiioncejjhjmglaiionpmgpjminnkb
 ```
 
-3. Open a ChatGPT conversation (`https://chatgpt.com/c/...`), click the BadCat icon, enter `owner/repo` and press **Catch 'em all, Meow!**. Press **Nap time, Meow!** to stop.
+3. Open a ChatGPT conversation (`https://chatgpt.com/c/...`), click the MissCat icon, enter `owner/repo` and press **Catch 'em all, Meow!**. Press **Nap time, Meow!** to stop.
 
-- The popup is only a remote control: the MV3 service worker keeps the Native Messaging connection, so closing the popup does not stop monitoring. The session is bound to the tab you started it from; if that tab is closed or leaves the conversation, monitoring stops (it never switches to another tab). Reload an already-open ChatGPT tab once after installing the extension so its content script is present.
-- Only `+1` events for the watched repo are acted on, once per repo + PR + HEAD (a new HEAD hands off again). The ChatGPT message is fixed text built from the PR number; no review body, SHA, repo or credentials are sent. The composer's current text is replaced by it. If submission fails (composer missing, ChatGPT still answering) it is retried twice and otherwise only logged in the extension's service-worker console; it is never marked delivered.
+- The popup is only a remote control: the MV3 service worker keeps the Native Messaging connection, so closing the popup does not stop monitoring. The session is bound to the tab you started it from; if that tab is closed or leaves the conversation, monitoring stops (it never switches to another tab). Only that tab can stop it: in any other tab's popup the button is disabled while a session is running, and the service worker refuses Start/Stop from other tabs. The extension finds ChatGPT's composer by its `contenteditable` + `data-composer-markdown` attributes and the send button as the `type="submit"` button in the composer's form. Reload an already-open ChatGPT tab once after installing the extension so its content script is present.
+- Only `+1` events for the watched repo are acted on, once per repo + PR + HEAD (a new HEAD hands off again). The ChatGPT message is fixed text built from the PR number; no review body, SHA, repo or credentials are sent. If the composer already holds text (e.g. an earlier handoff ChatGPT was too busy to accept), it is never cleared: the new command is appended after one space (`현재 작업 끝났으면 PR #365 리뷰해. 현재 작업 끝났으면 PR #366 리뷰해.`) and Enter is pressed again; a command already pending in the composer is not added twice. If submission fails (composer missing, ChatGPT still answering) it is retried twice and otherwise only logged in the extension's service-worker console; the text stays in the composer and the event is never marked delivered.
 - Permissions: `storage`, `nativeMessaging` and `https://chatgpt.com/*`. The extension never sees GitHub credentials; all GitHub access stays in `badcat-host` / `gh`.
 - Icons are the 16/32/48/128 px PNGs in `extensions/badcat-chrome/icons/`.
 - Tests (no install needed, Node ≥ 20): `node --test extensions/badcat-chrome/test/*.test.js` (also run by `python -m unittest` when `node` is available).
