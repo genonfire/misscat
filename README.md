@@ -54,7 +54,7 @@ pipx install misscat
 To upgrade MissCat to the latest version:
 
 ```bash
-pipx upgrade misscat
+pipx upgrade misscat --pip-args="--no-cache-dir"
 ```
 
 ## Releasing (maintainers)
