@@ -49,7 +49,7 @@ from urllib.parse import urlsplit
 
 import yaml
 
-__version__ = "1.4.1"
+__version__ = "1.5.0"
 
 log = logging.getLogger("misscat")
 
@@ -384,9 +384,11 @@ class PR:
     url: str
     title: str
     urgent: bool = False
+    no_review: bool = False
 
 
 URGENT_LABEL = "urgent"
+NO_REVIEW_LABEL = "no-review"
 
 
 def gh_open_prs(repo: str) -> list[PR]:
@@ -401,11 +403,12 @@ def gh_open_prs(repo: str) -> list[PR]:
     if proc.returncode != 0:
         raise GhError(proc.stderr.strip() or f"gh exited {proc.returncode}")
     try:
-        return [
-            PR(int(d["number"]), d["headRefOid"], bool(d["isDraft"]), d["url"], d["title"],
-               any(label["name"] == URGENT_LABEL for label in d.get("labels") or []))
-            for d in json.loads(proc.stdout)
-        ]
+        prs = []
+        for d in json.loads(proc.stdout):
+            names = {label["name"] for label in d.get("labels") or []}
+            prs.append(PR(int(d["number"]), d["headRefOid"], bool(d["isDraft"]), d["url"], d["title"],
+                          URGENT_LABEL in names, NO_REVIEW_LABEL in names))
+        return prs
     except (ValueError, KeyError, TypeError) as exc:
         raise GhError(f"unexpected gh output: {exc}") from exc
 
@@ -1052,10 +1055,11 @@ class Watcher:
         done = self.state.reviewed()
         waiting = [
             p for p in sorted(prs, key=lambda p: p.number)  # oldest PR first
-            if (self.s.include_drafts or not p.draft) and self._key(p) not in done
+            if (self.s.include_drafts or not p.draft) and not p.no_review and self._key(p) not in done
         ]
-        # `urgent` PRs are picked first; within each priority class, HEADs that just failed
-        # go last so they cannot starve the others
+        # `no-review` PRs are never eligible, even if also `urgent`. `urgent` PRs are picked
+        # first; within each priority class, HEADs that just failed go last so they cannot
+        # starve the others
         ordered = [p for urgent in (True, False) for failed in (False, True) for p in waiting
                    if p.urgent == urgent and (self._key(p) in self.failed) == failed]
         return ordered[: self.cats]
