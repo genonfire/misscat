@@ -9,8 +9,9 @@ const vm = require('node:vm');
 const GOOD_URL = 'https://chatgpt.com/c/abc-123';
 const TEXT = 'PR #123 리뷰해';
 
-function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubmits = false, tag = 'DIV' } = {}) {
+function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubmits = false, tag = 'DIV', initial = '' } = {}) {
   let now = 0; // virtual clock: waits finish instantly
+  let enterSubmitsNow = enterSubmits;
   const log = { submitted: [], keys: [], clicks: 0, fills: [] };
 
   const textareaProto = {
@@ -18,12 +19,12 @@ function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubm
     set value(v) { this._v = v; },
   };
   const el = Object.assign(tag === 'TEXTAREA' ? Object.create(textareaProto) : {}, {
-    tagName: tag, textContent: '', selected: false, _v: '',
+    tagName: tag, textContent: tag === 'TEXTAREA' ? '' : initial, selected: false, _v: tag === 'TEXTAREA' ? initial : '',
     focus() {},
     dispatchEvent(ev) {
       if (ev.type === 'input') return true;
       log.keys.push(ev.type + ':' + ev.key);
-      if (ev.type === 'keydown' && ev.key === 'Enter' && enterSubmits) submit();
+      if (ev.type === 'keydown' && ev.key === 'Enter' && enterSubmitsNow) submit();
       return true;
     },
   });
@@ -46,7 +47,7 @@ function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubm
     },
     execCommand(cmd, _ui, value) {
       assert.equal(cmd, 'insertText');
-      el.textContent = value; // the composer was selected first, so this replaces its content
+      el.textContent = el.collapsed ? el.textContent + value : value; // collapsed to the end = append, else replace the selection
       log.fills.push(value);
       return true;
     },
@@ -54,7 +55,7 @@ function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubm
   const listeners = [];
   const context = {
     document, location: { href: url },
-    window: { getSelection: () => ({ selectAllChildren() { el.selected = true; } }) },
+    window: { getSelection: () => ({ selectAllChildren() { el.selected = true; el.collapsed = false; }, collapseToEnd() { el.collapsed = true; } }) },
     KeyboardEvent: class { constructor(type, init) { this.type = type; Object.assign(this, init); } },
     Event: class { constructor(type) { this.type = type; } },
     HTMLTextAreaElement: { prototype: textareaProto },
@@ -71,7 +72,7 @@ function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubm
     const keep = listeners[0](message, sender, resolve);
     if (!keep) resolve(undefined);
   });
-  return { el, log, send, text };
+  return { el, log, send, text, setEnterSubmits: (v) => { enterSubmitsNow = v; } };
 }
 
 test('ping answers only the extension itself', async () => {
@@ -105,21 +106,52 @@ test('falls back to the send button when Enter does not submit', async () => {
   assert.deepEqual(t.log.submitted, [TEXT]);
 });
 
-test('fails (and leaves no stray draft) when nothing submits the message', async () => {
+test('a failed submission leaves the text in the composer', async () => {
   const t = boot({ enterSubmits: false, buttonSubmits: false });
   const res = await t.send({ type: 'badcat:handoff', pr: 123 });
   assert.equal(res.ok, false);
-  assert.equal(t.text(), '');
+  assert.equal(t.text(), TEXT);
+  assert.deepEqual(t.log.fills, [TEXT]); // never cleared
   assert.deepEqual(t.log.submitted, []);
 });
 
-test('a retry replaces the composer text instead of duplicating it', async () => {
-  const t = boot({ enterSubmits: false });
+test('a pending handoff is kept and the next PR is appended after one space, then submitted', async () => {
+  for (const tag of ['DIV', 'TEXTAREA']) {
+    const t = boot({ tag, initial: 'PR #365 리뷰해', enterSubmits: false });
+    t.setEnterSubmits(true);
+    const res = await t.send({ type: 'badcat:handoff', pr: 366 });
+    assert.equal(res.ok, true, tag);
+    assert.deepEqual(t.log.submitted, ['PR #365 리뷰해 PR #366 리뷰해'], tag);
+  }
+});
+
+test('an empty composer gets just the command', async () => {
+  const t = boot({ initial: '   ' });
+  assert.equal((await t.send({ type: 'badcat:handoff', pr: 365 })).ok, true);
+  assert.deepEqual(t.log.submitted, ['PR #365 리뷰해']);
+});
+
+test('a retry or duplicate event does not append the same handoff twice', async () => {
+  for (const tag of ['DIV', 'TEXTAREA']) {
+    const t = boot({ tag, enterSubmits: false });
+    await t.send({ type: 'badcat:handoff', pr: 5 });
+    await t.send({ type: 'badcat:handoff', pr: 5 });
+    assert.equal(t.text(), 'PR #5 리뷰해', tag);
+    await t.send({ type: 'badcat:handoff', pr: 6 });
+    assert.equal(t.text(), 'PR #5 리뷰해 PR #6 리뷰해', tag);
+    await t.send({ type: 'badcat:handoff', pr: 6 });
+    await t.send({ type: 'badcat:handoff', pr: 5 });
+    assert.equal(t.text(), 'PR #5 리뷰해 PR #6 리뷰해', tag);
+    t.setEnterSubmits(true);
+    assert.equal((await t.send({ type: 'badcat:handoff', pr: 5 })).ok, true);
+    assert.deepEqual(t.log.submitted, ['PR #5 리뷰해 PR #6 리뷰해'], tag);
+  }
+});
+
+test('PR #5 is not mistaken for already pending when only PR #15 is', async () => {
+  const t = boot({ initial: 'PR #15 리뷰해', enterSubmits: false });
   await t.send({ type: 'badcat:handoff', pr: 5 });
-  await t.send({ type: 'badcat:handoff', pr: 5 });
-  // each attempt fills the composer once (the '' entries are the stray-draft cleanup)
-  assert.deepEqual(t.log.fills.filter(Boolean), ['PR #5 리뷰해', 'PR #5 리뷰해']);
-  assert.equal(t.text(), '');
+  assert.equal(t.text(), 'PR #15 리뷰해 PR #5 리뷰해');
 });
 
 test('fails when the composer cannot be found or the page is not a conversation', async () => {
