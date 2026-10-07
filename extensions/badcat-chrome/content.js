@@ -5,8 +5,11 @@
   'use strict';
   const { isConversationUrl, reviewMessage } = self.BadCatShared;
 
-  const COMPOSER = '#prompt-textarea';
-  const SEND_BUTTON = 'button[data-testid="send-button"]';
+  // ChatGPT's composer is a ProseMirror contenteditable. Match on semantic attributes only (no class
+  // names or localized aria-labels); the send button is the submit button inside the composer's own form.
+  const COMPOSER = '[contenteditable="true"][data-composer-markdown]';
+  const COMPOSER_CONTAINER = 'form, [data-composer-input]';
+  const SEND_BUTTON = 'button[type="submit"]';
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
   async function waitFor(check, timeoutMs) {
@@ -19,7 +22,7 @@
     }
   }
 
-  const readComposer = (el) => ((el.value !== undefined ? el.value : el.textContent) || '').trim();
+  const readComposer = (el) => (el.textContent || '').trim();
 
   // True when `command` already sits in `existing` as its own space-delimited piece.
   function containsCommand(existing, command) {
@@ -32,20 +35,19 @@
 
   function appendToComposer(el, existing, text) {
     const insert = existing ? ' ' + text : text;
-    const full = existing + insert;
     el.focus();
-    if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {
-      const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement : HTMLInputElement;
-      Object.getOwnPropertyDescriptor(proto.prototype, 'value').set.call(el, full);
-      el.dispatchEvent(new Event('input', { bubbles: true }));
-      return full;
-    }
-    // ProseMirror contenteditable: insert at the end so whatever is already there is kept untouched.
+    // Insert at the end so whatever is already there is kept untouched.
     const selection = window.getSelection();
     selection.selectAllChildren(el);
     if (existing) selection.collapseToEnd(); // blank/whitespace-only content is simply replaced
     document.execCommand('insertText', false, insert);
-    return full;
+    return existing + insert;
+  }
+
+  function findSendButton(composer) {
+    const parent = composer.parentElement;
+    const container = parent && parent.closest(COMPOSER_CONTAINER);
+    return container ? container.querySelector(SEND_BUTTON) : null;
   }
 
   function pressEnter(el) {
@@ -71,7 +73,7 @@
     pressEnter(composer);
     let sent = await waitFor(() => readComposer(composer) === '', 3000);
     if (!sent) {
-      const button = document.querySelector(SEND_BUTTON);
+      const button = findSendButton(composer);
       if (button && !button.disabled) {
         button.click();
         sent = await waitFor(() => readComposer(composer) === '', 3000);

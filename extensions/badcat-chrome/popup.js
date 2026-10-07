@@ -10,13 +10,21 @@
   const statusText = document.getElementById('status-text');
   const errorEl = document.getElementById('error');
   let active = false;
+  let session = null;
+  let tabId = null; // the tab this popup was opened on
 
   function showError(text) {
     errorEl.textContent = text || '';
     errorEl.hidden = !text;
   }
 
-  function render(session) {
+  // The session belongs to the tab that started it: from any other tab the control stays disabled.
+  function updateToggle() {
+    toggle.disabled = active && !(session && Number.isInteger(tabId) && session.tabId === tabId);
+  }
+
+  function render(next) {
+    session = next;
     active = Boolean(session && session.active);
     document.body.classList.toggle('on', active);
     statusText.textContent = active ? 'Watching' : 'Sleeping';
@@ -24,6 +32,7 @@
     repoInput.readOnly = active;
     if (active) repoInput.value = session.repo;
     if (session && session.error) showError(session.error);
+    updateToggle();
   }
 
   async function ask(message) {
@@ -35,11 +44,13 @@
   }
 
   async function onToggle() {
+    if (toggle.disabled) return; // another tab owns the session, or a request is already running
     showError('');
     toggle.disabled = true;
     try {
       if (active) {
-        await ask({ type: 'badcat:stop' });
+        const result = await ask({ type: 'badcat:stop', tabId: tabId });
+        if (!result.ok) showError(result.error);
         return;
       }
       const repo = normalizeRepo(repoInput.value);
@@ -49,24 +60,25 @@
       }
       repoInput.value = repo;
       await chrome.storage.local.set({ [REPO_KEY]: repo });
-      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      const result = await ask({ type: 'badcat:start', repo: repo, tabId: tab && tab.id });
+      const result = await ask({ type: 'badcat:start', repo: repo, tabId: tabId });
       if (!result.ok) showError(result.error);
     } finally {
-      toggle.disabled = false;
+      updateToggle();
     }
   }
 
   async function init() {
     const stored = await chrome.storage.local.get(REPO_KEY);
     if (typeof stored[REPO_KEY] === 'string') repoInput.value = stored[REPO_KEY];
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    tabId = tab && Number.isInteger(tab.id) ? tab.id : null;
     const status = await ask({ type: 'badcat:status' });
     render(status.ok ? status.session : null);
     if (!status.ok) showError(status.error);
 
     toggle.addEventListener('click', onToggle);
     repoInput.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' && !active) onToggle();
+      if (e.key === 'Enter' && !active && !toggle.disabled) onToggle();
     });
     repoInput.addEventListener('input', () => {
       if (!active) chrome.storage.local.set({ [REPO_KEY]: repoInput.value.trim() });
