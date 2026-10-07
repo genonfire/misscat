@@ -383,12 +383,16 @@ class PR:
     draft: bool
     url: str
     title: str
+    urgent: bool = False
+
+
+URGENT_LABEL = "urgent"
 
 
 def gh_open_prs(repo: str) -> list[PR]:
     cmd = [
         "gh", "pr", "list", "--repo", repo, "--state", "open", "--limit", "200",
-        "--json", "number,headRefOid,isDraft,url,title",
+        "--json", "number,headRefOid,isDraft,url,title,labels",
     ]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
@@ -398,7 +402,8 @@ def gh_open_prs(repo: str) -> list[PR]:
         raise GhError(proc.stderr.strip() or f"gh exited {proc.returncode}")
     try:
         return [
-            PR(int(d["number"]), d["headRefOid"], bool(d["isDraft"]), d["url"], d["title"])
+            PR(int(d["number"]), d["headRefOid"], bool(d["isDraft"]), d["url"], d["title"],
+               any(label["name"] == URGENT_LABEL for label in d.get("labels") or []))
             for d in json.loads(proc.stdout)
         ]
     except (ValueError, KeyError, TypeError) as exc:
@@ -1049,9 +1054,10 @@ class Watcher:
             p for p in sorted(prs, key=lambda p: p.number)  # oldest PR first
             if (self.s.include_drafts or not p.draft) and self._key(p) not in done
         ]
-        # HEADs that just failed go last so they cannot starve the others
-        ordered = ([p for p in waiting if self._key(p) not in self.failed]
-                   + [p for p in waiting if self._key(p) in self.failed])
+        # `urgent` PRs are picked first; within each priority class, HEADs that just failed
+        # go last so they cannot starve the others
+        ordered = [p for urgent in (True, False) for failed in (False, True) for p in waiting
+                   if p.urgent == urgent and (self._key(p) in self.failed) == failed]
         return ordered[: self.cats]
 
     def _review(self, pr: PR) -> bool:
