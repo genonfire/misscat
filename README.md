@@ -291,13 +291,14 @@ Avoid `--dangerously-skip-permissions` for routine unattended operation, as it b
 
 ## Review workspace
 
-MissCat reviews each repository in its own persistent workspace:
+MissCat keeps one persistent **control clone** per repository and one persistent Git worktree per cat:
 
 ```text
-~/.cache/misscat/repos/<owner>/<repo>/
+~/.cache/misscat/repos/<owner>/<repo>/        control clone (default branch HEAD, never reviewed in)
+~/.cache/misscat/cats/<owner>/<repo>/cat-1/   review worktrees: cat-1, cat-2, ...
 ```
 
-The repository is cloned on first use and reused for later reviews. Before each review, MissCat prepares a clean checkout of the exact PR HEAD.
+The repository is cloned on first use and reused. At startup and before each batch MissCat fetches the control clone, leaves it clean on the default branch, and creates any missing `cat-N` worktrees. Existing cats are reused across runs; a later run with a smaller `--cat` leaves the extra cats on disk, unused. Before each review, MissCat cleans a cat's worktree and detaches it at the exact PR HEAD. The reviewer CLI runs with that cat worktree as its working directory.
 
 Your normal development checkout is never touched.
 
@@ -312,7 +313,7 @@ Your normal development checkout is never touched.
   - MissCat should only be used with repositories and pull requests whose code and contributors you trust.
 - **One process per repository**:
   - Run at most one MissCat process per repository at any given time.
-  - Multiple MissCat instances or profiles pointing to the same repository would share and conflict over the same persistent workspace (`~/.cache/misscat/repos/<owner>/<repo>/`).
+  - Multiple MissCat instances or profiles pointing to the same repository would share and conflict over the same persistent workspace (`~/.cache/misscat/repos/<owner>/<repo>/` and `~/.cache/misscat/cats/<owner>/<repo>/`).
 
 ## Reviewer backends
 
@@ -349,11 +350,23 @@ After review work is complete, MissCat gives the author some time to make change
 5m → 4m → 3m → 2m → 1m → 1m ...
 ```
 
-MissCat runs one review at a time.
+By default MissCat runs one review at a time.
 
 When a review finishes successfully, it immediately checks the repository again before sleeping. If another PR or new HEAD is waiting, it reviews that next.
 
 If a review or workspace preparation fails, that HEAD is not marked reviewed and MissCat waits 5 minutes before checking again.
+
+### Backlog bursts: `--cat=N`
+
+```bash
+misscat . luna --cat=3
+```
+
+When several reviews pile up, MissCat can briefly call the neighbor cats for help. `--cat=N` is the maximum number of reviews in one **batch**, not a permanently busy worker pool; `--cat=1` (the default) is the single-review behavior described above.
+
+On each fresh PR listing MissCat takes up to N waiting PR HEADs (same eligibility and oldest-first order), prepares one worktree per PR, runs the reviewers concurrently and **waits for the whole batch to finish**. A cat that finishes early does not pick up another PR. Successful reviews are then recorded in the state file by the main process, and PRs are listed again immediately. A failed review never discards the successes of its batch; failed HEADs stay eligible and go last in the next batch. If every review of a batch fails, MissCat waits 5 minutes.
+
+With `--cat` above 1, log lines carry the cat name (`cat-1`, ...). Each cat runs a full reviewer, so tokens and rate limits are used in parallel.
 
 ## BadCat: review-state watcher and opt-in merge
 
