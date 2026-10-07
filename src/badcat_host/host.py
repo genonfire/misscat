@@ -1,6 +1,7 @@
 """`badcat-host`: a read-only Chrome Native Messaging host that reports review-state events.
 
-Reuses BadCat's strict review protocol and poll/backoff loop. It never writes to GitHub: it only
+Reuses BadCat's `gh` client and strict review protocol; its poll/backoff loop is its own
+(`badcat_host.poll`). It never writes to GitHub: it only
 tells its client when a PR HEAD reaches a valid `+1`. stdout carries protocol frames and nothing
 else; diagnostics go to stderr.
 
