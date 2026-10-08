@@ -10,7 +10,7 @@ const MAX_DELIVERED = 500;
 const RETRY_DELAYS_MS = [0, 5000, 15000]; // e.g. ChatGPT still answering when the +1 arrives
 
 let port = null; // the live badcat-host connection, if any
-let queue = Promise.resolve(); // host events are handled one at a time
+let queue = Promise.resolve(); // events of the live connection are handled one at a time; reset per connection
 
 const INACTIVE = { active: false, repo: null, tabId: null, error: null };
 
@@ -73,6 +73,7 @@ async function start(repoInput, tabId) {
     return { ok: false, error: 'Cannot reach badcat-host.' };
   }
   port = connection;
+  queue = Promise.resolve(); // pending work of a previous connection must not delay this one
   connection.onMessage.addListener((message) => onHostMessage(connection, message));
   connection.onDisconnect.addListener(() => onHostDisconnect(connection));
   await setSession({ active: true, repo: repo, tabId: tabId, error: null });
@@ -106,7 +107,7 @@ function onHostMessage(connection, message) {
     deactivate('badcat-host: ' + message.error.slice(0, 200)); // not queued: retries may be sleeping
     return;
   }
-  queue = queue.then(() => handleEvent(message)).catch((e) => console.error('handoff failed', e));
+  queue = queue.then(() => handleEvent(connection, message)).catch((e) => console.error('handoff failed', e));
 }
 
 async function delivered() {
@@ -116,27 +117,33 @@ async function delivered() {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function handleEvent(message) {
+// Every handoff belongs to the connection that received the event; once that connection is no longer
+// the live one, the handoff is abandoned, even if repo and tab are unchanged in a newer session.
+async function handleEvent(connection, message) {
+  if (connection !== port) return;
   const session = await getSession();
-  if (!session.active) return;
+  if (connection !== port || !session.active) return;
   const event = parseEvent(message, session.repo);
   if (event === null) return; // invalid payload, +2, other repo: do nothing
   const key = eventKey(event);
 
   for (const delay of RETRY_DELAYS_MS) {
     if (delay) await sleep(delay);
+    if (connection !== port) return;
     const current = await getSession();
-    if (!current.active || current.repo !== session.repo || current.tabId !== session.tabId) return;
+    if (connection !== port || !current.active || current.repo !== session.repo || current.tabId !== session.tabId) return;
     const sent = await delivered();
+    if (connection !== port) return;
     if (sent.includes(key)) return; // idempotent: same repo + PR + HEAD is handed off once
 
     let tab;
     try {
       tab = await chrome.tabs.get(current.tabId);
     } catch (e) {
-      await deactivate('The ChatGPT tab was closed.');
+      if (connection === port) await deactivate('The ChatGPT tab was closed.');
       return;
     }
+    if (connection !== port) return;
     if (!isConversationUrl(tab.url)) {
       await deactivate('The tab is no longer a ChatGPT conversation.');
       return;
@@ -147,6 +154,7 @@ async function handleEvent(message) {
         type: 'badcat:handoff',
         pr: event.pr,
       });
+      if (connection !== port) return; // do not record into a newer session
       if (result && result.ok === true) {
         await chrome.storage.session.set({
           [DELIVERED_KEY]: sent.concat(key).slice(-MAX_DELIVERED),

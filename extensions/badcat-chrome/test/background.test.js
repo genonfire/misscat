@@ -9,7 +9,8 @@ const HEAD1 = 'a'.repeat(40);
 const HEAD2 = 'b'.repeat(40);
 const GOOD_URL = 'https://chatgpt.com/c/abc-123';
 
-function boot({ tabUrl = GOOD_URL, handoff = async () => ({ ok: true }), seed = {} } = {}) {
+function boot({ tabUrl = GOOD_URL, handoff = async () => ({ ok: true }), seed = {}, fakeTimers = false } = {}) {
+  const timers = [];
   const store = { ...seed };
   const tabs = { 7: { id: 7, url: tabUrl } };
   const sent = [];
@@ -52,7 +53,7 @@ function boot({ tabUrl = GOOD_URL, handoff = async () => ({ ok: true }), seed = 
   };
   const shared = require('../shared.js');
   const context = {
-    chrome, console: { warn() {}, error() {}, log() {} }, setTimeout, URL,
+    chrome, console: { warn() {}, error() {}, log() {} }, setTimeout: fakeTimers ? (fn, ms) => { timers.push({ fn, ms }); } : setTimeout, URL,
     importScripts() {}, self: { BadCatShared: shared },
   };
   context.self.chrome = chrome;
@@ -65,7 +66,7 @@ function boot({ tabUrl = GOOD_URL, handoff = async () => ({ ok: true }), seed = 
   });
   const session = () => store['badcat.session'];
   const settle = () => new Promise((r) => setImmediate(r));
-  return { popup, session, store, tabs, sent, listeners, natives, settle };
+  return { popup, session, store, tabs, sent, listeners, natives, settle, timers };
 }
 
 const plus1 = (pr, head, extra = {}) => ({ repo: 'o/r', pr, head, status: '+1', ...extra });
@@ -213,4 +214,53 @@ test('a stale active session without a live connection is reset on wake-up', asy
   const t = boot({ seed: { 'badcat.session': { active: true, repo: 'o/r', tabId: 7, error: null } } });
   const res = await t.popup({ type: 'badcat:status' });
   assert.equal(res.session.active, false);
+});
+
+const OFF_ON = async (t) => {
+  assert.equal((await t.popup({ type: 'badcat:stop', tabId: 7 })).ok, true);
+  assert.equal((await t.popup({ type: 'badcat:start', repo: 'o/r', tabId: 7 })).ok, true);
+};
+const wake = async (t) => { // fire the pending retry sleeps, then let the handlers run
+  for (const { fn } of t.timers.splice(0)) fn();
+  await t.settle();
+};
+
+test('a waiting retry is invalidated by OFF then ON on the same tab and repo', async () => {
+  const t = await started({ fakeTimers: true, handoff: async () => ({ ok: false, error: 'busy' }) });
+  t.natives[0].emit(plus1(5, HEAD1));
+  await t.settle();
+  assert.equal(t.sent.length, 1);
+  assert.equal(t.timers.length, 1); // sleeping before the retry
+  await OFF_ON(t);
+  await wake(t); // the old retry wakes up inside the new session
+  assert.equal(t.sent.length, 1);
+  assert.equal(t.timers.length, 0);
+  assert.equal(t.session().active, true);
+  assert.equal(t.store['badcat.delivered'], undefined);
+});
+
+test('after OFF/ON a new +1 is not held up by the old connection retry queue', async () => {
+  const t = await started({ fakeTimers: true, handoff: async (m) => (m.pr === 5 ? { ok: false } : { ok: true }) });
+  t.natives[0].emit(plus1(5, HEAD1));
+  await t.settle();
+  await OFF_ON(t);
+  t.natives[1].emit(plus1(6, HEAD2));
+  await t.settle(); // the old retry has not been woken
+  assert.equal(JSON.stringify(t.sent.map((s) => s.message.pr)), JSON.stringify([5, 6]));
+  await wake(t);
+  assert.equal(t.sent.length, 2);
+  assert.equal(JSON.stringify(t.store['badcat.delivered']), JSON.stringify(['o/r#6@' + HEAD2]));
+});
+
+test('a handoff that fails within a live connection gives up, and a later +1 still works', async () => {
+  const t = await started({ fakeTimers: true, handoff: async (m) => (m.pr === 5 ? { ok: false } : { ok: true }) });
+  t.natives[0].emit(plus1(5, HEAD1));
+  await t.settle();
+  for (let i = 0; i < 5; i++) await wake(t);
+  assert.equal(t.sent.filter((s) => s.message.pr === 5).length, 3); // bounded retries
+  assert.equal(t.timers.length, 0);
+  t.natives[0].emit(plus1(6, HEAD2));
+  await t.settle();
+  assert.equal(t.sent.filter((s) => s.message.pr === 6).length, 1);
+  assert.equal(t.session().active, true);
 });
