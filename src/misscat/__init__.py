@@ -49,7 +49,7 @@ from urllib.parse import urlsplit
 
 import yaml
 
-__version__ = "1.4.3"
+__version__ = "1.4.4"
 
 log = logging.getLogger("misscat")
 
