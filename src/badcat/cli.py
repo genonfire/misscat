@@ -16,7 +16,7 @@ from misscat import GhError, MissCatError, _write_atomic, resolve_repo_arg
 
 from . import __version__
 from .github import GhClient, OpenPR
-from .protocol import READY, WAITING, Verdict, evaluate
+from .protocol import PLUS1, READY, WAITING, Verdict, evaluate
 
 log = logging.getLogger("badcat")
 
@@ -197,7 +197,16 @@ class Watcher:
         sleep: Callable[[float], None] = time.sleep,
     ):
         self.repo, self.client, self.state = repo, client, state
-        self.trusted, self.merge, self.sleep = trusted, merge, sleep
+        # Preserve direct callers that pass the old boolean merge=True/False.
+        # The CLI now supplies None (notify only), 1 (+1), or 2 (+2).
+        if merge is True:
+            merge = 2
+        elif merge is False:
+            merge = None
+        if merge not in (None, 1, 2):
+            raise BadCatError("merge must be 1, 2, or disabled")
+        self.trusted, self.merge_level, self.sleep = trusted, merge, sleep
+        self.merge = merge is not None
         self.errors = 0
         self.last_error: Optional[str] = None
         self.rejected: dict = {}  # PR number -> state at the last merge rejection
@@ -244,15 +253,20 @@ class Watcher:
     def _verdict(self, number: int, head: str) -> Verdict:
         return evaluate(self.client.reviews(number), head, self.trusted)
 
+    def _review_ready(self, stage: str) -> bool:
+        # Notify-only keeps the historical +2 readiness notification.
+        # --merge=1 may use a valid +1, without relaxing protocol blockers.
+        return stage == READY or (self.merge_level == 1 and stage == PLUS1)
+
     def _process(self, pr: OpenPR) -> None:
         reviews = self.client.reviews(pr.number)
         verdict = evaluate(reviews, pr.head, self.trusted)
         gate = None
-        if verdict.stage == READY:
+        if self._review_ready(verdict.stage):
             raw = self.client.pr(pr.number)
             gate = merge_gate(self.client, raw, pr.head)
         self._report(pr, reviews, verdict, gate)
-        if verdict.stage == READY and gate is None and self.merge:
+        if self._review_ready(verdict.stage) and gate is None and self.merge:
             self._merge(pr)
 
     def _report(self, pr: OpenPR, reviews: list, verdict: Verdict, gate: Optional[str]) -> None:
@@ -274,7 +288,7 @@ class Watcher:
         if note and (prev is None or prev.get("note") != note):
             log.info("PR #%d: %s", pr.number, note)
         entry = {"head": pr.head, "reviews": [r.id for r in submitted], "note": note, "gate": None}
-        if verdict.stage == READY:
+        if self._review_ready(verdict.stage):
             entry["gate"] = "ok" if gate is None else gate
             if prev is None or prev.get("head") != pr.head or prev.get("gate") != entry["gate"]:
                 if gate is None:
@@ -286,7 +300,7 @@ class Watcher:
 
     def _merge(self, pr: OpenPR) -> None:
         # Re-read everything from GitHub immediately before the only write.
-        if self._verdict(pr.number, pr.head).stage != READY:
+        if not self._review_ready(self._verdict(pr.number, pr.head).stage):
             log.info("PR #%d: review state changed, not merging", pr.number)
             return
         raw = self.client.pr(pr.number)
@@ -333,8 +347,9 @@ def main(argv: Optional[list] = None) -> int:
         description="Watch GitHub PR review results; with --merge, squash-merge eligible PRs.",
         epilog=(
             "Default is notify only: BadCat never writes to GitHub without --merge.\n"
-            "A PR is eligible when the current HEAD has a valid +1 followed by a valid +2 from a\n"
-            "trusted reviewer, no -1, passing CI and a clean GitHub mergeability state.\n"
+            "With --merge (equivalent to --merge=2), require a valid +1 followed by +2.\n"
+            "With --merge=1, require a valid +1; both modes still require no -1,\n"
+            "passing CI and a clean GitHub mergeability state.\n"
             "Trusted reviewers: --trusted-reviewer LOGIN (repeatable), default the `gh` user.\n"
             "CI is discovered automatically: every check run, workflow run and commit status on the\n"
             "HEAD must pass, and at least one GitHub Actions check must have succeeded (skipped\n"
@@ -345,8 +360,9 @@ def main(argv: Optional[list] = None) -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("repo", metavar="owner/repo|.")
-    parser.add_argument("--merge", action="store_true",
-                        help="squash-merge PRs that pass every gate (default: notify only)")
+    parser.add_argument("--merge", nargs="?", const=2, default=None, type=int,
+                        choices=(1, 2), metavar="{1,2}",
+                        help="squash-merge after +1 or +2 (bare --merge defaults to 2; omitted: notify only)")
     parser.add_argument("--trusted-reviewer", action="append", default=[], metavar="LOGIN",
                         help="GitHub login whose review markers count (repeatable)")
     parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {__version__}")
@@ -370,7 +386,8 @@ def main(argv: Optional[list] = None) -> int:
                 except (GhError, KeyError) as exc:
                     raise BadCatError(f"cannot determine the authenticated gh user: {exc}") from exc
             log.info("Watching %s (%s; trusted reviewers: %s)", repo,
-                     "merge enabled" if args.merge else "notify only", ", ".join(sorted(trusted)))
+                     f"merge enabled (+{args.merge})" if args.merge is not None else "notify only",
+                     ", ".join(sorted(trusted)))
             Watcher(repo, client, NotifyState(state_path(repo)), trusted,
                     args.merge).run_forever()
     except MissCatError as exc:
