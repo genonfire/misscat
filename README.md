@@ -375,12 +375,18 @@ With `--cat` above 1, log lines carry the cat name (`cat-1`, ...). Each cat runs
 ```bash
 misscat owner/repo luna     # AI review (unchanged)
 badcat owner/repo           # DEFAULT: monitor and report only; NO GitHub writes
-badcat owner/repo --merge   # monitor, report, and squash-merge eligible PRs
-badcat . --merge            # same, for the current repository's origin
+badcat owner/repo --merge   # merge after valid +1 then +2 (same as --merge=2)
+badcat . --merge=1          # merge after valid +1 (without requiring +2)
+badcat . --merge=2          # explicitly require +1 then +2
 badcat . --merge --trusted-reviewer luna
 ```
 
 - `.` resolves to the current repository's `origin` exactly as in MissCat.
+- Omitting `--merge` always means **notify only**, with no GitHub writes.
+  A bare `--merge` is an alias for `--merge=2` (existing behavior);
+  `--merge=1` authorizes an eligible PR at a valid `+1`.
+  Only `1` and `2` are accepted. This changes the review threshold,
+  **not** the required CI/mergeability checks or final HEAD protection.
 - All **open** PRs are watched, Draft or Ready alike. BadCat never reads, changes or decides from Draft status; if GitHub rejects a merge of a Draft PR, the rejection is reported and BadCat keeps watching.
 - No AI calls, no checkout, no clone. It uses your existing `gh` login (`gh auth login`); no tokens are stored. `--merge` needs a `gh` account with permission to merge.
 - Output reports transitions only, not repeated snapshots: new PR, new HEAD, each newly submitted review, CI/merge waits and readiness, merged or closed, and API errors. Each new review is announced as one line carrying its **literal first line**, whatever it says (`PR #290: +1`, `PR #292: ## 1차 리뷰 — 변경 요청`); no `INVALID` label or explanation is added to a nonconforming review. What is printed is separate from the strict validation below. When BadCat sees a PR for the first time it records the existing reviews silently and announces only later ones. Polling is every 60 seconds, backing off to 5 minutes on errors.
@@ -407,15 +413,15 @@ HEAD: <40 lowercase hex characters>
 
 The first line is exactly `+1`, `+2` or `-1`: no leading blank or whitespace, decoration or explanation (`-1 : FAIL (blocker found)` is printed as-is but never authorizes). The second line is `HEAD: <sha>` immediately after. Evidence must follow. The header SHA, the review's `commit_id` and the PR's current HEAD must all match, so reviews of an old HEAD never carry forward.
 
-For the current HEAD a valid `+1` followed later by a valid `+2` makes the PR eligible, provided no later trusted review on that HEAD is something else: a `CHANGES_REQUESTED` or a plain/headerless `COMMENTED` review after the first `+1` holds the PR (its first line is still printed as usual) until a new HEAD is reviewed. `APPROVED` and `DISMISSED` reviews neither pass nor hold. A `-1` anywhere on the HEAD blocks it, a malformed or contradictory marker review on the HEAD also prevents merging, and `+2` alone never authorizes. Reviews that are not `COMMENTED` (for example `CHANGES_REQUESTED` or `APPROVED`) never count. A new commit requires fresh reviews.
+With `--merge` or `--merge=2`, for the current HEAD a valid `+1` followed later by a valid `+2` makes the PR eligible. With `--merge=1`, a valid `+1` is sufficient (and a later valid `+2` remains eligible), provided no later trusted review on that HEAD is something else: a `CHANGES_REQUESTED` or a plain/headerless `COMMENTED` review after the first `+1` holds the PR (its first line is still printed as usual) until a new HEAD is reviewed. `APPROVED` and `DISMISSED` reviews neither pass nor hold. A `-1` anywhere on the HEAD blocks it, a malformed or contradictory marker review on the HEAD also prevents merging, and `+2` alone never authorizes in either mode. Reviews that are not `COMMENTED` (for example `CHANGES_REQUESTED` or `APPROVED`) never count. A new commit requires fresh reviews.
 
 ### Trust
 
 Only reviews by trusted logins count (fail closed). Use `--trusted-reviewer LOGIN` (repeatable); the default is the authenticated `gh` user. Stage 1 and Stage 2 may share one account.
 
-### Merge gate (`--merge` only)
+### Merge gate (`--merge`, `--merge=1` or `--merge=2` only)
 
-Immediately before the only write, BadCat re-reads the PR HEAD and all reviews and re-evaluates everything, then requires:
+Immediately before the only write, BadCat re-reads the PR HEAD and all reviews, re-evaluates the chosen `+1`/`+2` threshold and blocks any new `-1` or malformed review, then requires:
 
 - CI, discovered automatically from GitHub for the exact HEAD, with no check name to configure: every reported check run, workflow run and commit status must be complete and passing (pending, failed, cancelled, timed out, action-required, stale or unreadable CI fails closed), and at least one check run created by **GitHub Actions** must have *succeeded*. Check names are repository-defined and never matched (`Validate and test Typewriter`, `unittest (3.12)`...). Skipped runs, other apps' checks and plain commit statuses are not evidence that tests ran, so a HEAD with no CI, only skipped CI, or only an unrelated green check is never merged. A successful workflow that deliberately skips work (for example a documentation-only change) counts as normal success. CI is re-read immediately before the merge, and a re-run on the same HEAD is picked up on the next poll.
   - *Limitation:* the API cannot tell which checks a repository *requires*, so BadCat cannot notice a required check that never started if other Actions checks passed. Enable branch protection or rulesets for required checks: GitHub then reports the PR as not mergeable (`mergeable_state` other than clean) and rejects the merge, both of which BadCat honors,
