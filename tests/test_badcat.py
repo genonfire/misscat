@@ -198,6 +198,76 @@ class WatcherTests(unittest.TestCase):
         self.assertTrue(any("merged (squash" in m for m in out))
         self.assertEqual(w.state.prs, {})
 
+    def test_merge_level_one_accepts_plus_one_and_plus_two(self):
+        for reviews in (
+            seq(rev("+1", A)),
+            seq(rev("+1", A), rev("+2", A)),
+        ):
+            with self.subTest(reviews=len(reviews)):
+                c = FakeClient(reviews=reviews)
+                _, out = self.run_cycle(self.watcher(c, merge=1))
+                self.assertEqual(c.calls, [("merge", 7, A)])
+                self.assertTrue(any("merged (squash" in message for message in out))
+
+    def test_merge_level_two_and_bare_legacy_boolean_still_wait_for_plus_two(self):
+        for merge in (2, True):
+            with self.subTest(merge=merge):
+                c = FakeClient(reviews=seq(rev("+1", A)))
+                w = self.watcher(c, merge=merge)
+                self.run_cycle(w)
+                self.assertEqual(c.calls, [])
+                self.assertFalse(any(entry.get("gate") == "ok" for entry in w.state.prs.values()))
+                c.review_list = seq(rev("+1", A), rev("+2", A))
+                self.run_cycle(w)
+                self.assertEqual(c.calls, [("merge", 7, A)])
+
+    def test_merge_level_one_preserves_blockers_and_all_external_gates(self):
+        invalid = [
+            seq(rev("+2", A)),
+            seq(rev("+1", A), rev("-1", A)),
+            seq(rev("+1", A), rev(None, A, text="-1 : FAIL\\nHEAD: %s\\n\\nx" % A)),
+            seq(rev("+1", A), rev(None, A, text="unresolved review")),
+            seq(rev("+1", B)),
+            seq(rev("+1", A, login="untrusted")),
+            seq(rev("+1", A, commit=B)),
+            seq(rev("+1", A, state="APPROVED")),
+        ]
+        for reviews in invalid:
+            with self.subTest(review=[r.body.splitlines()[0] for r in reviews]):
+                c = FakeClient(reviews=reviews)
+                self.run_cycle(self.watcher(c, merge=1))
+                self.assertEqual(c.calls, [])
+        for configure in (
+            lambda c: c.runs.clear(),
+            lambda c: c.runs.__setitem__(0, run("CI", conclusion="failure")),
+            lambda c: c.raw.update(mergeable=False, mergeable_state="dirty"),
+            lambda c: c.raw.update(mergeable=None),
+        ):
+            with self.subTest(configure=configure):
+                c = FakeClient(reviews=seq(rev("+1", A)))
+                configure(c)
+                self.run_cycle(self.watcher(c, merge=1))
+                self.assertEqual(c.calls, [])
+
+    def test_merge_level_one_rereads_reviews_and_ci_before_the_write(self):
+        c = FakeClient(reviews=seq(rev("+1", A)))
+        first = list(c.review_list)
+        calls = 0
+        def reviews(number):
+            nonlocal calls
+            calls += 1
+            return first if calls == 1 else seq(rev("+1", A), rev("-1", A))
+        c.reviews = reviews
+        self.run_cycle(self.watcher(c, merge=1))
+        self.assertGreaterEqual(calls, 2)
+        self.assertEqual(c.calls, [], "a fresh blocker on the same HEAD prevents a merge")
+
+        c = FakeClient(reviews=seq(rev("+1", A)))
+        ci_calls = iter([[run("CI")], [run("CI", conclusion="failure")]])
+        c.check_runs = lambda head: next(ci_calls)
+        self.run_cycle(self.watcher(c, merge=1))
+        self.assertEqual(c.calls, [], "CI is rechecked after the review gate")
+
     def test_draft_and_non_draft_same_path_and_rejection_reported_once(self):
         for draft in (False, True):
             with self.subTest(draft=draft):
@@ -541,9 +611,20 @@ class LockAndIdentityTests(unittest.TestCase):
              mock.patch.object(cli.shutil, "which", return_value="/usr/bin/gh"), \
              mock.patch.object(cli.GhClient, "viewer", return_value="Luna"):
             self.assertEqual(cli.main(["o/r"]), 0)
-            self.assertEqual(seen, {"trusted": frozenset({"luna"}), "merge": False})
+            self.assertEqual(seen, {"trusted": frozenset({"luna"}), "merge": None})
             self.assertEqual(cli.main(["o/r", "--merge", "--trusted-reviewer", "A"]), 0)
-            self.assertEqual(seen, {"trusted": frozenset({"a"}), "merge": True})
+            self.assertEqual(seen, {"trusted": frozenset({"a"}), "merge": 2})
+            self.assertEqual(cli.main(["o/r", "--merge=1"]), 0)
+            self.assertEqual(seen, {"trusted": frozenset({"luna"}), "merge": 1})
+            self.assertEqual(cli.main(["o/r", "--merge=2"]), 0)
+            self.assertEqual(seen, {"trusted": frozenset({"luna"}), "merge": 2})
+
+    def test_merge_level_rejects_invalid_values(self):
+        for value in ("--merge=0", "--merge=3", "--merge=foo"):
+            with self.subTest(value=value):
+                with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as cm:
+                    cli.main(["o/r", value])
+                self.assertEqual(cm.exception.code, 2)
 
 
 class GhClientTests(unittest.TestCase):
