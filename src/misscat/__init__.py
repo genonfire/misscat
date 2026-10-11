@@ -1452,8 +1452,13 @@ class Watcher:
                 continue
             try:
                 reviews = self.discussion.reviews(run.pr)
+                head = self.discussion.head(run.pr) if run.comment_ids else run.head
             except GhError as exc:
                 log.warning("PR #%d: review outcome still unknown: %s", run.pr, exc)
+                continue
+            if head != run.head:
+                log.warning("PR #%d: HEAD moved during the re-review; dropping stale attempt", run.pr)
+                self.state.drop_pending(run.run_id)
                 continue
             if run.comment_ids:
                 review_id = self._reply_review(run, reviews)
@@ -1487,6 +1492,10 @@ class Watcher:
                 self.state.update_pending(run)  # remember that the CLI itself finished cleanly
             return False
         if pr.reply is not None:
+            if head != pr.head:
+                self.state.drop_pending(pr.run_id)
+                log.warning("PR #%d: HEAD moved to %s during the re-review", pr.number, head[:7])
+                return False
             review_id = self._reply_review(run, reviews)
             if review_id is None:
                 self.state.drop_pending(pr.run_id)
@@ -1494,8 +1503,6 @@ class Watcher:
                           pr.number, pr.head[:7])
                 return False
             self._record_reply(run, review_id)  # even if the CLI failed after submitting
-            if head != pr.head:
-                log.warning("PR #%d: HEAD moved to %s during the re-review", pr.number, head[:7])
             return True
         found = carrying_run(reviews, pr.head, pr.run_id)
         self.state.drop_pending(pr.run_id)

@@ -280,7 +280,7 @@ class RecoveryTests(ReplyBase):
         d.comment_list = [comment(30, 3)]
         w2 = self.watcher(d, [m.PR(9, HEAD, False, "u", "t", author=AUTHOR, updated_at="n2")])
         w2.cycle()
-        self.assertEqual([c[2].reply.comment_ids for c in self.calls], [(30,)])
+        self.assertEqual([pr.reply.comment_ids for pr in self.calls], [(30,)])
 
     def test_unreachable_github_keeps_head_from_being_rerun(self):
         d = FakeDiscussion()
@@ -340,6 +340,23 @@ class RecoveryTests(ReplyBase):
         self.watcher(d).cycle()
         self.assertEqual({k.comment_id for k in reloaded.handled()}, {10})
         self.assertEqual(reloaded.pending(), [])
+
+    def test_restarted_reply_with_changed_head_is_not_completed(self):
+        d = self.blocked()
+        w = self.submitted_then(d, api_down=True)
+        with self.assertLogs("misscat", "ERROR"):
+            w.cycle()
+        d.fail = False
+        d.head_sha = "f" * 40
+        self.state = m.State(m.state_path(REPO))
+        new_pr = dataclasses.replace(self.pr, head=d.head_sha)
+        w = self.watcher(d, [new_pr])
+        with self.assertLogs("misscat", "WARNING"):
+            w.cycle()
+        self.assertEqual(self.state.handled(), set())
+        self.assertEqual(self.state.review_ids(self.key), {1})
+        self.assertEqual(self.calls[0].head, d.head_sha)
+        self.assertIsNone(self.calls[0].reply)
 
     def test_truly_unsubmitted_reply_is_dropped_and_retried(self):
         d = self.blocked()
@@ -432,7 +449,7 @@ class VerificationTests(ReplyBase):
         d.head_sha = "f" * 40
 
         def race(s, r, pr, ws):
-            d.review_list.append(review(3, 9))
+            d.review_list.append(review(3, 9, run=pr.run_id))
             return True
         w.reviewer = race
         with self.assertLogs("misscat", "WARNING"):
