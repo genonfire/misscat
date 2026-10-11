@@ -3,6 +3,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto').webcrypto;
 const vm = require('node:vm');
 
 const HEAD1 = 'a'.repeat(40);
@@ -14,6 +15,7 @@ function boot({ tabUrl = GOOD_URL, handoff = async () => ({ ok: true }), seed = 
   const store = { ...seed };
   const tabs = { 7: { id: 7, url: tabUrl } };
   const sent = [];
+  const controls = [];
   const listeners = {};
   const natives = [];
   const hook = (name) => ({ addListener: (fn) => { listeners[name] = fn; } });
@@ -39,13 +41,17 @@ function boot({ tabUrl = GOOD_URL, handoff = async () => ({ ok: true }), seed = 
         async get(key) { return key in store ? { [key]: store[key] } : {}; },
         async set(obj) { Object.assign(store, JSON.parse(JSON.stringify(obj))); },
       },
+      local: {
+        async get(key) { return key in store ? { [key]: store[key] } : {}; },
+        async set(obj) { Object.assign(store, JSON.parse(JSON.stringify(obj))); },
+      },
     },
     tabs: {
       onRemoved: hook('tabs.onRemoved'),
       onUpdated: hook('tabs.onUpdated'),
       async get(id) { if (!tabs[id]) throw new Error('No tab'); return tabs[id]; },
       async sendMessage(id, message) {
-        if (message.type === 'badcat:ping') return { ok: true };
+        if (message.type !== 'badcat:handoff') { controls.push(message); return { ok: true }; }
         sent.push({ id, message });
         return handoff(message);
       },
@@ -53,7 +59,7 @@ function boot({ tabUrl = GOOD_URL, handoff = async () => ({ ok: true }), seed = 
   };
   const shared = require('../shared.js');
   const context = {
-    chrome, console: { warn() {}, error() {}, log() {} }, setTimeout: fakeTimers ? (fn, ms) => { timers.push({ fn, ms }); } : setTimeout, URL,
+    chrome, crypto, console: { warn() {}, error() {}, log() {} }, setTimeout: fakeTimers ? (fn, ms) => { timers.push({ fn, ms }); } : setTimeout, URL,
     importScripts() {}, self: { BadCatShared: shared },
   };
   context.self.chrome = chrome;
@@ -66,10 +72,10 @@ function boot({ tabUrl = GOOD_URL, handoff = async () => ({ ok: true }), seed = 
   });
   const session = () => store['badcat.session'];
   const settle = () => new Promise((r) => setImmediate(r));
-  return { popup, session, store, tabs, sent, listeners, natives, settle, timers };
+  return { popup, session, store, tabs, sent, controls, listeners, natives, settle, timers };
 }
 
-const plus1 = (pr, head, extra = {}) => ({ repo: 'o/r', pr, head, status: '+1', ...extra });
+const plus1 = (pr, head, extra = {}) => ({ repo: 'o/r', pr, head, status: '+1', review_id: 100, delivery_id: 'c'.repeat(32), ...extra });
 
 async function started(opts) {
   const t = boot(opts);
@@ -108,7 +114,10 @@ test('a valid +1 sends exactly one handoff with only the PR number', async () =>
   const t = await started();
   t.natives[0].emit(plus1(123, HEAD1));
   await t.settle();
-  assert.equal(JSON.stringify(t.sent), JSON.stringify([{ id: 7, message: { type: 'badcat:handoff', pr: 123 } }]));
+  assert.equal(t.sent.length, 1);
+  assert.equal(t.sent[0].message.pr, 123);
+  assert.equal(t.natives[0].posted[1].type, 'ack');
+  assert.equal(t.natives[0].posted[1].review_id, 100);
 });
 
 test('a duplicate event for the same repo/PR/HEAD is not sent twice; a new HEAD is', async () => {
@@ -236,7 +245,7 @@ test('a waiting retry is invalidated by OFF then ON on the same tab and repo', a
   assert.equal(t.sent.length, 1);
   assert.equal(t.timers.length, 0);
   assert.equal(t.session().active, true);
-  assert.equal(t.store['badcat.delivered'], undefined);
+  assert.equal(t.store['badcat.delivered.v2'], undefined);
 });
 
 test('after OFF/ON a new +1 is not held up by the old connection retry queue', async () => {
@@ -249,7 +258,7 @@ test('after OFF/ON a new +1 is not held up by the old connection retry queue', a
   assert.equal(JSON.stringify(t.sent.map((s) => s.message.pr)), JSON.stringify([5, 6]));
   await wake(t);
   assert.equal(t.sent.length, 2);
-  assert.equal(JSON.stringify(t.store['badcat.delivered']), JSON.stringify(['o/r#6@' + HEAD2]));
+  assert.equal(JSON.stringify(t.store['badcat.delivered.v2']), JSON.stringify(['o/r#6@' + HEAD2 + ':100']));
 });
 
 test('a handoff that fails within a live connection gives up, and a later +1 still works', async () => {
@@ -263,4 +272,106 @@ test('a handoff that fails within a live connection gives up, and a later +1 sti
   await t.settle();
   assert.equal(t.sent.filter((s) => s.message.pr === 6).length, 1);
   assert.equal(t.session().active, true);
+});
+
+test('new review IDs on one HEAD submit twice, duplicates only re-ack', async () => {
+  const t = await started();
+  const p = t.natives[0];
+  for (const rid of [100, 100, 200, 200]) p.emit(plus1(123, HEAD1, { review_id: rid }));
+  await t.settle();
+  assert.equal(t.sent.length, 2);
+  assert.deepEqual(p.posted.filter(m => m.type === 'ack').map(m => m.review_id), [100, 100, 200, 200]);
+});
+
+test('durable deliveries survive browser restart; a lost ack is re-sent', async () => {
+  const t = await started();
+  const p = t.natives[0];
+  const original = p.postMessage;
+  p.postMessage = () => { throw Error('lost connection'); };
+  p.emit(plus1(123, HEAD1));
+  await t.settle();
+  assert.equal(t.store['badcat.delivered.v2'].length, 1);
+  p.postMessage = original;
+  const restarted = await started({ seed: { 'badcat.delivered.v2': t.store['badcat.delivered.v2'] } });
+  restarted.natives[0].emit(plus1(123, HEAD1, { delivery_id: 'd'.repeat(32) }));
+  await restarted.settle();
+  assert.equal(restarted.sent.length, 0);
+  assert.equal(restarted.natives[0].posted[1].delivery_id, 'd'.repeat(32));
+});
+
+test('stop during in-flight submission never acknowledges into the next connection', async () => {
+  let finish;
+  const t = await started({ handoff: () => new Promise(resolve => { finish = resolve; }) });
+  const old = t.natives[0];
+  old.emit(plus1(123, HEAD1));
+  await t.settle();
+  await OFF_ON(t);
+  finish({ ok: true });
+  await t.settle();
+  assert.equal(old.posted.filter(m => m.type === 'ack').length, 0);
+  t.natives[1].emit(plus1(123, HEAD1));
+  await t.settle();
+  assert.equal(t.sent.length, 1);
+  assert.equal(t.natives[1].posted[1].type, 'ack');
+});
+
+test('legacy HEAD keys are baselined once and future review IDs still submit', async () => {
+  const t = await started({ seed: { 'badcat.delivered': ['o/r#123@' + HEAD1] } });
+  t.natives[0].emit(plus1(123, HEAD1));
+  await t.settle();
+  assert.equal(t.sent.length, 0);
+  t.natives[0].emit(plus1(123, HEAD1, { review_id: 200 }));
+  await t.settle();
+  assert.equal(t.sent.length, 1);
+  assert.equal(t.natives[0].posted.filter(m => m.type === 'ack').length, 2);
+});
+
+test('two distinct in-flight events are submitted in order and acknowledged after saving', async () => {
+  let finish;
+  const t = await started({ handoff: m => m.pr === 1 ? new Promise(resolve => { finish = resolve; }) : Promise.resolve({ ok: true }) });
+  t.natives[0].emit(plus1(1, HEAD1));
+  t.natives[0].emit(plus1(1, HEAD1));
+  t.natives[0].emit(plus1(2, HEAD1, { review_id: 200 }));
+  await t.settle();
+  assert.equal(t.sent.length, 1);
+  assert.equal(t.natives[0].posted.length, 1);
+  finish({ ok: true });
+  await t.settle();
+  assert.deepEqual(t.sent.map(s => s.message.pr), [1, 2]);
+  assert.equal(t.store['badcat.delivered.v2'].length, 2);
+});
+
+test('failed content submission has bounded retries and no acknowledgement', async () => {
+  const t = await started({ fakeTimers: true, handoff: async () => ({ ok: false }) });
+  t.natives[0].emit(plus1(123, HEAD1));
+  await t.settle();
+  for (let i = 0; i < 5; i++) await wake(t);
+  assert.equal(t.sent.length, 3);
+  assert.equal(t.natives[0].posted.filter(m => m.type === 'ack').length, 0);
+  assert.match(t.session().error, /Handoff failed/);
+  assert.equal(t.store['badcat.delivered.v2'], undefined);
+});
+
+test('host disconnect cancels the original content session', async () => {
+  const t = await started();
+  const p = t.natives[0];
+  p.drop();
+  await t.settle();
+  p.emit(plus1(1, HEAD1));
+  await t.settle();
+  assert.equal(t.session().active, false);
+  assert.equal(t.sent.length, 0);
+  assert.equal(p.posted.filter(m => m.type === 'ack').length, 0);
+  const activate = t.controls.find(m => m.type === 'badcat:activate');
+  const cancel = t.controls.find(m => m.type === 'badcat:cancel');
+  assert.equal(cancel.session, activate.session);
+});
+
+test('host migration baseline does not suppress a fresh same-HEAD review in the old extension state', async () => {
+  const t = await started({ seed: { 'badcat.delivered': ['o/r#123@' + HEAD1] } });
+  t.natives[0].emit(plus1(123, HEAD1, { review_id: 200, legacy_review_id: 100 }));
+  await t.settle();
+  assert.equal(t.sent.length, 1);
+  assert.equal(t.natives[0].posted[1].review_id, 200);
+  assert.equal(t.store['badcat.delivered'].length, 0);
 });

@@ -6,7 +6,7 @@
   const HOST_NAME = 'com.genonfire.badcat_host';
   const OWNER_RE = /^[A-Za-z0-9-]+$/;
   const NAME_RE = /^[A-Za-z0-9_.-]+$/;
-  const HEAD_RE = /^[0-9a-f]{40}$/i;
+  const HEAD_RE = /^[0-9a-f]{40}$/;
   // A ChatGPT conversation: /c/<id>, also under a project or GPT prefix (/g/<slug>/c/<id>).
   const CONVERSATION_PATH_RE = /\/c\/[A-Za-z0-9-]+\/?$/;
 
@@ -17,7 +17,7 @@
     if (repo.length > 200 || repo.split('/').length !== 2) return null;
     const [owner, name] = repo.split('/');
     if (owner.startsWith('-') || name === '.' || name === '..') return null;
-    if (!OWNER_RE.test(owner) || !NAME_RE.test(name)) return null;
+    if ((owner.match(OWNER_RE) || [])[0] !== owner || (name.match(NAME_RE) || [])[0] !== name) return null;
     return repo;
   }
 
@@ -38,15 +38,23 @@
     if (message === null || typeof message !== 'object' || Array.isArray(message)) return null;
     if (message.status !== '+1') return null;
     const repo = normalizeRepo(message.repo);
-    if (repo === null || repo.toLowerCase() !== String(watchedRepo).toLowerCase()) return null;
+    if (repo === null || repo !== message.repo || repo.toLowerCase() !== String(watchedRepo).toLowerCase()) return null;
     const pr = message.pr;
     if (typeof pr !== 'number' || !Number.isSafeInteger(pr) || pr < 1) return null;
-    if (typeof message.head !== 'string' || !HEAD_RE.test(message.head)) return null;
-    return { repo: repo, pr: pr, head: message.head.toLowerCase() };
+    if (typeof message.head !== 'string' || message.head.length !== 40 || !HEAD_RE.test(message.head)) return null;
+    if (!Number.isSafeInteger(message.review_id) || message.review_id < 1) return null;
+    if (typeof message.delivery_id !== 'string' || message.delivery_id.length !== 32 || !/^[0-9a-f]{32}$/.test(message.delivery_id)) return null;
+    const event = { repo: repo.toLowerCase(), pr: pr, head: message.head,
+      review_id: message.review_id, delivery_id: message.delivery_id };
+    if (message.legacy_review_id !== undefined) {
+      if (!Number.isSafeInteger(message.legacy_review_id) || message.legacy_review_id < 0) return null;
+      event.legacy_review_id = message.legacy_review_id;
+    }
+    return event;
   }
 
   function eventKey(event) {
-    return event.repo.toLowerCase() + '#' + event.pr + '@' + event.head;
+    return event.repo.toLowerCase() + '#' + event.pr + '@' + event.head + ':' + event.review_id;
   }
 
   // The fixed handoff text, built only from a validated integer.

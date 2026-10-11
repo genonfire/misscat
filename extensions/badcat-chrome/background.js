@@ -5,10 +5,14 @@ importScripts('shared.js');
 const { HOST_NAME, normalizeRepo, isConversationUrl, parseEvent, eventKey } = self.BadCatShared;
 
 const SESSION_KEY = 'badcat.session'; // {active, repo, tabId, error}
-const DELIVERED_KEY = 'badcat.delivered'; // keys of handoffs already submitted
+const DELIVERED_KEY = 'badcat.delivered.v2';
+const LEGACY_KEY = 'badcat.delivered';
+const BASELINES_KEY = 'badcat.delivery-baselines'; // keys of handoffs already submitted
 const MAX_DELIVERED = 500;
 const RETRY_DELAYS_MS = [0, 5000, 15000]; // e.g. ChatGPT still answering when the +1 arrives
 
+let storageQueue = Promise.resolve();
+let controlQueue = Promise.resolve();
 let port = null; // the live badcat-host connection, if any
 let queue = Promise.resolve(); // events of the live connection are handled one at a time; reset per connection
 
@@ -34,7 +38,11 @@ const ready = (async () => {
 
 async function deactivate(error) {
   const current = port;
-  port = null;
+  port = null; // invalidate before the first asynchronous operation
+  const session = await getSession();
+  if (current && session.tabId !== null) {
+    chrome.tabs.sendMessage(session.tabId, { type: 'badcat:cancel', session: current.sessionId }).catch(() => {});
+  }
   if (current) {
     try {
       current.disconnect(); // the host sees EOF and exits cleanly
@@ -72,12 +80,22 @@ async function start(repoInput, tabId) {
   } catch (e) {
     return { ok: false, error: 'Cannot reach badcat-host.' };
   }
+  connection.sessionId = crypto.randomUUID();
   port = connection;
-  queue = Promise.resolve(); // pending work of a previous connection must not delay this one
+  queue = Promise.resolve();
   connection.onMessage.addListener((message) => onHostMessage(connection, message));
   connection.onDisconnect.addListener(() => onHostDisconnect(connection));
   await setSession({ active: true, repo: repo, tabId: tabId, error: null });
-  connection.postMessage({ type: 'start', repo: repo });
+  if (connection !== port) return { ok: false, error: 'badcat-host disconnected.' };
+  try {
+    const activated = await chrome.tabs.sendMessage(tabId, { type: 'badcat:activate', session: connection.sessionId });
+    if (!activated || activated.ok !== true) throw new Error('activation failed');
+    if (connection !== port) return { ok: false, error: 'badcat-host disconnected.' };
+    connection.postMessage({ type: 'start', repo: repo });
+  } catch (e) {
+    if (connection === port) await deactivate('Cannot start the ChatGPT handoff session.');
+    return { ok: false, error: 'Cannot start the ChatGPT handoff session.' };
+  }
   return { ok: true };
 }
 
@@ -94,25 +112,71 @@ async function stop(tabId) {
 function onHostDisconnect(connection) {
   if (connection !== port) return; // a connection we already closed
   const reason = chrome.runtime.lastError && chrome.runtime.lastError.message;
-  port = null;
   console.warn('badcat-host disconnected', reason || '');
   deactivate(reason ? 'badcat-host: ' + reason.slice(0, 200) : 'badcat-host disconnected.');
 }
 
 function onHostMessage(connection, message) {
   if (connection !== port) return;
+  if (message && typeof message.warning === 'string') {
+    reportError(connection, message.warning);
+    return;
+  }
   if (message && typeof message === 'object' && typeof message.error === 'string') {
     // The host rejected the request or stopped monitoring: nothing more will arrive.
     console.warn('badcat-host error:', message.error);
     deactivate('badcat-host: ' + message.error.slice(0, 200)); // not queued: retries may be sleeping
     return;
   }
-  queue = queue.then(() => handleEvent(connection, message)).catch((e) => console.error('handoff failed', e));
+  queue = queue.then(() => handleEvent(connection, message)).catch(async (e) => {
+    console.error('handoff failed', e);
+    await reportError(connection, 'Handoff failed; delivery remains retryable.');
+  });
 }
 
 async function delivered() {
-  const stored = await chrome.storage.session.get(DELIVERED_KEY);
+  const stored = await chrome.storage.local.get(DELIVERED_KEY);
   return stored[DELIVERED_KEY] || [];
+}
+
+async function reportError(connection, error) {
+  const session = await getSession();
+  if (connection === port && session.active) {
+    await setSession({ ...session, error: String(error || 'Handoff failed').slice(0, 200) });
+  }
+}
+
+async function clearError(connection) {
+  const session = await getSession();
+  if (connection === port && session.active && session.error) {
+    await setSession({ ...session, error: null });
+  }
+}
+
+function acknowledge(connection, event) {
+  if (connection !== port) return;
+  try {
+    connection.postMessage({ type: 'ack', repo: event.repo, pr: event.pr, head: event.head,
+      review_id: event.review_id, delivery_id: event.delivery_id });
+  } catch (e) {
+    reportError(connection, 'Acknowledgement failed; the host may retry.');
+  }
+}
+
+async function legacyDelivered(event) {
+  // Resolve each old HEAD key once. Future review IDs on that HEAD remain eligible.
+  const old = await chrome.storage.session.get(LEGACY_KEY);
+  const legacyKey = event.repo.toLowerCase() + '#' + event.pr + '@' + event.head;
+  const saved = await chrome.storage.local.get(BASELINES_KEY);
+  const baselines = saved[BASELINES_KEY] || {};
+  if (!(legacyKey in baselines) && (old[LEGACY_KEY] || []).includes(legacyKey)) {
+    baselines[legacyKey] = event.legacy_review_id === undefined ? event.review_id : event.legacy_review_id;
+    await chrome.storage.local.set({ [BASELINES_KEY]: Object.fromEntries(Object.entries(baselines).slice(-MAX_DELIVERED)) });
+  }
+  if (legacyKey in baselines && (old[LEGACY_KEY] || []).includes(legacyKey)) {
+    await chrome.storage.session.set({ [LEGACY_KEY]: old[LEGACY_KEY].filter(k => k !== legacyKey) });
+  }
+  return event.review_id === baselines[legacyKey];
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -134,7 +198,12 @@ async function handleEvent(connection, message) {
     if (connection !== port || !current.active || current.repo !== session.repo || current.tabId !== session.tabId) return;
     const sent = await delivered();
     if (connection !== port) return;
-    if (sent.includes(key)) return; // idempotent: same repo + PR + HEAD is handed off once
+    if (sent.includes(key) || await legacyDelivered(event)) {
+      await clearError(connection);
+      acknowledge(connection, event); // replay after a lost ack: never submit twice
+      return;
+    }
+    if (connection !== port) return;
 
     let tab;
     try {
@@ -152,13 +221,21 @@ async function handleEvent(connection, message) {
     try {
       const result = await chrome.tabs.sendMessage(current.tabId, {
         type: 'badcat:handoff',
-        pr: event.pr,
+        pr: event.pr, event: event, session: connection.sessionId,
       });
-      if (connection !== port) return; // do not record into a newer session
       if (result && result.ok === true) {
-        await chrome.storage.session.set({
-          [DELIVERED_KEY]: sent.concat(key).slice(-MAX_DELIVERED),
+        // Save even if Stop raced with the response: the submission really happened.
+        // ACK is still restricted to the original live connection.
+        const save = storageQueue.then(async () => {
+          const latest = await delivered();
+          await chrome.storage.local.set({
+            [DELIVERED_KEY]: [...new Set(latest.concat(key))].slice(-MAX_DELIVERED),
+          });
         });
+        storageQueue = save.catch(() => {});
+        await save;
+        await clearError(connection);
+        acknowledge(connection, event);
         return;
       }
       console.error('handoff not delivered:', result && result.error);
@@ -167,6 +244,7 @@ async function handleEvent(connection, message) {
     }
   }
   console.error('giving up on', key, '- not marked delivered');
+  await reportError(connection, 'Handoff failed; waiting for host retry.');
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -180,7 +258,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === 'badcat:stop') return stop(message.tabId);
     return { ok: false, error: 'unknown message' };
   };
-  run().then(sendResponse, (e) => sendResponse({ ok: false, error: String(e && e.message) }));
+  const action = controlQueue.then(run);
+  controlQueue = action.catch(() => {});
+  action.then(sendResponse, (e) => sendResponse({ ok: false, error: String(e && e.message) }));
   return true;
 });
 

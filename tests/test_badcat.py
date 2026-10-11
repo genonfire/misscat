@@ -40,6 +40,34 @@ def seq(*reviews):
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_effective_sequence_supersedes_history_and_resets_stage_two(self):
+        for markers, expected in [
+            (("-1",), BLOCKED), (("-1", "+1"), PLUS1),
+            (("-1", "+1", "+2"), READY), (("+1", "+2", "-1"), BLOCKED),
+            (("+1", "+2", "-1", "+1"), PLUS1),
+            (("+1", "+2", "-1", "+1", "+2"), READY),
+            (("+1", "+2", "-1", "+2"), INVALID),
+            (("+1", "+2", "+1"), PLUS1),
+        ]:
+            with self.subTest(markers=markers):
+                reviews = seq(*(rev(marker, A) for marker in markers))
+                result = evaluate(list(reversed(reviews)), A, ME)
+                self.assertEqual(result.stage, expected)
+                if expected in (PLUS1, READY):
+                    self.assertEqual(result.plus1_review_id,
+                                     [r.id for r in reviews if r.body.startswith("+1\n")][-1])
+                else:
+                    self.assertIsNone(result.plus1_review_id)
+
+    def test_clean_sequence_supersedes_resolved_invalid_reviews(self):
+        for invalid in (rev(None, A, text="-1: FAIL"), rev("+1", B, commit=A),
+                        rev("+1", A, text=body("+1", A, "")),
+                        rev("+1", A, state="CHANGES_REQUESTED")):
+            with self.subTest(invalid=invalid):
+                self.assertEqual(self.stage(seq(invalid, rev("+1", A), rev("+2", A))), READY)
+                self.assertEqual(self.stage(seq(rev("+1", A), rev("+2", A), invalid)), INVALID)
+                self.assertNotEqual(self.stage(seq(invalid, rev("+2", A))), READY)
+
     def stage(self, reviews, head=A, trusted=ME):
         return evaluate(reviews, head, trusted).stage
 
@@ -267,6 +295,24 @@ class WatcherTests(unittest.TestCase):
         c.check_runs = lambda head: next(ci_calls)
         self.run_cycle(self.watcher(c, merge=1))
         self.assertEqual(c.calls, [], "CI is rechecked after the review gate")
+
+    def test_superseded_blocker_uses_effective_threshold_and_final_read(self):
+        for level in (1, 2):
+            c = FakeClient(reviews=seq(rev("-1", A), rev("+1", A), rev("+2", A)))
+            self.run_cycle(self.watcher(c, merge=level))
+            self.assertEqual(c.calls, [("merge", 7, A)])
+            c = FakeClient(reviews=seq(rev("+1", A), rev("+2", A), rev("-1", A), rev("+1", A)))
+            self.run_cycle(self.watcher(c, merge=level))
+            self.assertEqual(c.calls, [("merge", 7, A)] if level == 1 else [])
+            c = FakeClient(reviews=seq(rev("-1", A), rev("+1", A), rev("+2", A)))
+            initial = c.review_list
+            calls = []
+            def reviews(n):
+                calls.append(n)
+                return initial if len(calls) == 1 else seq(*initial, rev("-1", A))
+            c.reviews = reviews
+            self.run_cycle(self.watcher(c, merge=level))
+            self.assertEqual(c.calls, [])
 
     def test_draft_and_non_draft_same_path_and_rejection_reported_once(self):
         for draft in (False, True):

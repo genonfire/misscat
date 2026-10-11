@@ -3,7 +3,7 @@
 // submitted (e.g. ChatGPT still answering) is left in the composer; the next handoff is appended to it.
 (function () {
   'use strict';
-  const { isConversationUrl, reviewMessage } = self.BadCatShared;
+  const { isConversationUrl, reviewMessage, parseEvent, eventKey } = self.BadCatShared;
 
   // ChatGPT's composer is a ProseMirror contenteditable. Match on semantic attributes only (no class
   // names or localized aria-labels); the send button is the submit button in the composer's own form (it sits outside [data-composer-input]).
@@ -55,10 +55,18 @@
     el.dispatchEvent(new KeyboardEvent('keyup', init));
   }
 
-  async function handoff(pr) {
+  let activeSession = null;
+  let queue = Promise.resolve();
+  const submitted = new Set(); // survives service-worker restart while this tab stays open
+  async function handoff(pr, session, event) {
+    const active = () => session === undefined || session === activeSession;
+    if (!active()) return { ok: false, error: 'stale session' };
+    const key = event ? eventKey(event) : null;
+    if (key && submitted.has(key)) return { ok: true };
     if (!isConversationUrl(location.href)) return { ok: false, error: 'not a conversation page' };
     const text = reviewMessage(pr);
     const composer = await waitFor(() => document.querySelector(COMPOSER), 5000);
+    if (!active()) return { ok: false, error: 'session stopped' };
     if (!composer) return { ok: false, error: 'composer not found' };
 
     // Never discard what is already there: append after exactly one space, unless this very command
@@ -69,16 +77,23 @@
       if (readComposer(composer) !== full) return { ok: false, error: 'could not fill the composer' };
     }
 
+    if (!active()) return { ok: false, error: 'session stopped' };
     pressEnter(composer);
     let sent = await waitFor(() => readComposer(composer) === '', 3000);
     if (!sent) {
       const button = findSendButton(composer);
-      if (button && !button.disabled) {
+      if (active() && button && !button.disabled) {
         button.click();
         sent = await waitFor(() => readComposer(composer) === '', 3000);
       }
     }
-    if (sent) return { ok: true };
+    if (sent) {
+      if (key) {
+        submitted.add(key);
+        if (submitted.size > 500) submitted.delete(submitted.values().next().value);
+      }
+      return { ok: true };
+    }
     return { ok: false, error: 'message was not submitted' };
   }
 
@@ -88,8 +103,25 @@
       sendResponse({ ok: true });
       return false;
     }
+    if (message.type === 'badcat:activate') {
+      activeSession = message.session;
+      sendResponse({ ok: true });
+      return false;
+    }
+    if (message.type === 'badcat:cancel') {
+      if (activeSession === message.session) activeSession = null;
+      sendResponse({ ok: true });
+      return false;
+    }
     if (message.type === 'badcat:handoff') {
-      handoff(message.pr).then(sendResponse, (e) => sendResponse({ ok: false, error: String(e.message) }));
+      const event = message.event ? parseEvent(message.event, message.event.repo) : null;
+      if (message.session !== undefined && (!event || event.pr !== message.pr)) {
+        sendResponse({ ok: false, error: 'invalid event' });
+        return false;
+      }
+      const task = queue.then(() => handoff(message.pr, message.session, event));
+      queue = task.catch(() => {});
+      task.then(sendResponse, (e) => sendResponse({ ok: false, error: String(e.message) }));
       return true;
     }
     return false;

@@ -72,20 +72,173 @@ def frames(data):
     return out
 
 
-def event(pr=7, head=A):
-    return {"repo": "o/r", "pr": pr, "head": head, "status": "+1"}
+def event(pr=7, head=A, review_id=1):
+    return {"repo": "o/r", "pr": pr, "head": head, "status": "+1",
+            "review_id": review_id, "delivery_id": mock.ANY}
 
 
 class WatcherTests(unittest.TestCase):
+    def ack(self, event):
+        return {**{k: v for k, v in event.items() if k not in ("status", "legacy_review_id")}, "type": "ack"}
+
+    def test_write_without_ack_is_retryable_and_restart_revalidates(self):
+        clock = [0]
+        c = FakeClient(reviews=[review(10, "+1", A)])
+        w = self.watcher(c, auto_ack=False, now=lambda: clock[0])
+        w.cycle()
+        self.assertFalse(w.state.has(7, A, 10))
+        w.cycle()
+        self.assertEqual(len(self.events), 1)
+        clock[0] = 60
+        w.cycle()
+        self.assertEqual(len(self.events), 2)
+        restarted = self.watcher(c, auto_ack=False)
+        restarted.cycle()
+        self.assertNotEqual(self.events[0]["delivery_id"], self.events[-1]["delivery_id"])
+        self.assertFalse(restarted.acknowledge(self.ack(self.events[0])))
+        self.assertTrue(restarted.acknowledge(self.ack(self.events[-1])))
+        self.watcher(c).cycle()
+        self.assertEqual(len(self.events), 3)
+
+    def test_new_effective_same_head_review_is_a_new_delivery(self):
+        c = FakeClient(reviews=[review(10, "+1", A)])
+        w = self.watcher(c)
+        w.cycle()
+        c.review_list += [review(11, "+2", A), review(12, "-1", A)]
+        w.cycle()
+        c.review_list.append(review(20, "+1", A))
+        w.cycle()
+        w.cycle()
+        self.assertEqual([e["review_id"] for e in self.events], [10, 20])
+
+    def test_stale_unacknowledged_events_are_never_replayed(self):
+        for change in ("block", "ready", "head", "closed", "draft"):
+            with self.subTest(change=change):
+                c = FakeClient(reviews=[review(10, "+1", A)])
+                self.events.clear()
+                self.path = self.path.with_name(change + ".json")
+                clock = [0]
+                w = self.watcher(c, auto_ack=False, now=lambda: clock[0])
+                w.cycle()
+                if change in ("block", "ready"):
+                    c.review_list.append(review(11, "-1" if change == "block" else "+2", A))
+                elif change == "head":
+                    c.head = B
+                elif change == "closed":
+                    c.open = False
+                else:
+                    c.open_prs = lambda: [OpenPR(7, A, True, "u", "t")]
+                clock[0] = 1000
+                w.cycle()
+                self.assertEqual(len(self.events), 1)
+                self.assertFalse(w.acknowledge(self.ack(self.events[0])))
+                self.watcher(c, auto_ack=False).cycle()
+                self.assertEqual(len(self.events), 1)
+
+    def test_ack_requires_exact_outstanding_identity_and_shape(self):
+        w = self.watcher(FakeClient(reviews=[review(10, "+1", A)]), auto_ack=False)
+        w.cycle()
+        ack = self.ack(self.events[0])
+        for field, wrong in (("repo", "x/y"), ("pr", 8), ("pr", True), ("head", B),
+                             ("review_id", 11), ("review_id", "10"),
+                             ("delivery_id", "d" * 32), ("extra", "x")):
+            self.assertFalse(w.acknowledge({**ack, field: wrong}))
+            self.assertFalse(w.state.has(7, A, 10))
+        with mock.patch.object(host, "_write_atomic", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                w.acknowledge(ack)
+        self.assertFalse(w.state.has(7, A, 10))
+        self.assertTrue(w.acknowledge(ack))
+        self.assertTrue(w.acknowledge(ack))  # duplicate ACK on the same connection is harmless
+
+    def test_legacy_state_baselines_once_without_suppressing_future_plus1(self):
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text(json.dumps({"version": 1, "emitted": {"7": [A]}}))
+        c = FakeClient(reviews=[review(10, "+1", A)])
+        self.watcher(c).cycle()
+        self.assertEqual(self.events, [])
+        c.review_list += [review(11, "-1", A), review(20, "+1", A)]
+        self.watcher(c).cycle()
+        self.assertEqual([e["review_id"] for e in self.events], [20])
+        self.watcher(c).cycle()
+        self.assertEqual(len(self.events), 1)
+
+    def test_new_review_before_first_upgrade_poll_is_not_lost(self):
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text(json.dumps({"version": 1, "emitted": {"7": [A]}}))
+        os.utime(self.path, (1767225605, 1767225605))  # 2026-01-01T00:00:05Z
+        c = FakeClient(reviews=[review(1, "+1", A), review(6, "-1", A), review(10, "+1", A)])
+        w = self.watcher(c)
+        w.cycle()
+        self.assertEqual([e["review_id"] for e in self.events], [10])
+        self.assertEqual(self.events[0]["legacy_review_id"], 1)
+        self.assertTrue(host.EmittedState(self.path).has(7, A, 10))
+
+    def test_other_pr_mtime_does_not_hide_new_approval_and_restart_is_retryable(self):
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text(json.dumps({"version": 1, "emitted": {"7": [A], "8": [B]}}))
+        os.utime(self.path, (1767225630, 1767225630))  # later than both PR histories
+        c = FakeClient()
+        c.open_prs = lambda: [OpenPR(7, A, False, "u", "t"), OpenPR(8, B, False, "u", "t")]
+        c.reviews = lambda n: ([review(10, "+1", A), review(11, "-1", A), review(20, "+1", A)]
+                              if n == 7 else [review(25, "+1", B)])
+        self.watcher(c, auto_ack=False).cycle()
+        self.assertEqual([(e["pr"], e["review_id"], e["legacy_review_id"]) for e in self.events],
+                         [(7, 20, 10)])
+        saved = json.loads(self.path.read_text())
+        self.assertEqual(saved["baselines"], {"7": {A: 10}, "8": {B: 25}})
+        self.assertEqual(saved["acknowledged"], {})
+        restarted = self.watcher(c, auto_ack=False)
+        restarted.cycle()
+        self.assertEqual([e["review_id"] for e in self.events], [20, 20])
+        self.assertTrue(restarted.acknowledge(self.ack(self.events[-1])))
+        self.watcher(c).cycle()
+        self.assertEqual(len(self.events), 2)
+
+    def test_many_legacy_initial_approvals_do_not_replay_on_upgrade(self):
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text(json.dumps({"version": 1, "emitted": {str(n): [A] for n in range(1, 51)}}))
+        c = FakeClient()
+        c.open_prs = lambda: [OpenPR(n, A, False, "u", "t") for n in range(1, 51)]
+        c.reviews = lambda n: [review(n, "+1", A)]
+        self.watcher(c).cycle()
+        self.watcher(c).cycle()
+        self.assertEqual(self.events, [])
+
+    def test_provisional_mtime_baselines_are_repaired_without_erasing_acks(self):
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text(json.dumps({"version": 2, "legacy": {}, "migration_before": 1767225630,
+                                        "baselines": {"7": {A: 20}}, "acknowledged": {"8": {B: [25]}}}))
+        c = FakeClient(reviews=[review(10, "+1", A), review(11, "-1", A), review(20, "+1", A)])
+        w = self.watcher(c)
+        w.cycle()
+        self.assertEqual([e["review_id"] for e in self.events], [20])
+        self.assertTrue(host.EmittedState(self.path).has(8, B, 25))
+
+    def test_legacy_baseline_uses_only_trusted_valid_current_head_approval(self):
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text(json.dumps({"version": 1, "emitted": {"7": [A]}}))
+        c = FakeClient(reviews=[review(1, "+1", A, login="eve"), review(2, "+1", B),
+                                review(3, "+1", A, state="APPROVED"),
+                                review(4, "+1", A, text="+1: malformed"),
+                                review(10, "+1", A), review(11, "-1", A), review(20, "+1", A)])
+        self.watcher(c).cycle()
+        self.assertEqual(self.events[0]["legacy_review_id"], 10)
+
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.path = Path(tmp.name) / "host" / "o__r.json"
         self.events = []
 
-    def watcher(self, client):
-        return host.ReviewStateWatcher("o/r", client, host.EmittedState(self.path),
-                                       frozenset({"me"}), self.events.append)
+    def watcher(self, client, auto_ack=True, now=None):
+        def emit(event):
+            self.events.append(event)
+            if auto_ack:
+                w.acknowledge({**{k: v for k, v in event.items() if k not in ("status", "legacy_review_id")}, "type": "ack"})
+        w = host.ReviewStateWatcher("o/r", client, host.EmittedState(self.path),
+                                   frozenset({"me"}), emit, **({"now": now} if now else {}))
+        return w
 
     def test_same_head_plus1_emits_exactly_once(self):
         client = FakeClient(reviews=[review(1, "+1", A)])
@@ -95,7 +248,7 @@ class WatcherTests(unittest.TestCase):
         self.assertEqual(self.events, [event()])
         reads = client.reads
         w.cycle()
-        self.assertEqual(client.reads, reads)  # a reported HEAD is not re-evaluated
+        self.assertGreater(client.reads, reads)  # a later effective +1 remains discoverable
 
     def test_restart_does_not_repeat_the_event(self):
         client = FakeClient(reviews=[review(1, "+1", A)])
@@ -110,7 +263,7 @@ class WatcherTests(unittest.TestCase):
                                     host.EmittedState(self.path), frozenset({"me"}), gone)
         with self.assertRaises(host.ConnectionClosed):
             w.cycle()
-        self.assertFalse(w.state.has(7, A))
+        self.assertFalse(w.state.has(7, A, 1))
 
     def test_states_that_are_not_plus1_never_emit(self):
         cases = {
@@ -147,7 +300,7 @@ class WatcherTests(unittest.TestCase):
         client.review_list = [review(1, "+1", A), review(2, "+1", B)]
         w.cycle()
         w.cycle()
-        self.assertEqual(self.events, [event(), event(head=B)])
+        self.assertEqual(self.events, [event(), event(head=B, review_id=2)])
 
     def test_api_failure_never_emits_and_recovers(self):
         client = FakeClient(reviews=[review(1, "+1", A)])
@@ -174,11 +327,11 @@ class WatcherTests(unittest.TestCase):
         client.open = True  # reopened with the same HEAD
         w.cycle()
         self.assertEqual(self.events, [event()])
-        self.assertTrue(host.EmittedState(self.path).has(7, A))  # also across a restart
+        self.assertTrue(host.EmittedState(self.path).has(7, A, 1))  # also across a restart
         client.head = B
         client.review_list = [review(1, "+1", A), review(2, "+1", B)]
         w.cycle()
-        self.assertEqual(self.events, [event(), event(head=B)])
+        self.assertEqual(self.events, [event(), event(head=B, review_id=2)])
 
     def test_gh_errors_are_logged_without_gh_text(self):
         secret = "HTTP 401: Bad credentials token ghp_secret Authorization: Bearer abc"
@@ -199,8 +352,9 @@ class WatcherTests(unittest.TestCase):
         self.path.parent.mkdir(parents=True)
         for text in ("{nope", json.dumps({"version": 9, "emitted": {}}), "[]"):
             self.path.write_text(text)
-            with self.assertLogs("badcat_host", level="WARNING"):
-                self.assertEqual(host.EmittedState(self.path).prs, {})
+            with self.assertRaises(misscat.MissCatError):
+                host.EmittedState(self.path)
+            self.assertEqual(self.path.read_text(), text)
 
     def test_client_has_no_write_surface(self):
         # the watcher only ever calls open_prs/reviews/viewer; FakeClient has nothing else
@@ -284,6 +438,25 @@ class Connection:
 
 
 class ServeTests(unittest.TestCase):
+    def test_framed_ack_persists_only_the_exact_outstanding_delivery(self):
+        conn = Connection(self, FakeClient(reviews=[review(10, "+1", A)]))
+        conn.send({"type": "start", "repo": "o/r"})
+        sent = conn.wait_frames(1)[0]
+        ack = {**{k: v for k, v in sent.items() if k not in ("status", "legacy_review_id")}, "type": "ack"}
+        conn.send({**ack, "review_id": 99})
+        self.assertEqual(conn.wait_frames(2)[1], {"warning": "invalid or stale acknowledgement"})
+        self.assertFalse(host.EmittedState(host.state_path("o/r")).has(7, A, 10))
+        conn.send(ack)
+        conn.send({"type": "stop"})
+        # Reader processes messages in order; the next invalid request is a barrier.
+        conn.send({"type": "unknown"})
+        conn.wait_frames(3)
+        self.assertTrue(host.EmittedState(host.state_path("o/r")).has(7, A, 10))
+        conn.send({"type": "start", "repo": "o/r"})
+        conn.send({"type": "unknown"})
+        conn.wait_frames(4)
+        self.assertEqual(len([e for e in frames(conn.out.getvalue()) if e.get("status") == "+1"]), 1)
+
     def test_start_emits_one_event_and_closing_exits_cleanly(self):
         conn = Connection(self, FakeClient(reviews=[review(1, "+1", A)]))
         conn.send({"type": "start", "repo": "O/R"})
