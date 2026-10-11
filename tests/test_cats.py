@@ -283,10 +283,10 @@ class BatchTests(WatcherBase):
         writers, finished = [], []
         original = self.state.add
 
-        def add(key):
+        def add(key, *ids):
             writers.append(threading.current_thread())
             self.assertEqual(len(finished), 3)
-            original(key)
+            original(key, *ids)
 
         self.state.add = add
 
