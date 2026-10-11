@@ -20,6 +20,13 @@ class OpenPR:
     draft: bool
     url: str
     title: str
+    labels: frozenset[str] = frozenset()
+
+
+def pr_labels(data: dict) -> frozenset[str]:
+    """Exact GitHub PR label names; absent or malformed labels cannot grant batch access."""
+    return frozenset(label["name"] for label in (data.get("labels") or [])
+                     if isinstance(label, dict) and isinstance(label.get("name"), str))
 
 
 class GhClient:
@@ -62,7 +69,7 @@ class GhClient:
     def open_prs(self) -> list:
         try:
             return [OpenPR(int(d["number"]), d["head"]["sha"], bool(d.get("draft")),
-                           d["html_url"], d["title"])
+                           d["html_url"], d["title"], pr_labels(d))
                     for d in self._pages(f"repos/{self.repo}/pulls?state=open")]
         except (KeyError, TypeError, ValueError) as exc:
             raise GhError(f"unexpected gh output: {exc}") from exc
