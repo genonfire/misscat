@@ -249,6 +249,20 @@ The `args` field under `reviewer` is passed to the selected reviewer CLI unchang
 
 Reviewed state is stored per repository and keyed by PR, HEAD SHA, and profile. The same HEAD can therefore be reviewed again with a different profile.
 
+### Author replies to a blocking `-1`
+
+A PR can stay stuck at `-1` after the author supplies evidence. MissCat therefore also notices when the conversation advances on an **unchanged HEAD**, and calls the reviewer again; it never judges the reply. For an already-reviewed current HEAD (same eligibility rules: drafts, `no-review`, `urgent`, `--cat`), a review is triggered when:
+
+- the latest valid marker review of that HEAD (`-1`/`+1`/`+2` header with matching `HEAD:`, `commit_id` and evidence, same format BadCat uses) is a `-1`. A later `+1`/`+2` or newer `-1` supersedes earlier ones, and reviews of other HEADs never count;
+- the PR author then adds a new **top-level conversation comment** after that review. Author and reviewer may share one GitHub account: only conversation comments trigger, never submitted reviews or inline review comments. Comments by others, comments before the `-1`, and comments on an old HEAD are ignored. No special text or command is needed; a mere progress comment may cause one harmless extra review;
+- the `-1` is not newer than this profile's own last completed review of that HEAD (give or take two minutes of clock skew), so a different stage/profile's `-1` is not re-opened by this one.
+
+The reviewer prompt names the author's comment(s) and tells the reviewer to read its earlier `-1`, the comments after it and the latest evidence, answer the argument and explain a maintained or changed judgment in a new submitted PR Review (per the repository's `REVIEW.md`). The reviewer should answer through that review rather than a conversation comment, or it would count as another author reply when it shares the author's account.
+
+The run counts as done only if, afterwards, GitHub shows a **new submitted review of the same HEAD** and the PR's HEAD is unchanged; a zero exit alone is not enough. Only then are the triggering comment ids stored (in an optional `replies` list of the existing state file, keyed by PR, HEAD, profile and comment id; older v2 files load unchanged and no review history is lost). A crash, missing review, GitHub error or HEAD change records nothing and the reply is retried like a failed review. Each comment is handled at most once; a later author comment after a new `-1` can trigger again, and a new HEAD follows the normal review path.
+
+To stay cheap, the PR listing also fetches `author` and `updatedAt`; reviews (and then comments, only if the HEAD is blocked) are read only for a reviewed PR whose `updatedAt` changed.
+
 ### Gemini (Antigravity CLI)
 
 Gemini reviews use the Antigravity CLI (`agy`). Configure authentication and permissions before running MissCat.
@@ -483,6 +497,7 @@ badcat-host install --extension-id iiaiioncejjhjmglaiionpmgpjminnkb
 - Discovers PRs created after MissCat starts
 - Detects changes by PR HEAD SHA
 - Reviews every new PR HEAD once per profile
+- Re-reviews an unchanged HEAD once when the PR author answers a blocking `-1` (see below)
 - Avoids duplicate reviews
 - Remembers reviewed commits across restarts
 - Uses an isolated persistent review workspace

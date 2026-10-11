@@ -42,14 +42,14 @@ import shutil
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, NamedTuple
 from urllib.parse import urlsplit
 
 import yaml
 
-__version__ = "1.4.4"
+__version__ = "1.4.5"
 
 log = logging.getLogger("misscat")
 
@@ -385,6 +385,9 @@ class PR:
     title: str
     urgent: bool = False
     no_review: bool = False
+    author: str = ""  # PR author login; empty = unknown, which disables same-HEAD reply triggers
+    updated_at: str = ""  # cheap change cursor from the PR listing
+    reply: "ReplyTrigger | None" = None  # set only on a same-HEAD re-review picked by the watcher
 
 
 URGENT_LABEL = "urgent"
@@ -394,7 +397,7 @@ NO_REVIEW_LABEL = "no-review"
 def gh_open_prs(repo: str) -> list[PR]:
     cmd = [
         "gh", "pr", "list", "--repo", repo, "--state", "open", "--limit", "200",
-        "--json", "number,headRefOid,isDraft,url,title,labels",
+        "--json", "number,headRefOid,isDraft,url,title,labels,author,updatedAt",
     ]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
@@ -407,10 +410,122 @@ def gh_open_prs(repo: str) -> list[PR]:
         for d in json.loads(proc.stdout):
             names = {label["name"] for label in d.get("labels") or []}
             prs.append(PR(int(d["number"]), d["headRefOid"], bool(d["isDraft"]), d["url"], d["title"],
-                          URGENT_LABEL in names, NO_REVIEW_LABEL in names))
+                          URGENT_LABEL in names, NO_REVIEW_LABEL in names,
+                          str((d.get("author") or {}).get("login") or ""),
+                          str(d.get("updatedAt") or "")))
         return prs
     except (ValueError, KeyError, TypeError) as exc:
         raise GhError(f"unexpected gh output: {exc}") from exc
+
+
+# --------------------------------------------------------------------------- same-HEAD replies
+
+REPLY_SKEW = 120.0  # seconds: tolerated clock difference between GitHub and the local state clock
+MAX_PAGES = 20
+_MARKER_RE = re.compile(r"\A(\+1|\+2|-1)\r?\nHEAD: ([0-9a-f]{40})\r?\n(.*)\Z", re.DOTALL)
+
+
+@dataclass(frozen=True)
+class GhReview:
+    id: int
+    login: str
+    state: str
+    body: str
+    commit_id: str
+    submitted_at: str
+
+
+@dataclass(frozen=True)
+class GhComment:
+    """A top-level PR conversation (issue) comment; never a review or an inline comment."""
+    id: int
+    login: str
+    created_at: str
+    url: str
+
+
+@dataclass(frozen=True)
+class ReplyTrigger:
+    """Why an already-reviewed HEAD is reviewed again: the PR author answered a `-1`."""
+    comment_ids: tuple[int, ...]  # unhandled author comments after the blocking review, oldest first
+    comment_urls: tuple[str, ...]
+    blocking_review_id: int
+    known_review_ids: frozenset[int]  # reviews that existed when the run was selected
+
+
+class GhDiscussion:
+    """Reads PR reviews, conversation comments and the current HEAD through `gh api`."""
+
+    def __init__(self, repo: str):
+        self.repo = repo
+
+    @staticmethod
+    def _api(path: str):
+        try:
+            proc = subprocess.run(["gh", "api", path], capture_output=True, text=True, timeout=60,
+                                  stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise GhError(str(exc)) from exc
+        if proc.returncode != 0:
+            raise GhError(proc.stderr.strip() or f"gh exited {proc.returncode}")
+        try:
+            return json.loads(proc.stdout)
+        except ValueError as exc:
+            raise GhError(f"unexpected gh output: {exc}") from exc
+
+    def _pages(self, path: str) -> list:
+        items: list = []
+        for page in range(1, MAX_PAGES + 1):
+            chunk = self._api(f"{path}?per_page=100&page={page}")
+            if not isinstance(chunk, list):
+                raise GhError("unexpected gh output: expected a list")
+            items.extend(chunk)
+            if len(chunk) < 100:
+                return items
+        raise GhError(f"too many pages for {path}")  # fail closed rather than truncate
+
+    def reviews(self, number: int) -> list[GhReview]:
+        try:
+            return [GhReview(int(d["id"]), str((d.get("user") or {}).get("login") or ""),
+                             str(d.get("state") or ""), str(d.get("body") or ""),
+                             str(d.get("commit_id") or ""), str(d.get("submitted_at") or ""))
+                    for d in self._pages(f"repos/{self.repo}/pulls/{number}/reviews")]
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            raise GhError(f"unexpected gh output: {exc}") from exc
+
+    def comments(self, number: int) -> list[GhComment]:
+        try:
+            return [GhComment(int(d["id"]), str((d.get("user") or {}).get("login") or ""),
+                              str(d["created_at"]), str(d.get("html_url") or ""))
+                    for d in self._pages(f"repos/{self.repo}/issues/{number}/comments")]
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            raise GhError(f"unexpected gh output: {exc}") from exc
+
+    def head(self, number: int) -> str:
+        try:
+            return str(self._api(f"repos/{self.repo}/pulls/{number}")["head"]["sha"])
+        except (KeyError, TypeError) as exc:
+            raise GhError(f"unexpected gh output: {exc}") from exc
+
+
+def blocking_review(reviews: list[GhReview], head: str) -> GhReview | None:
+    """The latest substantive marker review of `head` if it is a `-1`, else None.
+
+    Only submitted reviews count (not issue comments or inline comments). A marker is
+    `+1|+2|-1`, then `HEAD: <sha>` equal to the review's commit and `head`, then evidence.
+    A later marker review on the same HEAD (a pass, or a newer `-1`) supersedes earlier ones.
+    """
+    latest = None
+    submitted = [r for r in reviews if r.submitted_at and r.state not in ("PENDING", "DISMISSED")]
+    for review in sorted(submitted, key=lambda r: (_instant(r.submitted_at), r.id)):
+        match = _MARKER_RE.match(review.body)
+        if not match or not match.group(3).strip():
+            continue
+        if match.group(2) != head or review.commit_id != head:
+            continue
+        latest = review if match.group(1) == "-1" else None
+    return latest
+
 
 
 # --------------------------------------------------------------------------- workspace
@@ -789,6 +904,20 @@ def build_prompt(settings: Settings, repo: str, pr: PR) -> str:
         "The current directory is a checkout of exactly this HEAD.\n"
         "Review exactly this HEAD. Do not modify code, push commits, or merge."
     )
+    if pr.reply is not None:
+        urls = "\n".join(f"  - {url}" for url in pr.reply.comment_urls if url)
+        context += (
+            "\n\nThis HEAD was already reviewed and an earlier review of it was a blocking -1. "
+            "The PR author has since added top-level conversation comment(s):\n"
+            f"{urls or '  (see the PR conversation)'}\n"
+            "Re-review this same HEAD. Read your previous -1 review and the author's comments "
+            "after it (the PR conversation and the review thread), plus the latest evidence "
+            "(code, tests, artifacts, checks). Respond to the substantive argument, then submit "
+            "a new GitHub PR Review for this HEAD that explicitly explains whether you maintain "
+            "or change your judgment. Follow the repository's REVIEW.md for the verdict policy. "
+            "Answer only through that submitted PR Review, not through a separate conversation "
+            "comment."
+        )
     return f"{settings.prompt.strip()}\n\n{context}"
 
 
@@ -811,6 +940,25 @@ class Key(NamedTuple):
     profile: str | None  # None = bundled default, different from profile "default"
 
 
+class ReplyKey(NamedTuple):
+    pr: int
+    head: str
+    profile: str | None
+    comment_id: int  # immutable GitHub id of the author's conversation comment
+
+
+@dataclass(frozen=True)
+class ReplyRecord:
+    pr: int
+    head: str
+    profile: str | None
+    comment_id: int
+    handled_at: str  # UTC ISO 8601, recorded when the triggered review was verified
+
+    def key(self) -> ReplyKey:
+        return ReplyKey(self.pr, self.head, self.profile, self.comment_id)
+
+
 @dataclass(frozen=True)
 class ReviewRecord:
     pr: int
@@ -830,16 +978,23 @@ def _instant(timestamp: str) -> datetime:
 class State:
     """State v2: completed reviews by repository, PR, HEAD and profile.
 
+    An optional `replies` list (absent in files written by older versions, which stay valid)
+    holds the author comment ids already answered by a same-HEAD re-review.
+
     v1 contained no review timestamps; by design it is discarded on first access
     instead of guessing review order. Call only while holding repository_lock().
     """
 
     def __init__(self, path: Path):
         self.path = path
+        self._replies: list[ReplyRecord] = []
         self._records = self._load()
         self._reviewed = {row.key() for row in self._records}
         if len(self._records) != len(self._reviewed):
             raise StateError(f"duplicate review records in {path}")
+        self._handled = {row.key() for row in self._replies}
+        if len(self._replies) != len(self._handled):
+            raise StateError(f"duplicate reply records in {path}")
 
     def _load(self) -> list[ReviewRecord]:
         if not self.path.exists():
@@ -854,7 +1009,7 @@ class State:
                     "resetting legacy State v1 in %s: previously reviewed PR HEADs become eligible "
                     "again, so currently open PRs may be reviewed again and use reviewer tokens",
                     self.path)
-                self._write([])
+                self._write([], [])
                 return []
             if type(version) is not int or version != 2:
                 raise ValueError("unsupported state version")
@@ -875,19 +1030,41 @@ class State:
                 if parsed.tzinfo is None or parsed.utcoffset() is None:
                     raise ValueError("reviewed_at must have a timezone")
                 result.append(ReviewRecord(item["pr"], item["head"], item["profile"], ts))
+            replies = raw.get("replies", [])
+            if not isinstance(replies, list):
+                raise ValueError("replies must be a list")
+            for item in replies:
+                if (not isinstance(item, dict) or type(item.get("pr")) is not int
+                        or item["pr"] <= 0 or not isinstance(item.get("head"), str)
+                        or not item["head"] or not (item.get("profile") is None
+                        or isinstance(item["profile"], str))
+                        or type(item.get("comment_id")) is not int or item["comment_id"] <= 0
+                        or not isinstance(item.get("handled_at"), str)):
+                    raise ValueError("malformed reply entry")
+                parsed = datetime.fromisoformat(item["handled_at"].replace("Z", "+00:00"))
+                if parsed.tzinfo is None or parsed.utcoffset() is None:
+                    raise ValueError("handled_at must have a timezone")
+                self._replies.append(ReplyRecord(item["pr"], item["head"], item["profile"],
+                                                 item["comment_id"], item["handled_at"]))
             return result
         except (OSError, ValueError, KeyError, TypeError) as exc:
             raise StateError(
                 f"unreadable state file {self.path} ({exc}); fix or delete it to continue"
             ) from exc
 
-    def _write(self, records: list[ReviewRecord]) -> None:
+    def _write(self, records: list[ReviewRecord], replies: list[ReplyRecord]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         rows = sorted(records, key=lambda r: (r.pr, r.head, r.profile or ""))
-        data = {"version": 2, "reviewed": [
+        data: dict = {"version": 2, "reviewed": [
             {"pr": r.pr, "head": r.head, "profile": r.profile, "reviewed_at": r.reviewed_at}
             for r in rows
         ]}
+        if replies:
+            data["replies"] = [
+                {"pr": r.pr, "head": r.head, "profile": r.profile, "comment_id": r.comment_id,
+                 "handled_at": r.handled_at}
+                for r in sorted(replies, key=lambda r: (r.pr, r.head, r.profile or "", r.comment_id))
+            ]
         _write_atomic(self.path, json.dumps(data, indent=2) + "\n")
 
     def reviewed(self) -> set[Key]:
@@ -901,9 +1078,31 @@ class State:
             return
         timestamp = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
         records = [*self._records, ReviewRecord(*key, timestamp)]
-        self._write(records)
+        self._write(records, self._replies)
         self._records = records
         self._reviewed.add(key)
+
+    def review_time(self, key: Key) -> str | None:
+        return next((r.reviewed_at for r in self._records if r.key() == key), None)
+
+    def handled(self) -> set[ReplyKey]:
+        return self._handled
+
+    def handled_time(self, key: Key) -> str | None:
+        """Latest time a same-HEAD reply review of this PR/HEAD/profile was verified."""
+        times = [r.handled_at for r in self._replies if (r.pr, r.head, r.profile) == key]
+        return max(times, key=_instant) if times else None
+
+    def add_replies(self, keys: list[ReplyKey]) -> None:
+        """Record author comments as answered by one verified same-HEAD review."""
+        new = [k for k in keys if k not in self._handled]
+        if not new:
+            return
+        timestamp = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+        replies = [*self._replies, *(ReplyRecord(*k, timestamp) for k in new)]
+        self._write(self._records, replies)
+        self._replies = replies
+        self._handled.update(new)
 
     def is_latest(self, key: Key) -> bool:
         group = [r for r in self._records if (r.pr, r.profile) == (key.pr, key.profile)]
@@ -916,7 +1115,7 @@ class State:
         if not self.is_latest(key):
             return False
         records = [r for r in self._records if r.key() != key]
-        self._write(records)
+        self._write(records, self._replies)
         self._records = records
         self._reviewed.remove(key)
         return True
@@ -1005,6 +1204,9 @@ class Watcher:
     Reviews run in batches of at most `cats` PR HEADs, one cat worktree each, concurrently.
     The batch is a barrier: nothing new starts until every reviewer of the batch has
     finished; only then are successes recorded (here, sequentially) and PRs listed again.
+
+    An already-reviewed HEAD is reviewed once more when the PR author adds a top-level
+    conversation comment after a submitted `-1` of that HEAD (see `_find_reply`).
     """
 
     def __init__(
@@ -1018,8 +1220,11 @@ class Watcher:
         sleep: Callable[[float], None] = time.sleep,
         cats: int = 1,
         workspaces: Workspaces | None = None,
+        discussion: GhDiscussion | None = None,
     ):
         self.repo, self.profile, self.s, self.state = repo, profile, settings, state
+        self.discussion = discussion  # None disables same-HEAD reply re-reviews
+        self._checked: dict[tuple[int, str], str] = {}  # (PR, HEAD) -> updated_at with no reply due
         self.list_prs, self.reviewer, self.sleep = list_prs, reviewer, sleep
         self.cats, self.workspaces = cats, workspaces
         self.mode, self.step = IDLE, 0
@@ -1053,16 +1258,86 @@ class Watcher:
 
     def _next_batch(self, prs: list[PR]) -> list[PR]:
         done = self.state.reviewed()
-        waiting = [
+        eligible = [
             p for p in sorted(prs, key=lambda p: p.number)  # oldest PR first
-            if (self.s.include_drafts or not p.draft) and not p.no_review and self._key(p) not in done
+            if (self.s.include_drafts or not p.draft) and not p.no_review
         ]
+        waiting = [p for p in eligible if self._key(p) not in done]
+        waiting += self._reply_candidates([p for p in eligible if self._key(p) in done])
+        waiting.sort(key=lambda p: p.number)
         # `no-review` PRs are never eligible, even if also `urgent`. `urgent` PRs are picked
         # first; within each priority class, HEADs that just failed go last so they cannot
         # starve the others
         ordered = [p for urgent in (True, False) for failed in (False, True) for p in waiting
                    if p.urgent == urgent and (self._key(p) in self.failed) == failed]
         return ordered[: self.cats]
+
+    def _reply_candidates(self, reviewed: list[PR]) -> list[PR]:
+        """Reviewed current HEADs whose author answered a blocking `-1`, marked with their trigger.
+
+        GitHub is queried only for a PR whose `updatedAt` moved since it was last found to have
+        no due reply; a failed lookup is not remembered, so the next cycle retries it.
+        """
+        if self.discussion is None:
+            return []
+        self._checked = {k: v for k, v in self._checked.items()
+                         if any((p.number, p.head) == k for p in reviewed)}
+        due = []
+        for pr in reviewed:
+            if not pr.author or not pr.updated_at or self._checked.get((pr.number, pr.head)) == pr.updated_at:
+                continue
+            try:
+                trigger = self._find_reply(pr)
+            except GhError as exc:
+                log.warning("PR #%d: cannot check for an author reply: %s", pr.number, exc)
+                continue
+            if trigger is None:
+                self._checked[(pr.number, pr.head)] = pr.updated_at
+            else:
+                due.append(replace(pr, reply=trigger))
+        return due
+
+    def _find_reply(self, pr: PR) -> ReplyTrigger | None:
+        assert self.discussion is not None
+        reviews = self.discussion.reviews(pr.number)
+        block = blocking_review(reviews, pr.head)
+        if block is None:
+            return None
+        # This profile only answers the `-1` it can have written: one submitted no later than its
+        # own completed review (or last verified reply), so another stage's `-1` is not reopened.
+        key = self._key(pr)
+        anchors = [t for t in (self.state.review_time(key), self.state.handled_time(key)) if t]
+        if not anchors or (_instant(block.submitted_at) - max(map(_instant, anchors))).total_seconds() > REPLY_SKEW:
+            return None
+        blocked_at = _instant(block.submitted_at)
+        new = [c for c in self.discussion.comments(pr.number)
+               if c.login.lower() == pr.author.lower() and _instant(c.created_at) > blocked_at
+               and ReplyKey(pr.number, pr.head, self.profile, c.id) not in self.state.handled()]
+        if not new:
+            return None
+        new.sort(key=lambda c: (_instant(c.created_at), c.id))
+        return ReplyTrigger(tuple(c.id for c in new), tuple(c.url for c in new), block.id,
+                            frozenset(r.id for r in reviews))
+
+    def _verify_reply(self, pr: PR) -> bool:
+        """True only if the reviewer really submitted a new review of this exact HEAD."""
+        assert self.discussion is not None and pr.reply is not None
+        try:
+            head = self.discussion.head(pr.number)
+            reviews = self.discussion.reviews(pr.number)
+        except GhError as exc:
+            log.error("PR #%d: cannot verify the re-review: %s", pr.number, exc)
+            return False
+        if head != pr.head:
+            log.warning("PR #%d: HEAD changed during the re-review (%s -> %s)", pr.number,
+                        pr.head[:7], head[:7])
+            return False
+        if not any(r.id not in pr.reply.known_review_ids and r.submitted_at
+                   and r.state != "PENDING" and r.commit_id == pr.head for r in reviews):
+            log.error("PR #%d: reviewer exited without submitting a review of %s", pr.number,
+                      pr.head[:7])
+            return False
+        return True
 
     def _review(self, pr: PR) -> bool:
         return self._review_batch([pr])[0]
@@ -1072,7 +1347,8 @@ class Watcher:
         tag = (lambda n: f" [cat-{n}]") if self.cats > 1 else (lambda n: "")
         _log_review_separator()
         for n, pr in enumerate(batch, 1):
-            log.info("PR #%d: review start (%s)%s", pr.number, pr.head[:7], tag(n))
+            log.info("PR #%d: %s start (%s)%s", pr.number,
+                     "re-review after author reply" if pr.reply else "review", pr.head[:7], tag(n))
         started = [time.monotonic() for _ in batch]
         workspaces: list[Path | None] = [None] * len(batch)
         results: list[bool | None] = [None] * len(batch)  # None = not run yet
@@ -1117,10 +1393,18 @@ class Watcher:
             if elapsed[i] is None:  # failed before a reviewer started
                 elapsed[i] = time.monotonic() - started[i]
 
+        for i, pr in enumerate(batch):
+            if results[i] and pr.reply is not None:
+                results[i] = self._verify_reply(pr)
+
         self.failed = set()
         for n, (pr, ok) in enumerate(zip(batch, results), 1):
             if ok:
-                self.state.add(self._key(pr))  # only a successful review is recorded
+                if pr.reply is not None:  # only a verified review marks the comments as answered
+                    self.state.add_replies(
+                        [ReplyKey(pr.number, pr.head, self.profile, c) for c in pr.reply.comment_ids])
+                else:
+                    self.state.add(self._key(pr))  # only a successful review is recorded
                 log.info("PR #%d: review done in %s%s", pr.number, _fmt_elapsed(elapsed[n - 1]),
                          tag(n))
             else:
@@ -1416,7 +1700,8 @@ def main(argv: list[str] | None = None) -> int:
             except WorkspaceError as exc:  # retried before every batch, like a failed review
                 log.warning("workspace not ready yet: %s", exc)
             Watcher(repo, args.profile, settings, state, gh_open_prs, run_cli_reviewer,
-                    cats=args.cat, workspaces=workspaces).run_forever()
+                    cats=args.cat, workspaces=workspaces,
+                    discussion=GhDiscussion(repo)).run_forever()
     except MissCatError as exc:
         print(f"misscat: {exc}", file=sys.stderr)
         return 2
