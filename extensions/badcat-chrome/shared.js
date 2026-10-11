@@ -33,7 +33,8 @@
   }
 
   // The only host message that triggers a handoff: a "+1" for the watched repo.
-  // Returns {repo, pr, head} or null for anything else (errors, +2, malformed, other repo).
+  // Returns the validated event contract for forwarding and re-validation by content.js.
+  // Normalization preserves status and IDs; errors, +2, malformed/other-repo events return null.
   function parseEvent(message, watchedRepo) {
     if (message === null || typeof message !== 'object' || Array.isArray(message)) return null;
     if (message.status !== '+1') return null;
@@ -44,7 +45,7 @@
     if (typeof message.head !== 'string' || message.head.length !== 40 || !HEAD_RE.test(message.head)) return null;
     if (!Number.isSafeInteger(message.review_id) || message.review_id < 1) return null;
     if (typeof message.delivery_id !== 'string' || message.delivery_id.length !== 32 || !/^[0-9a-f]{32}$/.test(message.delivery_id)) return null;
-    const event = { repo: repo.toLowerCase(), pr: pr, head: message.head,
+    const event = { repo: repo.toLowerCase(), pr: pr, head: message.head, status: message.status,
       review_id: message.review_id, delivery_id: message.delivery_id };
     if (message.legacy_review_id !== undefined) {
       if (!Number.isSafeInteger(message.legacy_review_id) || message.legacy_review_id < 0) return null;
