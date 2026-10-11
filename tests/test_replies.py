@@ -232,11 +232,14 @@ class AttributionTests(ReplyBase):
         ])
         self.assertEqual(record.review_ids, (5,))
 
-    def test_review_without_nonce_is_recorded_but_unattributed(self):
+    def test_review_without_nonce_is_a_failure_not_an_unattributed_success(self):
         d = FakeDiscussion([review(5, 0)])
-        self.watcher(d, [m.PR(9, HEAD, False, "u", "t")]).cycle()
-        record = [r for r in self.state.records() if r.pr == 9][0]
-        self.assertEqual(record.review_ids, ())
+        w = self.watcher(d, [m.PR(9, HEAD, False, "u", "t")])
+        with self.assertLogs("misscat", "ERROR"):
+            w.cycle()
+        self.assertEqual([r for r in self.state.records() if r.pr == 9], [])
+        self.assertEqual(self.sleeps, [m.FAILURE_WAIT])
+        self.assertEqual(self.state.pending(), [])  # nothing pending: it is simply retried
 
     def test_prompt_carries_the_run_nonce(self):
         d = self.blocked()
@@ -244,6 +247,130 @@ class AttributionTests(ReplyBase):
         run_id = self.calls[0].run_id
         self.assertEqual(len(run_id), 16)
         self.assertIn(m.run_line(run_id), m.build_prompt(self.cfg, REPO, self.calls[0]))
+
+
+class RecoveryTests(ReplyBase):
+    """Outcomes survive GitHub errors, CLI crashes and restarts."""
+
+    def normal_pr(self):
+        return m.PR(9, HEAD, False, "u", "t", author=AUTHOR, updated_at="n1")
+
+    def test_attribution_api_error_after_a_valid_minus_one_is_settled_later(self):
+        d = FakeDiscussion()
+        w = self.watcher(d, [self.normal_pr()])
+
+        def reviewer(s, r, pr, ws):
+            d.review_list = [review(5, 0, run=pr.run_id)]
+            d.fail = True  # GitHub hiccups right after the reviewer submitted
+            return True
+        w.reviewer = reviewer
+        with self.assertLogs("misscat", "ERROR"):
+            w.cycle()
+        self.assertEqual([r for r in self.state.records() if r.pr == 9], [])
+        self.assertEqual([(p.pr, p.ok) for p in self.state.pending()], [(9, True)])
+        d.fail = False
+        self.calls.clear()
+        w.reviewer = lambda *a: self.calls.append(a) or True
+        w.cycle()  # reconciles; the HEAD is not reviewed a second time
+        self.assertEqual(self.calls, [])
+        record = [r for r in self.state.records() if r.pr == 9][0]
+        self.assertEqual(record.review_ids, (5,))
+        self.assertEqual(self.state.pending(), [])
+        # the author's reply to that -1 now triggers a re-review
+        d.comment_list = [comment(30, 3)]
+        w2 = self.watcher(d, [m.PR(9, HEAD, False, "u", "t", author=AUTHOR, updated_at="n2")])
+        w2.cycle()
+        self.assertEqual([c[2].reply.comment_ids for c in self.calls], [(30,)])
+
+    def test_unreachable_github_keeps_head_from_being_rerun(self):
+        d = FakeDiscussion()
+        w = self.watcher(d, [self.normal_pr()])
+
+        def reviewer(s, r, pr, ws):
+            d.review_list = [review(5, 0, run=pr.run_id)]
+            d.fail = True
+            return True
+        w.reviewer = reviewer
+        with self.assertLogs("misscat", "ERROR"):
+            w.cycle()
+        w.reviewer = lambda *a: self.fail("must not rerun while the outcome is unknown")
+        with self.assertLogs("misscat", "WARNING"):
+            w.cycle()
+        self.assertEqual(len(self.state.pending()), 1)
+
+    def submitted_then(self, d, fail_cli=False, api_down=False):
+        w = self.watcher(d)
+
+        def reviewer(s, r, pr, ws):
+            d.review_list.append(review(2, 8, run=pr.run_id))
+            d.fail = api_down
+            return not fail_cli
+        w.reviewer = reviewer
+        return w
+
+    def test_submitted_reply_review_survives_a_cli_crash(self):
+        d = self.blocked()
+        self.submitted_then(d, fail_cli=True).cycle()
+        self.assertEqual({k.comment_id for k in self.state.handled()}, {10})
+        self.assertEqual(self.state.review_ids(self.key), {1, 2})
+        self.assertEqual(self.state.pending(), [])
+
+    def test_submitted_reply_review_survives_a_verification_api_failure(self):
+        d = self.blocked()
+        w = self.submitted_then(d, api_down=True)
+        with self.assertLogs("misscat", "ERROR"):
+            w.cycle()
+        self.assertEqual(self.state.handled(), set())
+        self.assertEqual(len(self.state.pending()), 1)
+        d.fail = False
+        w.reviewer = lambda *a: self.fail("must not rerun")
+        w.cycle()
+        self.assertEqual({k.comment_id for k in self.state.handled()}, {10})
+        self.assertEqual(self.state.pending(), [])
+
+    def test_pending_attempt_is_settled_after_a_restart(self):
+        d = self.blocked()
+        w = self.submitted_then(d, api_down=True)
+        with self.assertLogs("misscat", "ERROR"):
+            w.cycle()
+        d.fail = False
+        reloaded = m.State(m.state_path(REPO))
+        self.assertEqual(len(reloaded.pending()), 1)
+        self.state = reloaded
+        self.watcher(d).cycle()
+        self.assertEqual({k.comment_id for k in reloaded.handled()}, {10})
+        self.assertEqual(reloaded.pending(), [])
+
+    def test_truly_unsubmitted_reply_is_dropped_and_retried(self):
+        d = self.blocked()
+        w = self.watcher(d)
+        with self.assertLogs("misscat", "ERROR"):
+            w.cycle()
+        self.assertEqual(self.state.pending(), [])
+        self.assertEqual(self.state.handled(), set())
+        w.cycle()
+        self.assertEqual(len(self.calls), 2)
+
+    def test_interrupted_normal_run_without_clean_exit_is_not_marked_reviewed(self):
+        d = FakeDiscussion()
+        w = self.watcher(d, [self.normal_pr()])
+        self.state.add_pending(m.PendingRun(9, HEAD, "luna", "abcd", (), False))
+        d.review_list = [review(5, 0, run="abcd")]  # submitted, but the CLI never exited cleanly
+        w.reviewer = lambda s, r, pr, ws: False
+        with self.assertLogs("misscat", "WARNING"):
+            w.cycle()
+        self.assertEqual([r for r in self.state.records() if r.pr == 9], [])
+
+    def test_pending_state_round_trips_and_rejects_garbage(self):
+        run = m.PendingRun(9, HEAD, "luna", "abcd", (3, 4), True)
+        self.state.add_pending(run)
+        self.assertEqual(m.State(m.state_path(REPO)).pending(), [run])
+        path = m.state_path(REPO)
+        data = json.loads(path.read_text())
+        data["pending"] = [{"pr": 9, "head": HEAD, "profile": None, "run_id": ""}]
+        path.write_text(json.dumps(data))
+        with self.assertRaises(m.StateError):
+            m.State(path)
 
 
 class VerificationTests(ReplyBase):

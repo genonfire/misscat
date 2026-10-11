@@ -539,6 +539,14 @@ def submitted_by_run(reviews: list[GhReview], head: str, run_id: str) -> list[Gh
             and run_line(run_id) in (line.strip() for line in r.body.splitlines())]
 
 
+def carrying_run(reviews: list[GhReview], head: str, run_id: str) -> list[GhReview]:
+    """Submitted reviews of exactly `head` that carry this run's nonce line (any verdict format)."""
+    if not run_id:
+        return []
+    return [r for r in reviews if r.submitted_at and r.state != "PENDING" and r.commit_id == head
+            and run_line(run_id) in (line.strip() for line in r.body.splitlines())]
+
+
 def blocking_review(reviews: list[GhReview], head: str) -> GhReview | None:
     """The latest substantive marker review of `head` if it is a `-1`, else None.
 
@@ -996,6 +1004,20 @@ class ReplyRecord:
 
 
 @dataclass(frozen=True)
+class PendingRun:
+    """A review attempt written down before it starts, so a crash cannot lose its outcome."""
+    pr: int
+    head: str
+    profile: str | None
+    run_id: str
+    comment_ids: tuple[int, ...] = ()  # author comments a same-HEAD re-review answers
+    ok: bool = False  # the reviewer CLI exited cleanly but GitHub could not be checked yet
+
+    def key(self) -> Key:
+        return Key(self.pr, self.head, self.profile)
+
+
+@dataclass(frozen=True)
 class ReviewRecord:
     pr: int
     head: str
@@ -1016,7 +1038,8 @@ class State:
     """State v2: completed reviews by repository, PR, HEAD and profile.
 
     An optional `replies` list (absent in files written by older versions, which stay valid)
-    holds the author comment ids already answered by a same-HEAD re-review.
+    holds the author comment ids already answered by a same-HEAD re-review, and an optional
+    `pending` list holds review attempts whose outcome has not been settled yet.
 
     v1 contained no review timestamps; by design it is discarded on first access
     instead of guessing review order. Call only while holding repository_lock().
@@ -1025,6 +1048,7 @@ class State:
     def __init__(self, path: Path):
         self.path = path
         self._replies: list[ReplyRecord] = []
+        self._pending: list[PendingRun] = []
         self._records = self._load()
         self._reviewed = {row.key() for row in self._records}
         if len(self._records) != len(self._reviewed):
@@ -1046,7 +1070,7 @@ class State:
                     "resetting legacy State v1 in %s: previously reviewed PR HEADs become eligible "
                     "again, so currently open PRs may be reviewed again and use reviewer tokens",
                     self.path)
-                self._write([], [])
+                self._write([], [], [])
                 return []
             if type(version) is not int or version != 2:
                 raise ValueError("unsupported state version")
@@ -1088,13 +1112,29 @@ class State:
                 self._replies.append(ReplyRecord(item["pr"], item["head"], item["profile"],
                                                  item["comment_id"], item["handled_at"],
                                                  item.get("review_id", 0)))
+            pending = raw.get("pending", [])
+            if not isinstance(pending, list):
+                raise ValueError("pending must be a list")
+            for item in pending:
+                ids = item.get("comment_ids", []) if isinstance(item, dict) else None
+                if (not isinstance(item, dict) or type(item.get("pr")) is not int
+                        or item["pr"] <= 0 or not isinstance(item.get("head"), str)
+                        or not item["head"] or not (item.get("profile") is None
+                        or isinstance(item["profile"], str))
+                        or not isinstance(item.get("run_id"), str) or not item["run_id"]
+                        or not isinstance(ids, list) or not all(type(i) is int for i in ids)
+                        or type(item.get("ok", False)) is not bool):
+                    raise ValueError("malformed pending entry")
+                self._pending.append(PendingRun(item["pr"], item["head"], item["profile"],
+                                                item["run_id"], tuple(ids), item.get("ok", False)))
             return result
         except (OSError, ValueError, KeyError, TypeError) as exc:
             raise StateError(
                 f"unreadable state file {self.path} ({exc}); fix or delete it to continue"
             ) from exc
 
-    def _write(self, records: list[ReviewRecord], replies: list[ReplyRecord]) -> None:
+    def _write(self, records: list[ReviewRecord], replies: list[ReplyRecord],
+               pending: list[PendingRun]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         rows = sorted(records, key=lambda r: (r.pr, r.head, r.profile or ""))
         data: dict = {"version": 2, "reviewed": [
@@ -1107,6 +1147,12 @@ class State:
                 {"pr": r.pr, "head": r.head, "profile": r.profile, "comment_id": r.comment_id,
                  "handled_at": r.handled_at, "review_id": r.review_id}
                 for r in sorted(replies, key=lambda r: (r.pr, r.head, r.profile or "", r.comment_id))
+            ]
+        if pending:
+            data["pending"] = [
+                {"pr": r.pr, "head": r.head, "profile": r.profile, "run_id": r.run_id,
+                 "comment_ids": list(r.comment_ids), "ok": r.ok}
+                for r in pending
             ]
         _write_atomic(self.path, json.dumps(data, indent=2) + "\n")
 
@@ -1121,9 +1167,28 @@ class State:
             return
         timestamp = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
         records = [*self._records, ReviewRecord(*key, timestamp, review_ids)]
-        self._write(records, self._replies)
+        self._write(records, self._replies, self._pending)
         self._records = records
         self._reviewed.add(key)
+
+    def pending(self) -> list[PendingRun]:
+        return list(self._pending)
+
+    def add_pending(self, run: PendingRun) -> None:
+        pending = [*self._pending, run]
+        self._write(self._records, self._replies, pending)
+        self._pending = pending
+
+    def update_pending(self, run: PendingRun) -> None:
+        pending = [run if r.run_id == run.run_id else r for r in self._pending]
+        self._write(self._records, self._replies, pending)
+        self._pending = pending
+
+    def drop_pending(self, run_id: str) -> None:
+        pending = [r for r in self._pending if r.run_id != run_id]
+        if len(pending) != len(self._pending):
+            self._write(self._records, self._replies, pending)
+            self._pending = pending
 
     def handled(self) -> set[ReplyKey]:
         return self._handled
@@ -1142,7 +1207,7 @@ class State:
             return
         timestamp = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
         replies = [*self._replies, *(ReplyRecord(*k, timestamp, review_id) for k in new)]
-        self._write(self._records, replies)
+        self._write(self._records, replies, self._pending)
         self._replies = replies
         self._handled.update(new)
 
@@ -1157,7 +1222,7 @@ class State:
         if not self.is_latest(key):
             return False
         records = [r for r in self._records if r.key() != key]
-        self._write(records, self._replies)
+        self._write(records, self._replies, self._pending)
         self._records = records
         self._reviewed.remove(key)
         return True
@@ -1286,6 +1351,7 @@ class Watcher:
             return
         if not prs and self.mode == ACTIVE:
             self.mode, self.step = IDLE, 0
+        self._reconcile_pending()
         batch = self._next_batch(prs)
         if not batch:
             self._sleep_adaptive()
@@ -1300,9 +1366,11 @@ class Watcher:
 
     def _next_batch(self, prs: list[PR]) -> list[PR]:
         done = self.state.reviewed()
+        unsettled = {r.key() for r in self.state.pending()}  # outcome not known yet: do not rerun
         eligible = [
             p for p in sorted(prs, key=lambda p: p.number)  # oldest PR first
             if (self.s.include_drafts or not p.draft) and not p.no_review
+            and self._key(p) not in unsettled
         ]
         waiting = [p for p in eligible if self._key(p) not in done]
         waiting += self._reply_candidates([p for p in eligible if self._key(p) in done])
@@ -1359,35 +1427,84 @@ class Watcher:
         new.sort(key=lambda c: (_instant(c.created_at), c.id))
         return ReplyTrigger(tuple(c.id for c in new), tuple(c.url for c in new), block.id)
 
-    def _verify_reply(self, pr: PR) -> int | None:
-        """Id of the review this run submitted for the exact HEAD, or None (not a success)."""
-        assert self.discussion is not None and pr.reply is not None
-        try:
-            head = self.discussion.head(pr.number)
-            new = submitted_by_run(self.discussion.reviews(pr.number), pr.head, pr.run_id)
-        except GhError as exc:
-            log.error("PR #%d: cannot verify the re-review: %s", pr.number, exc)
-            return None
-        if head != pr.head:
-            log.warning("PR #%d: HEAD changed during the re-review (%s -> %s)", pr.number,
-                        pr.head[:7], head[:7])
-            return None
-        if not new:
-            log.error("PR #%d: reviewer exited without submitting a valid review of %s carrying "
-                      "this run's id", pr.number, pr.head[:7])
-            return None
-        return max(r.id for r in new)
+    def _reply_review(self, run: PendingRun, reviews: list[GhReview]) -> int | None:
+        """Id of the valid verdict review this re-review submitted, if any."""
+        found = submitted_by_run(reviews, run.head, run.run_id)
+        return max(r.id for r in found) if found else None
 
-    def _attribute(self, pr: PR) -> tuple[int, ...]:
-        """Best effort: ids of the reviews this normal run submitted (never fails the run)."""
+    def _record_reply(self, run: PendingRun, review_id: int) -> None:
+        self.state.add_replies(
+            [ReplyKey(run.pr, run.head, run.profile, c) for c in run.comment_ids], review_id)
+        self.state.drop_pending(run.run_id)
+
+    def _reconcile_pending(self) -> None:
+        """Settle attempts left over by a crash, restart or earlier GitHub error.
+
+        A re-review that really submitted its review counts even if its CLI died afterwards.
+        A normal run counts only if its CLI had exited cleanly (`ok`); otherwise, like any
+        failed run, it is dropped and the HEAD is reviewed again. A lookup failure keeps the
+        attempt pending, and its HEAD is not rerun until it can be settled.
+        """
         if self.discussion is None:
-            return ()
+            return
+        for run in self.state.pending():
+            if run.profile != self.profile:
+                continue
+            try:
+                reviews = self.discussion.reviews(run.pr)
+            except GhError as exc:
+                log.warning("PR #%d: review outcome still unknown: %s", run.pr, exc)
+                continue
+            if run.comment_ids:
+                review_id = self._reply_review(run, reviews)
+                if review_id is not None:
+                    log.info("PR #%d: settled a re-review submitted earlier", run.pr)
+                    self._record_reply(run, review_id)
+                    continue
+            elif run.ok:
+                found = carrying_run(reviews, run.head, run.run_id)
+                if found:
+                    self.state.add(run.key(), tuple(sorted(r.id for r in found)))
+                    self.state.drop_pending(run.run_id)
+                    continue
+            self.state.drop_pending(run.run_id)  # nothing was submitted: eligible again
+
+    def _settle(self, pr: PR, cli_ok: bool) -> bool:
+        """Decide a finished run against GitHub. True = recorded as done, False = failed/pending."""
+        run = PendingRun(pr.number, pr.head, self.profile, pr.run_id,
+                         pr.reply.comment_ids if pr.reply else (), cli_ok)
+        if self.discussion is None:
+            return cli_ok
+        if pr.reply is None and not cli_ok:
+            self.state.drop_pending(pr.run_id)
+            return False
         try:
             reviews = self.discussion.reviews(pr.number)
+            head = self.discussion.head(pr.number) if pr.reply is not None else pr.head
         except GhError as exc:
-            log.debug("PR #%d: cannot attribute the review: %s", pr.number, exc)
-            return ()
-        return tuple(sorted(r.id for r in submitted_by_run(reviews, pr.head, pr.run_id)))
+            log.error("PR #%d: cannot verify the review, outcome stays pending: %s", pr.number, exc)
+            if cli_ok:
+                self.state.update_pending(run)  # remember that the CLI itself finished cleanly
+            return False
+        if pr.reply is not None:
+            review_id = self._reply_review(run, reviews)
+            if review_id is None:
+                self.state.drop_pending(pr.run_id)
+                log.error("PR #%d: no valid review of %s carrying this run's id was submitted",
+                          pr.number, pr.head[:7])
+                return False
+            self._record_reply(run, review_id)  # even if the CLI failed after submitting
+            if head != pr.head:
+                log.warning("PR #%d: HEAD moved to %s during the re-review", pr.number, head[:7])
+            return True
+        found = carrying_run(reviews, pr.head, pr.run_id)
+        self.state.drop_pending(pr.run_id)
+        if not found:
+            log.error("PR #%d: review of %s has no submitted review carrying this run's id; "
+                      "it will be retried", pr.number, pr.head[:7])
+            return False
+        self.state.add(self._key(pr), tuple(sorted(r.id for r in found)))
+        return True
 
     def _review(self, pr: PR) -> bool:
         return self._review_batch([pr])[0]
@@ -1401,6 +1518,10 @@ class Watcher:
         for n, pr in enumerate(batch, 1):
             log.info("PR #%d: %s start (%s)%s", pr.number,
                      "re-review after author reply" if pr.reply else "review", pr.head[:7], tag(n))
+        if self.discussion is not None:
+            for pr in batch:  # written down before anything runs: a crash cannot lose the attempt
+                self.state.add_pending(PendingRun(pr.number, pr.head, self.profile, pr.run_id,
+                                                  pr.reply.comment_ids if pr.reply else ()))
         started = [time.monotonic() for _ in batch]
         workspaces: list[Path | None] = [None] * len(batch)
         results: list[bool | None] = [None] * len(batch)  # None = not run yet
@@ -1445,23 +1566,14 @@ class Watcher:
             if elapsed[i] is None:  # failed before a reviewer started
                 elapsed[i] = time.monotonic() - started[i]
 
-        answered: dict[int, int] = {}  # batch index -> verified review id
-        for i, pr in enumerate(batch):
-            if results[i] and pr.reply is not None:
-                review_id = self._verify_reply(pr)
-                results[i] = review_id is not None
-                if review_id is not None:
-                    answered[i] = review_id
+        if self.discussion is not None:
+            results = [self._settle(pr, bool(ok)) for pr, ok in zip(batch, results)]
 
         self.failed = set()
         for n, (pr, ok) in enumerate(zip(batch, results), 1):
             if ok:
-                if pr.reply is not None:  # only a verified review marks the comments as answered
-                    self.state.add_replies(
-                        [ReplyKey(pr.number, pr.head, self.profile, c) for c in pr.reply.comment_ids],
-                        answered[n - 1])
-                else:  # only a successful review is recorded
-                    self.state.add(self._key(pr), self._attribute(pr))
+                if self.discussion is None:  # no GitHub check available: a clean exit is the record
+                    self.state.add(self._key(pr))
                 log.info("PR #%d: review done in %s%s", pr.number, _fmt_elapsed(elapsed[n - 1]),
                          tag(n))
             else:
