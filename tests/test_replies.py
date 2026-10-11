@@ -37,6 +37,9 @@ class FakeDiscussion:
         self.review_calls = self.comment_calls = 0
         self.fail = False
 
+    def viewer(self):
+        return "Reviewer"  # the CLI's own gh login; compared case-insensitively
+
     def reviews(self, number):
         self.review_calls += 1
         if self.fail:
@@ -167,7 +170,7 @@ class TriggerTests(ReplyBase):
         self.watcher(d, [pr]).cycle()
         self.assertEqual(len(self.calls), 1)
         self.assertIsNone(self.calls[0].reply)
-        self.assertEqual(d.review_calls, 0)
+        self.assertEqual(d.comment_calls, 0)  # no reply search; reviews read only to attribute
 
     def test_no_review_label_and_draft_filtering_still_apply(self):
         d = self.blocked()
@@ -190,7 +193,77 @@ class TriggerTests(ReplyBase):
         self.assertEqual([p.number for p in w._next_batch(prs)], [7])
 
 
+class AttributionTests(ReplyBase):
+    def test_other_profile_within_two_minutes_is_not_reopened(self):
+        # A (luna) finished with +1 at +5 (recorded 12:05:30); B's -1 follows 30s later
+        self.state._records = [m.ReviewRecord(7, HEAD, "luna", "2026-10-01T12:05:30Z")]
+        b_block = m.GhReview(1, "reviewer", "COMMENTED", marker("-1"), HEAD, "2026-10-01T12:06:00Z")
+        d = FakeDiscussion([review(0, 5, "+1"), b_block], [comment(10, 7)])
+        self.watcher(d).cycle()
+        self.assertEqual(self.calls, [])
+
+    def test_attributed_review_ids_decide_ownership(self):
+        self.state._records = [m.ReviewRecord(7, HEAD, "luna", ts(5), (1,))]
+        d = FakeDiscussion([review(1, 4)], [comment(10, 6)])
+        self.watcher(d).cycle()
+        self.assertEqual(len(self.calls), 1)
+        self.calls.clear()
+        # the latest -1 is someone else's review: not owned by this profile
+        d = FakeDiscussion([review(1, 4), review(2, 5)], [comment(10, 6)])
+        self.watcher(d).cycle()
+        self.assertEqual(self.calls, [])
+
+    def test_changes_requested_marker_is_not_a_blocker(self):
+        d = FakeDiscussion([review(1, 4, state="CHANGES_REQUESTED")], [comment(10, 6)])
+        self.watcher(d).cycle()
+        self.assertEqual(self.calls, [])
+
+    def test_normal_review_records_its_review_ids(self):
+        d = FakeDiscussion()
+        pr = m.PR(9, HEAD, False, "u", "t")
+        d.review_list = [review(5, 0, login="reviewer"), review(6, 1, login="someone")]
+        w = self.watcher(d, [pr])
+        with mock.patch.object(m, "datetime", wraps=m.datetime) as dt:
+            dt.now.return_value = T0 - timedelta(minutes=1)
+            dt.fromisoformat = m.datetime.fromisoformat
+            w.cycle()
+        record = [r for r in self.state.records() if r.pr == 9][0]
+        self.assertEqual(record.review_ids, (5,))  # only the reviewer account's own review
+
+
 class VerificationTests(ReplyBase):
+    def test_unrelated_reviews_do_not_complete_a_reply(self):
+        d = self.blocked()
+        w = self.watcher(d)
+        others = [
+            m.GhReview(2, "reviewer", "APPROVED", marker("+1"), HEAD, ts(8)),
+            m.GhReview(3, "reviewer", "CHANGES_REQUESTED", marker("-1"), HEAD, ts(8)),
+            m.GhReview(4, "reviewer", "COMMENTED", "", HEAD, ts(8)),
+            m.GhReview(5, "reviewer", "COMMENTED", f"-1\nHEAD: {HEAD}\n", HEAD, ts(8)),
+            m.GhReview(6, "someone-else", "COMMENTED", marker("-1"), HEAD, ts(8)),
+            m.GhReview(7, "reviewer", "COMMENTED", marker("-1", "b" * 40), "b" * 40, ts(8)),
+        ]
+
+        def reviewer(s, r, pr, ws):
+            d.review_list.extend(others)
+            return True
+        w.reviewer = reviewer
+        with self.assertLogs("misscat", "ERROR"):
+            w.cycle()
+        self.assertEqual(self.state.handled(), set())
+
+    def test_verified_reply_stores_the_answering_review_id(self):
+        d = self.blocked()
+        w = self.watcher(d)
+
+        def reviewer(s, r, pr, ws):
+            d.review_list.append(review(9, 8, "+1"))
+            return True
+        w.reviewer = reviewer
+        w.cycle()
+        self.assertEqual(self.state.review_ids(self.key), {9})
+
+
     def test_exit_zero_without_review_is_not_recorded_and_retries(self):
         d = self.blocked()
         w = self.watcher(d)
@@ -279,10 +352,10 @@ class PollingTests(ReplyBase):
 
 class StateTests(ReplyBase):
     def test_replies_persist_and_old_v2_files_load(self):
-        self.state.add_replies([m.ReplyKey(7, HEAD, "luna", 10)])
+        self.state.add_replies([m.ReplyKey(7, HEAD, "luna", 10)], 2)
         again = m.State(m.state_path(REPO))
         self.assertEqual(again.handled(), {m.ReplyKey(7, HEAD, "luna", 10)})
-        self.assertIsNotNone(again.handled_time(self.key))
+        self.assertEqual(again.review_ids(self.key), {2})
         data = json.loads(m.state_path(REPO).read_text())
         data.pop("replies")
         m.state_path(REPO).write_text(json.dumps(data))
@@ -300,7 +373,7 @@ class StateTests(ReplyBase):
             m.State(path)
 
     def test_removing_a_review_keeps_replies(self):
-        self.state.add_replies([m.ReplyKey(7, HEAD, "luna", 10)])
+        self.state.add_replies([m.ReplyKey(7, HEAD, "luna", 10)], 2)
         self.state._records = [m.ReviewRecord(7, HEAD, "luna", ts(5))]
         self.assertTrue(self.state.remove_latest(self.key))
         self.assertEqual(len(m.State(m.state_path(REPO)).handled()), 1)

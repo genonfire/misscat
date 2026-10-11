@@ -420,7 +420,6 @@ def gh_open_prs(repo: str) -> list[PR]:
 
 # --------------------------------------------------------------------------- same-HEAD replies
 
-REPLY_SKEW = 120.0  # seconds: tolerated clock difference between GitHub and the local state clock
 MAX_PAGES = 20
 _MARKER_RE = re.compile(r"\A(\+1|\+2|-1)\r?\nHEAD: ([0-9a-f]{40})\r?\n(.*)\Z", re.DOTALL)
 
@@ -458,6 +457,7 @@ class GhDiscussion:
 
     def __init__(self, repo: str):
         self.repo = repo
+        self._viewer = ""
 
     @staticmethod
     def _api(path: str):
@@ -501,6 +501,15 @@ class GhDiscussion:
         except (KeyError, TypeError, ValueError, AttributeError) as exc:
             raise GhError(f"unexpected gh output: {exc}") from exc
 
+    def viewer(self) -> str:
+        """Login the reviewer CLI submits as (the user's own `gh` credentials); cached."""
+        if not self._viewer:
+            try:
+                self._viewer = str(self._api("user")["login"])
+            except (KeyError, TypeError) as exc:
+                raise GhError(f"unexpected gh output: {exc}") from exc
+        return self._viewer
+
     def head(self, number: int) -> str:
         try:
             return str(self._api(f"repos/{self.repo}/pulls/{number}")["head"]["sha"])
@@ -508,22 +517,32 @@ class GhDiscussion:
             raise GhError(f"unexpected gh output: {exc}") from exc
 
 
+def marker_verdict(review: GhReview, head: str) -> str | None:
+    """`+1`/`+2`/`-1` of a submitted COMMENTED review that is a valid marker for exactly `head`."""
+    if review.state != "COMMENTED" or not review.submitted_at:
+        return None
+    match = _MARKER_RE.match(review.body)
+    if not match or not match.group(3).strip():
+        return None
+    if match.group(2) != head or review.commit_id != head:
+        return None
+    return match.group(1)
+
+
 def blocking_review(reviews: list[GhReview], head: str) -> GhReview | None:
     """The latest substantive marker review of `head` if it is a `-1`, else None.
 
-    Only submitted reviews count (not issue comments or inline comments). A marker is
+    Only submitted COMMENTED reviews count (not issue comments, inline comments, APPROVED or
+    CHANGES_REQUESTED, as in BadCat's protocol). A marker is
     `+1|+2|-1`, then `HEAD: <sha>` equal to the review's commit and `head`, then evidence.
     A later marker review on the same HEAD (a pass, or a newer `-1`) supersedes earlier ones.
     """
     latest = None
-    submitted = [r for r in reviews if r.submitted_at and r.state not in ("PENDING", "DISMISSED")]
+    submitted = [r for r in reviews if r.submitted_at]
     for review in sorted(submitted, key=lambda r: (_instant(r.submitted_at), r.id)):
-        match = _MARKER_RE.match(review.body)
-        if not match or not match.group(3).strip():
-            continue
-        if match.group(2) != head or review.commit_id != head:
-            continue
-        latest = review if match.group(1) == "-1" else None
+        verdict = marker_verdict(review, head)
+        if verdict is not None:
+            latest = review if verdict == "-1" else None
     return latest
 
 
@@ -954,6 +973,7 @@ class ReplyRecord:
     profile: str | None
     comment_id: int
     handled_at: str  # UTC ISO 8601, recorded when the triggered review was verified
+    review_id: int = 0  # the verified review that answered it
 
     def key(self) -> ReplyKey:
         return ReplyKey(self.pr, self.head, self.profile, self.comment_id)
@@ -965,6 +985,7 @@ class ReviewRecord:
     head: str
     profile: str | None
     reviewed_at: str  # UTC ISO 8601, recorded when the reviewer completes successfully
+    review_ids: tuple[int, ...] = ()  # GitHub reviews this run submitted (empty: not attributed)
 
     def key(self) -> Key:
         return Key(self.pr, self.head, self.profile)
@@ -1029,7 +1050,10 @@ class State:
                 parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
                 if parsed.tzinfo is None or parsed.utcoffset() is None:
                     raise ValueError("reviewed_at must have a timezone")
-                result.append(ReviewRecord(item["pr"], item["head"], item["profile"], ts))
+                ids = item.get("review_ids", [])
+                if not isinstance(ids, list) or not all(type(i) is int and i > 0 for i in ids):
+                    raise ValueError("review_ids must be a list of ids")
+                result.append(ReviewRecord(item["pr"], item["head"], item["profile"], ts, tuple(ids)))
             replies = raw.get("replies", [])
             if not isinstance(replies, list):
                 raise ValueError("replies must be a list")
@@ -1039,13 +1063,15 @@ class State:
                         or not item["head"] or not (item.get("profile") is None
                         or isinstance(item["profile"], str))
                         or type(item.get("comment_id")) is not int or item["comment_id"] <= 0
-                        or not isinstance(item.get("handled_at"), str)):
+                        or not isinstance(item.get("handled_at"), str)
+                        or type(item.get("review_id", 0)) is not int):
                     raise ValueError("malformed reply entry")
                 parsed = datetime.fromisoformat(item["handled_at"].replace("Z", "+00:00"))
                 if parsed.tzinfo is None or parsed.utcoffset() is None:
                     raise ValueError("handled_at must have a timezone")
                 self._replies.append(ReplyRecord(item["pr"], item["head"], item["profile"],
-                                                 item["comment_id"], item["handled_at"]))
+                                                 item["comment_id"], item["handled_at"],
+                                                 item.get("review_id", 0)))
             return result
         except (OSError, ValueError, KeyError, TypeError) as exc:
             raise StateError(
@@ -1056,13 +1082,14 @@ class State:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         rows = sorted(records, key=lambda r: (r.pr, r.head, r.profile or ""))
         data: dict = {"version": 2, "reviewed": [
-            {"pr": r.pr, "head": r.head, "profile": r.profile, "reviewed_at": r.reviewed_at}
+            {"pr": r.pr, "head": r.head, "profile": r.profile, "reviewed_at": r.reviewed_at,
+             **({"review_ids": list(r.review_ids)} if r.review_ids else {})}
             for r in rows
         ]}
         if replies:
             data["replies"] = [
                 {"pr": r.pr, "head": r.head, "profile": r.profile, "comment_id": r.comment_id,
-                 "handled_at": r.handled_at}
+                 "handled_at": r.handled_at, "review_id": r.review_id}
                 for r in sorted(replies, key=lambda r: (r.pr, r.head, r.profile or "", r.comment_id))
             ]
         _write_atomic(self.path, json.dumps(data, indent=2) + "\n")
@@ -1073,11 +1100,11 @@ class State:
     def records(self) -> list[ReviewRecord]:
         return list(self._records)
 
-    def add(self, key: Key) -> None:
+    def add(self, key: Key, review_ids: tuple[int, ...] = ()) -> None:
         if key in self._reviewed:
             return
         timestamp = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
-        records = [*self._records, ReviewRecord(*key, timestamp)]
+        records = [*self._records, ReviewRecord(*key, timestamp, review_ids)]
         self._write(records, self._replies)
         self._records = records
         self._reviewed.add(key)
@@ -1088,18 +1115,20 @@ class State:
     def handled(self) -> set[ReplyKey]:
         return self._handled
 
-    def handled_time(self, key: Key) -> str | None:
-        """Latest time a same-HEAD reply review of this PR/HEAD/profile was verified."""
-        times = [r.handled_at for r in self._replies if (r.pr, r.head, r.profile) == key]
-        return max(times, key=_instant) if times else None
+    def review_ids(self, key: Key) -> set[int]:
+        """GitHub reviews known to have been submitted by this profile for this PR HEAD."""
+        ids = {i for r in self._records if r.key() == key for i in r.review_ids}
+        ids.update(r.review_id for r in self._replies
+                   if (r.pr, r.head, r.profile) == key and r.review_id)
+        return ids
 
-    def add_replies(self, keys: list[ReplyKey]) -> None:
+    def add_replies(self, keys: list[ReplyKey], review_id: int) -> None:
         """Record author comments as answered by one verified same-HEAD review."""
         new = [k for k in keys if k not in self._handled]
         if not new:
             return
         timestamp = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
-        replies = [*self._replies, *(ReplyRecord(*k, timestamp) for k in new)]
+        replies = [*self._replies, *(ReplyRecord(*k, timestamp, review_id) for k in new)]
         self._write(self._records, replies)
         self._replies = replies
         self._handled.update(new)
@@ -1303,12 +1332,18 @@ class Watcher:
         block = blocking_review(reviews, pr.head)
         if block is None:
             return None
-        # This profile only answers the `-1` it can have written: one submitted no later than its
-        # own completed review (or last verified reply), so another stage's `-1` is not reopened.
+        # Only the `-1` this profile itself submitted is answered, so another stage's blocker is
+        # never reopened. Reviews are attributed by id. A record from before attribution existed
+        # falls back to ordering: the `-1` must precede the local completion time of the review.
         key = self._key(pr)
-        anchors = [t for t in (self.state.review_time(key), self.state.handled_time(key)) if t]
-        if not anchors or (_instant(block.submitted_at) - max(map(_instant, anchors))).total_seconds() > REPLY_SKEW:
-            return None
+        owned = self.state.review_ids(key)
+        if owned:
+            if block.id not in owned:
+                return None
+        else:
+            completed = self.state.review_time(key)
+            if completed is None or _instant(block.submitted_at) > _instant(completed):
+                return None
         blocked_at = _instant(block.submitted_at)
         new = [c for c in self.discussion.comments(pr.number)
                if c.login.lower() == pr.author.lower() and _instant(c.created_at) > blocked_at
@@ -1319,25 +1354,46 @@ class Watcher:
         return ReplyTrigger(tuple(c.id for c in new), tuple(c.url for c in new), block.id,
                             frozenset(r.id for r in reviews))
 
-    def _verify_reply(self, pr: PR) -> bool:
-        """True only if the reviewer really submitted a new review of this exact HEAD."""
+    def _submitted_by_run(self, pr: PR, reviews: list[GhReview], known: frozenset[int],
+                          after: datetime | None = None) -> list[GhReview]:
+        """New valid verdict reviews of exactly pr.head submitted as the reviewer's own account."""
+        assert self.discussion is not None
+        viewer = self.discussion.viewer().lower()
+        return [r for r in reviews
+                if r.id not in known and marker_verdict(r, pr.head) is not None
+                and r.login.lower() == viewer
+                and (after is None or _instant(r.submitted_at) >= after)]
+
+    def _verify_reply(self, pr: PR) -> int | None:
+        """Id of the review this run submitted for the exact HEAD, or None (not a success)."""
         assert self.discussion is not None and pr.reply is not None
         try:
             head = self.discussion.head(pr.number)
             reviews = self.discussion.reviews(pr.number)
+            new = self._submitted_by_run(pr, reviews, pr.reply.known_review_ids)
         except GhError as exc:
             log.error("PR #%d: cannot verify the re-review: %s", pr.number, exc)
-            return False
+            return None
         if head != pr.head:
             log.warning("PR #%d: HEAD changed during the re-review (%s -> %s)", pr.number,
                         pr.head[:7], head[:7])
-            return False
-        if not any(r.id not in pr.reply.known_review_ids and r.submitted_at
-                   and r.state != "PENDING" and r.commit_id == pr.head for r in reviews):
-            log.error("PR #%d: reviewer exited without submitting a review of %s", pr.number,
-                      pr.head[:7])
-            return False
-        return True
+            return None
+        if not new:
+            log.error("PR #%d: reviewer exited without submitting a valid review of %s",
+                      pr.number, pr.head[:7])
+            return None
+        return max(r.id for r in new)
+
+    def _attribute(self, pr: PR, started: datetime) -> tuple[int, ...]:
+        """Best effort: ids of the valid reviews a normal run just submitted (never fails a run)."""
+        if self.discussion is None:
+            return ()
+        try:
+            reviews = self.discussion.reviews(pr.number)
+            return tuple(sorted(r.id for r in self._submitted_by_run(pr, reviews, frozenset(), started)))
+        except GhError as exc:
+            log.debug("PR #%d: cannot attribute the review: %s", pr.number, exc)
+            return ()
 
     def _review(self, pr: PR) -> bool:
         return self._review_batch([pr])[0]
@@ -1350,6 +1406,7 @@ class Watcher:
             log.info("PR #%d: %s start (%s)%s", pr.number,
                      "re-review after author reply" if pr.reply else "review", pr.head[:7], tag(n))
         started = [time.monotonic() for _ in batch]
+        run_started = datetime.now(timezone.utc)
         workspaces: list[Path | None] = [None] * len(batch)
         results: list[bool | None] = [None] * len(batch)  # None = not run yet
         elapsed: list[float | None] = [None] * len(batch)
@@ -1393,18 +1450,23 @@ class Watcher:
             if elapsed[i] is None:  # failed before a reviewer started
                 elapsed[i] = time.monotonic() - started[i]
 
+        answered: dict[int, int] = {}  # batch index -> verified review id
         for i, pr in enumerate(batch):
             if results[i] and pr.reply is not None:
-                results[i] = self._verify_reply(pr)
+                review_id = self._verify_reply(pr)
+                results[i] = review_id is not None
+                if review_id is not None:
+                    answered[i] = review_id
 
         self.failed = set()
         for n, (pr, ok) in enumerate(zip(batch, results), 1):
             if ok:
                 if pr.reply is not None:  # only a verified review marks the comments as answered
                     self.state.add_replies(
-                        [ReplyKey(pr.number, pr.head, self.profile, c) for c in pr.reply.comment_ids])
-                else:
-                    self.state.add(self._key(pr))  # only a successful review is recorded
+                        [ReplyKey(pr.number, pr.head, self.profile, c) for c in pr.reply.comment_ids],
+                        answered[n - 1])
+                else:  # only a successful review is recorded
+                    self.state.add(self._key(pr), self._attribute(pr, run_started))
                 log.info("PR #%d: review done in %s%s", pr.number, _fmt_elapsed(elapsed[n - 1]),
                          tag(n))
             else:
