@@ -38,6 +38,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -388,6 +389,7 @@ class PR:
     author: str = ""  # PR author login; empty = unknown, which disables same-HEAD reply triggers
     updated_at: str = ""  # cheap change cursor from the PR listing
     reply: "ReplyTrigger | None" = None  # set only on a same-HEAD re-review picked by the watcher
+    run_id: str = ""  # per-run nonce the reviewer must echo in its review (set by the watcher)
 
 
 URGENT_LABEL = "urgent"
@@ -421,6 +423,7 @@ def gh_open_prs(repo: str) -> list[PR]:
 # --------------------------------------------------------------------------- same-HEAD replies
 
 MAX_PAGES = 20
+RUN_PREFIX = "MissCat-Run:"
 _MARKER_RE = re.compile(r"\A(\+1|\+2|-1)\r?\nHEAD: ([0-9a-f]{40})\r?\n(.*)\Z", re.DOTALL)
 
 
@@ -449,7 +452,6 @@ class ReplyTrigger:
     comment_ids: tuple[int, ...]  # unhandled author comments after the blocking review, oldest first
     comment_urls: tuple[str, ...]
     blocking_review_id: int
-    known_review_ids: frozenset[int]  # reviews that existed when the run was selected
 
 
 class GhDiscussion:
@@ -457,7 +459,6 @@ class GhDiscussion:
 
     def __init__(self, repo: str):
         self.repo = repo
-        self._viewer = ""
 
     @staticmethod
     def _api(path: str):
@@ -501,15 +502,6 @@ class GhDiscussion:
         except (KeyError, TypeError, ValueError, AttributeError) as exc:
             raise GhError(f"unexpected gh output: {exc}") from exc
 
-    def viewer(self) -> str:
-        """Login the reviewer CLI submits as (the user's own `gh` credentials); cached."""
-        if not self._viewer:
-            try:
-                self._viewer = str(self._api("user")["login"])
-            except (KeyError, TypeError) as exc:
-                raise GhError(f"unexpected gh output: {exc}") from exc
-        return self._viewer
-
     def head(self, number: int) -> str:
         try:
             return str(self._api(f"repos/{self.repo}/pulls/{number}")["head"]["sha"])
@@ -522,11 +514,29 @@ def marker_verdict(review: GhReview, head: str) -> str | None:
     if review.state != "COMMENTED" or not review.submitted_at:
         return None
     match = _MARKER_RE.match(review.body)
-    if not match or not match.group(3).strip():
+    evidence = "\n".join(line for line in match.group(3).splitlines()
+                         if not line.strip().startswith(RUN_PREFIX)) if match else ""
+    if not match or not evidence.strip():  # the run id line alone is not evidence
         return None
     if match.group(2) != head or review.commit_id != head:
         return None
     return match.group(1)
+
+
+def run_line(run_id: str) -> str:
+    return f"{RUN_PREFIX} {run_id}"
+
+
+def submitted_by_run(reviews: list[GhReview], head: str, run_id: str) -> list[GhReview]:
+    """Valid verdict reviews of exactly `head` that carry this run's nonce line.
+
+    The nonce is generated per run and given only to that run's reviewer, so neither another
+    stage, a manual review nor another run on the same GitHub account can be mistaken for it.
+    """
+    if not run_id:
+        return []
+    return [r for r in reviews if marker_verdict(r, head) is not None
+            and run_line(run_id) in (line.strip() for line in r.body.splitlines())]
 
 
 def blocking_review(reviews: list[GhReview], head: str) -> GhReview | None:
@@ -923,6 +933,12 @@ def build_prompt(settings: Settings, repo: str, pr: PR) -> str:
         "The current directory is a checkout of exactly this HEAD.\n"
         "Review exactly this HEAD. Do not modify code, push commits, or merge."
     )
+    if pr.run_id:
+        context += (
+            "\n\nWhen you submit your PR Review, make the last line of its body exactly "
+            f"`{run_line(pr.run_id)}` (after the verdict and evidence). This run identifier is "
+            "required; do not reuse it anywhere else."
+        )
     if pr.reply is not None:
         urls = "\n".join(f"  - {url}" for url in pr.reply.comment_urls if url)
         context += (
@@ -1108,9 +1124,6 @@ class State:
         self._write(records, self._replies)
         self._records = records
         self._reviewed.add(key)
-
-    def review_time(self, key: Key) -> str | None:
-        return next((r.reviewed_at for r in self._records if r.key() == key), None)
 
     def handled(self) -> set[ReplyKey]:
         return self._handled
@@ -1332,18 +1345,11 @@ class Watcher:
         block = blocking_review(reviews, pr.head)
         if block is None:
             return None
-        # Only the `-1` this profile itself submitted is answered, so another stage's blocker is
-        # never reopened. Reviews are attributed by id. A record from before attribution existed
-        # falls back to ordering: the `-1` must precede the local completion time of the review.
-        key = self._key(pr)
-        owned = self.state.review_ids(key)
-        if owned:
-            if block.id not in owned:
-                return None
-        else:
-            completed = self.state.review_time(key)
-            if completed is None or _instant(block.submitted_at) > _instant(completed):
-                return None
+        # Only the `-1` that one of this profile's own runs submitted is answered (proved by the
+        # run nonce, stored as a review id). A record without ids (made before attribution
+        # existed, or whose reviewer omitted the nonce) is never guessed at: no trigger.
+        if block.id not in self.state.review_ids(self._key(pr)):
+            return None
         blocked_at = _instant(block.submitted_at)
         new = [c for c in self.discussion.comments(pr.number)
                if c.login.lower() == pr.author.lower() and _instant(c.created_at) > blocked_at
@@ -1351,26 +1357,14 @@ class Watcher:
         if not new:
             return None
         new.sort(key=lambda c: (_instant(c.created_at), c.id))
-        return ReplyTrigger(tuple(c.id for c in new), tuple(c.url for c in new), block.id,
-                            frozenset(r.id for r in reviews))
-
-    def _submitted_by_run(self, pr: PR, reviews: list[GhReview], known: frozenset[int],
-                          after: datetime | None = None) -> list[GhReview]:
-        """New valid verdict reviews of exactly pr.head submitted as the reviewer's own account."""
-        assert self.discussion is not None
-        viewer = self.discussion.viewer().lower()
-        return [r for r in reviews
-                if r.id not in known and marker_verdict(r, pr.head) is not None
-                and r.login.lower() == viewer
-                and (after is None or _instant(r.submitted_at) >= after)]
+        return ReplyTrigger(tuple(c.id for c in new), tuple(c.url for c in new), block.id)
 
     def _verify_reply(self, pr: PR) -> int | None:
         """Id of the review this run submitted for the exact HEAD, or None (not a success)."""
         assert self.discussion is not None and pr.reply is not None
         try:
             head = self.discussion.head(pr.number)
-            reviews = self.discussion.reviews(pr.number)
-            new = self._submitted_by_run(pr, reviews, pr.reply.known_review_ids)
+            new = submitted_by_run(self.discussion.reviews(pr.number), pr.head, pr.run_id)
         except GhError as exc:
             log.error("PR #%d: cannot verify the re-review: %s", pr.number, exc)
             return None
@@ -1379,34 +1373,35 @@ class Watcher:
                         pr.head[:7], head[:7])
             return None
         if not new:
-            log.error("PR #%d: reviewer exited without submitting a valid review of %s",
-                      pr.number, pr.head[:7])
+            log.error("PR #%d: reviewer exited without submitting a valid review of %s carrying "
+                      "this run's id", pr.number, pr.head[:7])
             return None
         return max(r.id for r in new)
 
-    def _attribute(self, pr: PR, started: datetime) -> tuple[int, ...]:
-        """Best effort: ids of the valid reviews a normal run just submitted (never fails a run)."""
+    def _attribute(self, pr: PR) -> tuple[int, ...]:
+        """Best effort: ids of the reviews this normal run submitted (never fails the run)."""
         if self.discussion is None:
             return ()
         try:
             reviews = self.discussion.reviews(pr.number)
-            return tuple(sorted(r.id for r in self._submitted_by_run(pr, reviews, frozenset(), started)))
         except GhError as exc:
             log.debug("PR #%d: cannot attribute the review: %s", pr.number, exc)
             return ()
+        return tuple(sorted(r.id for r in submitted_by_run(reviews, pr.head, pr.run_id)))
 
     def _review(self, pr: PR) -> bool:
         return self._review_batch([pr])[0]
 
     def _review_batch(self, batch: list[PR]) -> list[bool]:
         """Review `batch` concurrently, wait for all of it, then record the successes."""
+        if self.discussion is not None:  # one nonce per run: proves which run submitted a review
+            batch = [replace(pr, run_id=secrets.token_hex(8)) for pr in batch]
         tag = (lambda n: f" [cat-{n}]") if self.cats > 1 else (lambda n: "")
         _log_review_separator()
         for n, pr in enumerate(batch, 1):
             log.info("PR #%d: %s start (%s)%s", pr.number,
                      "re-review after author reply" if pr.reply else "review", pr.head[:7], tag(n))
         started = [time.monotonic() for _ in batch]
-        run_started = datetime.now(timezone.utc)
         workspaces: list[Path | None] = [None] * len(batch)
         results: list[bool | None] = [None] * len(batch)  # None = not run yet
         elapsed: list[float | None] = [None] * len(batch)
@@ -1466,7 +1461,7 @@ class Watcher:
                         [ReplyKey(pr.number, pr.head, self.profile, c) for c in pr.reply.comment_ids],
                         answered[n - 1])
                 else:  # only a successful review is recorded
-                    self.state.add(self._key(pr), self._attribute(pr, run_started))
+                    self.state.add(self._key(pr), self._attribute(pr))
                 log.info("PR #%d: review done in %s%s", pr.number, _fmt_elapsed(elapsed[n - 1]),
                          tag(n))
             else:
