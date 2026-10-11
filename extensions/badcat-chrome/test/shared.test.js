@@ -25,7 +25,7 @@ test('isConversationUrl only accepts https://chatgpt.com conversations', () => {
 test('parseEvent accepts only a well-formed +1 for the watched repo', () => {
   const ok = { repo: 'Neverworkalone/typewriter', pr: 123, head: HEAD, status: '+1', review_id: 100, delivery_id: 'c'.repeat(32) };
   assert.deepEqual(S.parseEvent(ok, 'neverworkalone/typewriter'),
-    { repo: 'neverworkalone/typewriter', pr: 123, head: HEAD, review_id: 100, delivery_id: 'c'.repeat(32) });
+    { repo: 'neverworkalone/typewriter', pr: 123, head: HEAD, status: '+1', review_id: 100, delivery_id: 'c'.repeat(32) });
   const bad = [
     { ...ok, status: '+2' }, { ...ok, status: '-1' }, { ...ok, status: undefined },
     { ...ok, repo: 'other/repo' }, { ...ok, repo: 'a/b/c' },
@@ -41,6 +41,13 @@ test('parseEvent accepts only a well-formed +1 for the watched repo', () => {
   for (const message of bad) {
     assert.equal(S.parseEvent(message, 'neverworkalone/typewriter'), null, JSON.stringify(message));
   }
+});
+
+test('normalized events can be validated again across script boundaries', () => {
+  const raw = { repo: 'O/R', pr: 558, head: HEAD, status: '+1',
+    review_id: 5481963549, delivery_id: 'c'.repeat(32), legacy_review_id: 100 };
+  const normalized = S.parseEvent(raw, 'o/r');
+  assert.deepEqual(S.parseEvent(normalized, 'o/r'), normalized);
 });
 
 test('reviewMessage is fixed text built from a validated integer', () => {
