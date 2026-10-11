@@ -149,11 +149,12 @@ def run(name, head=A, conclusion="success", status="completed", app="github-acti
 
 
 class FakeClient:
-    def __init__(self, head=A, draft=False, reviews=None):
-        self.head, self.draft = head, draft
+    def __init__(self, head=A, draft=False, reviews=None, labels=()):
+        self.head, self.draft, self.labels = head, draft, frozenset(labels)
         self.review_list = reviews if reviews is not None else seq(rev("+1", A), rev("+2", A))
         self.raw = {"state": "open", "merged": False, "mergeable": True, "mergeable_state": "clean",
-                    "draft": draft, "head": {"sha": head}}
+                    "draft": draft, "head": {"sha": head},
+                    "labels": [{"name": label} for label in self.labels]}
         self.runs = [run("Validate and test Typewriter", head)]
         self.workflows = []
         self.status = {"state": "pending", "total_count": 0, "sha": head}
@@ -167,7 +168,7 @@ class FakeClient:
 
     def open_prs(self):
         self._maybe_fail("open_prs")
-        return [OpenPR(7, self.head, self.draft, "u", "t")] if self.open else []
+        return [OpenPR(7, self.head, self.draft, "u", "t", self.labels)] if self.open else []
 
     def pr(self, n):
         self._maybe_fail("pr")
@@ -248,6 +249,57 @@ class WatcherTests(unittest.TestCase):
                 c.review_list = seq(rev("+1", A), rev("+2", A))
                 self.run_cycle(w)
                 self.assertEqual(c.calls, [("merge", 7, A)])
+
+    def test_batch_label_merges_at_plus_one_only_in_merge_two(self):
+        for merge in (2, True):
+            for labels, expected in (
+                (("batch",), True),
+                (("Batch",), False),
+                (("urgent",), False),
+                (("batch", "urgent"), False),
+                ((), False),
+            ):
+                with self.subTest(merge=merge, labels=labels):
+                    c = FakeClient(reviews=seq(rev("+1", A)), labels=labels)
+                    self.run_cycle(self.watcher(c, merge=merge))
+                    self.assertEqual(c.calls, [("merge", 7, A)] if expected else [])
+        c = FakeClient(reviews=seq(rev("+1", A)), labels=("batch",))
+        self.run_cycle(self.watcher(c))  # notify-only remains +2
+        self.assertEqual(c.calls, [])
+        c = FakeClient(reviews=seq(rev("+1", A)), labels=("batch", "urgent"))
+        self.run_cycle(self.watcher(c, merge=1))  # explicit +1 mode is unchanged
+        self.assertEqual(c.calls, [("merge", 7, A)])
+
+    def test_batch_merge_rereads_labels_before_write(self):
+        c = FakeClient(reviews=seq(rev("+1", A)), labels=("batch",))
+        raw = c.raw
+        reads = 0
+        def pr(number):
+            nonlocal reads
+            reads += 1
+            return raw if reads == 1 else {**raw, "labels": []}
+        c.pr = pr
+        self.run_cycle(self.watcher(c, merge=2))
+        self.assertEqual(reads, 2)
+        self.assertEqual(c.calls, [], "batch removal before merge must revoke +1 access")
+
+    def test_batch_merge_keeps_protocol_and_ci_gates(self):
+        cases = (
+            (seq(rev("+1", A), rev("-1", A)), None),
+            (seq(rev("+1", A), rev(None, A, text="invalid review")), None),
+            (seq(rev("+1", B)), None),
+            (seq(rev("+1", A, login="other")), None),
+            (seq(rev("+1", A)), lambda c: c.runs.clear()),
+            (seq(rev("+1", A)), lambda c: c.runs.__setitem__(0, run("CI", conclusion="failure"))),
+            (seq(rev("+1", A)), lambda c: c.raw.update(head={"sha": B})),
+        )
+        for reviews, mutate in cases:
+            with self.subTest(reviews=[r.body[:2] for r in reviews], mutate=mutate):
+                c = FakeClient(reviews=reviews, labels=("batch",))
+                if mutate:
+                    mutate(c)
+                self.run_cycle(self.watcher(c, merge=2))
+                self.assertEqual(c.calls, [])
 
     def test_merge_level_one_preserves_blockers_and_all_external_gates(self):
         invalid = [
@@ -674,6 +726,15 @@ class LockAndIdentityTests(unittest.TestCase):
 
 
 class GhClientTests(unittest.TestCase):
+    def test_open_prs_carries_exact_labels(self):
+        client = GhClient("o/r")
+        data = {"number": 4, "head": {"sha": A}, "draft": False,
+                "html_url": "u", "title": "t", "labels": [{"name": "batch"}, {"name": "urgent"}]}
+        with mock.patch.object(client, "_pages", return_value=[data]):
+            self.assertEqual(client.open_prs()[0].labels, frozenset({"batch", "urgent"}))
+        with mock.patch.object(client, "_pages", return_value=[{**data, "labels": []}]):
+            self.assertEqual(client.open_prs()[0].labels, frozenset())
+
     def test_merge_request_is_squash_with_sha_guard(self):
         client = GhClient("o/r")
         with mock.patch.object(client, "_api") as api:

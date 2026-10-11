@@ -389,17 +389,20 @@ With `--cat` above 1, log lines carry the cat name (`cat-1`, ...). Each cat runs
 ```bash
 misscat owner/repo luna     # AI review (unchanged)
 badcat owner/repo           # DEFAULT: monitor and report only; NO GitHub writes
-badcat owner/repo --merge   # merge after valid +1 then +2 (same as --merge=2)
-badcat . --merge=1          # merge after valid +1 (without requiring +2)
-badcat . --merge=2          # explicitly require +1 then +2
+badcat owner/repo --merge   # +1 then +2; batch-labeled PRs merge at +1
+badcat . --merge=1          # merge after valid +1 (all PRs)
+badcat . --merge=2          # same as --merge; batch PRs merge at +1
 badcat . --merge --trusted-reviewer luna
 ```
 
 - `.` resolves to the current repository's `origin` exactly as in MissCat.
 - Omitting `--merge` always means **notify only**, with no GitHub writes.
-  A bare `--merge` is an alias for `--merge=2` (existing behavior);
-  `--merge=1` authorizes an eligible PR at a valid `+1`.
-  Only `1` and `2` are accepted. This changes the review threshold,
+  A bare `--merge` is an alias for `--merge=2`.
+  `--merge=1` authorizes any eligible PR at a valid `+1`.
+  `--merge=2` normally requires `+1` then `+2`, but an exactly `batch`-labeled
+  PR may merge at `+1` (`urgent` takes precedence if both labels are present).
+  Labels are checked again immediately before the merge. Only `1` and `2`
+  are accepted. This changes the review threshold,
   **not** the required CI/mergeability checks or final HEAD protection.
 - All **open** PRs are watched, Draft or Ready alike. BadCat never reads, changes or decides from Draft status; if GitHub rejects a merge of a Draft PR, the rejection is reported and BadCat keeps watching.
 - No AI calls, no checkout, no clone. It uses your existing `gh` login (`gh auth login`); no tokens are stored. `--merge` needs a `gh` account with permission to merge.
@@ -429,7 +432,7 @@ The first line is exactly `+1`, `+2` or `-1`: no leading blank or whitespace, de
 
 BadCat reduces submitted, trusted reviews chronologically (review ID breaks timestamp ties). A valid `-1` blocks and resets the approval sequence. A later valid `+1` clears the older blocker and starts a fresh Stage 1 pass; it also resets any earlier Stage 2 authorization. A valid `+2` authorizes Stage 2 only after an effective `+1` in this sequence. Thus `+1 → +2 → -1 → +1` is only `+1`, while `-1 → +1 → +2` is `READY`. Older verdicts remain in GitHub's audit history but no longer authorize or veto the current sequence.
 
-With `--merge` / `--merge=2`, the effective two-stage sequence is required; `--merge=1` accepts effective `+1` or `READY`. A latest trusted malformed/contradictory marker or non-pass review holds the HEAD until a new valid `+1` starts a clean sequence. `+2` alone never authorizes. `APPROVED`, `DISMISSED` and unsubmitted reviews neither pass nor hold; non-`COMMENTED` states never authorize. Reviews on an old HEAD do not carry forward.
+With `--merge` / `--merge=2`, the effective two-stage sequence is required except for `batch` PRs (effective `+1` suffices unless also labeled `urgent`); `--merge=1` accepts effective `+1` or `READY`. A latest trusted malformed/contradictory marker or non-pass review holds the HEAD until a new valid `+1` starts a clean sequence. `+2` alone never authorizes. `APPROVED`, `DISMISSED` and unsubmitted reviews neither pass nor hold; non-`COMMENTED` states never authorize. Reviews on an old HEAD do not carry forward.
 
 ### Trust
 

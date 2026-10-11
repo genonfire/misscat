@@ -15,7 +15,7 @@ from typing import Callable, Optional
 from misscat import GhError, MissCatError, _write_atomic, resolve_repo_arg
 
 from . import __version__
-from .github import GhClient, OpenPR
+from .github import GhClient, OpenPR, pr_labels
 from .protocol import PLUS1, READY, WAITING, Verdict, evaluate
 
 log = logging.getLogger("badcat")
@@ -253,20 +253,24 @@ class Watcher:
     def _verdict(self, number: int, head: str) -> Verdict:
         return evaluate(self.client.reviews(number), head, self.trusted)
 
-    def _review_ready(self, stage: str) -> bool:
-        # Notify-only keeps the historical +2 readiness notification.
-        # --merge=1 may use a valid +1, without relaxing protocol blockers.
-        return stage == READY or (self.merge_level == 1 and stage == PLUS1)
+    def _review_ready(self, stage: str, labels: frozenset[str]) -> bool:
+        # --merge=2 permits +1 only for batch; urgent overrides batch if both appear.
+        return stage == READY or (
+            stage == PLUS1 and (self.merge_level == 1 or
+                                (self.merge_level == 2 and "batch" in labels
+                                 and "urgent" not in labels))
+        )
 
     def _process(self, pr: OpenPR) -> None:
         reviews = self.client.reviews(pr.number)
         verdict = evaluate(reviews, pr.head, self.trusted)
+        eligible = self._review_ready(verdict.stage, pr.labels)
         gate = None
-        if self._review_ready(verdict.stage):
+        if eligible:
             raw = self.client.pr(pr.number)
             gate = merge_gate(self.client, raw, pr.head)
         self._report(pr, reviews, verdict, gate)
-        if self._review_ready(verdict.stage) and gate is None and self.merge:
+        if eligible and gate is None and self.merge:
             self._merge(pr)
 
     def _report(self, pr: OpenPR, reviews: list, verdict: Verdict, gate: Optional[str]) -> None:
@@ -288,7 +292,7 @@ class Watcher:
         if note and (prev is None or prev.get("note") != note):
             log.info("PR #%d: %s", pr.number, note)
         entry = {"head": pr.head, "reviews": [r.id for r in submitted], "note": note, "gate": None}
-        if self._review_ready(verdict.stage):
+        if self._review_ready(verdict.stage, pr.labels):
             entry["gate"] = "ok" if gate is None else gate
             if prev is None or prev.get("head") != pr.head or prev.get("gate") != entry["gate"]:
                 if gate is None:
@@ -300,15 +304,17 @@ class Watcher:
 
     def _merge(self, pr: OpenPR) -> None:
         # Re-read everything from GitHub immediately before the only write.
-        if not self._review_ready(self._verdict(pr.number, pr.head).stage):
-            log.info("PR #%d: review state changed, not merging", pr.number)
-            return
+        verdict = self._verdict(pr.number, pr.head)
         raw = self.client.pr(pr.number)
+        labels = pr_labels(raw)
+        if not self._review_ready(verdict.stage, labels):
+            log.info("PR #%d: review state or labels changed, not merging", pr.number)
+            return
         reason = merge_gate(self.client, raw, pr.head)
         if reason is not None:
             log.info("PR #%d: not merging: %s", pr.number, reason)
             return
-        marker = (pr.head, raw.get("draft"), raw.get("mergeable_state"))
+        marker = (pr.head, raw.get("draft"), raw.get("mergeable_state"), labels)
         if self.rejected.get(pr.number) == marker:
             return  # same rejected situation: no repeated requests
         try:
@@ -347,7 +353,7 @@ def main(argv: Optional[list] = None) -> int:
         description="Watch GitHub PR review results; with --merge, squash-merge eligible PRs.",
         epilog=(
             "Default is notify only: BadCat never writes to GitHub without --merge.\n"
-            "With --merge (equivalent to --merge=2), require a valid +1 followed by +2.\n"
+            "With --merge (equivalent to --merge=2), require +1 then +2 (batch PRs: +1).\n"
             "With --merge=1, require a valid +1; both modes still require no -1,\n"
             "passing CI and a clean GitHub mergeability state.\n"
             "Trusted reviewers: --trusted-reviewer LOGIN (repeatable), default the `gh` user.\n"
