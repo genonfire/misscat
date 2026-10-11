@@ -35,7 +35,7 @@ test('parseEvent accepts only a well-formed +1 for the watched repo', () => {
     { ...ok, delivery_id: undefined }, { ...ok, head: HEAD.toUpperCase() },
     { ...ok, head: HEAD + '\n' }, { ...ok, delivery_id: 'c'.repeat(32) + '\n' },
     { ...ok, repo: ' Neverworkalone/typewriter ' },
-    { ...ok, legacy_review_id: 100 }, { ...ok, legacy_review_id: -1 },
+    { ...ok, legacy_review_id: "100" }, { ...ok, legacy_review_id: -1 },
     { error: 'boom' }, [], null, 'x', 7, undefined,
   ];
   for (const message of bad) {

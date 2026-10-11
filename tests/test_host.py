@@ -174,6 +174,57 @@ class WatcherTests(unittest.TestCase):
         self.assertEqual(self.events[0]["legacy_review_id"], 1)
         self.assertTrue(host.EmittedState(self.path).has(7, A, 10))
 
+    def test_other_pr_mtime_does_not_hide_new_approval_and_restart_is_retryable(self):
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text(json.dumps({"version": 1, "emitted": {"7": [A], "8": [B]}}))
+        os.utime(self.path, (1767225630, 1767225630))  # later than both PR histories
+        c = FakeClient()
+        c.open_prs = lambda: [OpenPR(7, A, False, "u", "t"), OpenPR(8, B, False, "u", "t")]
+        c.reviews = lambda n: ([review(10, "+1", A), review(11, "-1", A), review(20, "+1", A)]
+                              if n == 7 else [review(25, "+1", B)])
+        self.watcher(c, auto_ack=False).cycle()
+        self.assertEqual([(e["pr"], e["review_id"], e["legacy_review_id"]) for e in self.events],
+                         [(7, 20, 10)])
+        saved = json.loads(self.path.read_text())
+        self.assertEqual(saved["baselines"], {"7": {A: 10}, "8": {B: 25}})
+        self.assertEqual(saved["acknowledged"], {})
+        restarted = self.watcher(c, auto_ack=False)
+        restarted.cycle()
+        self.assertEqual([e["review_id"] for e in self.events], [20, 20])
+        self.assertTrue(restarted.acknowledge(self.ack(self.events[-1])))
+        self.watcher(c).cycle()
+        self.assertEqual(len(self.events), 2)
+
+    def test_many_legacy_initial_approvals_do_not_replay_on_upgrade(self):
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text(json.dumps({"version": 1, "emitted": {str(n): [A] for n in range(1, 51)}}))
+        c = FakeClient()
+        c.open_prs = lambda: [OpenPR(n, A, False, "u", "t") for n in range(1, 51)]
+        c.reviews = lambda n: [review(n, "+1", A)]
+        self.watcher(c).cycle()
+        self.watcher(c).cycle()
+        self.assertEqual(self.events, [])
+
+    def test_provisional_mtime_baselines_are_repaired_without_erasing_acks(self):
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text(json.dumps({"version": 2, "legacy": {}, "migration_before": 1767225630,
+                                        "baselines": {"7": {A: 20}}, "acknowledged": {"8": {B: [25]}}}))
+        c = FakeClient(reviews=[review(10, "+1", A), review(11, "-1", A), review(20, "+1", A)])
+        w = self.watcher(c)
+        w.cycle()
+        self.assertEqual([e["review_id"] for e in self.events], [20])
+        self.assertTrue(host.EmittedState(self.path).has(8, B, 25))
+
+    def test_legacy_baseline_uses_only_trusted_valid_current_head_approval(self):
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text(json.dumps({"version": 1, "emitted": {"7": [A]}}))
+        c = FakeClient(reviews=[review(1, "+1", A, login="eve"), review(2, "+1", B),
+                                review(3, "+1", A, state="APPROVED"),
+                                review(4, "+1", A, text="+1: malformed"),
+                                review(10, "+1", A), review(11, "-1", A), review(20, "+1", A)])
+        self.watcher(c).cycle()
+        self.assertEqual(self.events[0]["legacy_review_id"], 10)
+
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)

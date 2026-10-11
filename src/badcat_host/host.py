@@ -26,14 +26,13 @@ import time
 import struct
 import sys
 import threading
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import BinaryIO, Callable, Optional
 
 from misscat import GhError, MissCatError, NAME_RE, OWNER_RE, _write_atomic, canonical_repo
 
 from badcat.github import GhClient, OpenPR
-from badcat.protocol import PLUS1, evaluate
+from badcat.protocol import PLUS1, evaluate, initial_plus1_review_id
 
 from . import __version__
 from .poll import Poller
@@ -122,13 +121,11 @@ class EmittedState:
     def __init__(self, path: Path):
         self.path, self.prs, self.legacy, self.baselines = path, {}, {}, {}
         self.lock = threading.RLock()
-        self.migration_before = None
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
             version = raw.get("version")
             if version == 1:
                 self.legacy = raw["emitted"]
-                self.migration_before = path.stat().st_mtime
                 if not isinstance(self.legacy, dict) or any(
                         not isinstance(v, list) or any(not isinstance(h, str) for h in v)
                         for v in self.legacy.values()):
@@ -136,7 +133,6 @@ class EmittedState:
             elif version == STATE_VERSION:
                 self.prs, self.legacy = raw["acknowledged"], raw.get("legacy", {})
                 self.baselines = raw.get("baselines", {})
-                self.migration_before = raw.get("migration_before")
                 if not isinstance(self.prs, dict) or not isinstance(self.legacy, dict):
                     raise ValueError("incompatible state")
                 for values in self.prs.values():
@@ -155,6 +151,12 @@ class EmittedState:
                     not isinstance(values, list) or any(not isinstance(h, str) for h in values)
                     for values in self.legacy.values()):
                 raise ValueError("incompatible legacy state")
+            if version == STATE_VERSION and "migration_before" in raw:
+                # Earlier provisional v2 files inferred baselines from a repo-wide mtime.
+                # Recompute only those guesses; preserve every actual acknowledgement.
+                for number, values in self.baselines.items():
+                    self.legacy[number] = list(set(self.legacy.get(number, [])) | set(values))
+                self.baselines = {}
         except FileNotFoundError:
             pass
         except (OSError, ValueError, KeyError, AttributeError, TypeError) as exc:
@@ -164,22 +166,13 @@ class EmittedState:
     def has(self, number: int, head: str, review_id: int) -> bool:
         with self.lock:
             return (review_id in self.prs.get(str(number), {}).get(head, []) or
-                    review_id <= self.baselines.get(str(number), {}).get(head, 0))
+                    review_id == self.baselines.get(str(number), {}).get(head, 0))
 
-    def baseline(self, number: int, head: str, reviews: list) -> None:
+    def baseline(self, number: int, head: str, reviews: list, trusted: frozenset) -> None:
         with self.lock:
             if head not in self.legacy.get(str(number), []):
                 return
-            cutoff = (datetime.fromtimestamp(self.migration_before, timezone.utc)
-                      if self.migration_before is not None else None)
-            historical = []
-            for review in reviews:
-                if review.commit_id != head or not review.submitted_at:
-                    continue
-                submitted = datetime.fromisoformat(review.submitted_at.replace("Z", "+00:00"))
-                if cutoff is None or submitted <= cutoff:
-                    historical.append(review.id)
-            rid = max(historical, default=0)
+            rid = initial_plus1_review_id(reviews, head, trusted) or 0
             self.baselines.setdefault(str(number), {}).setdefault(head, rid)
             self._save()  # keep legacy until the baseline has been saved durably
             self.legacy[str(number)].remove(head)
@@ -197,7 +190,7 @@ class EmittedState:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         _write_atomic(self.path, json.dumps({"version": STATE_VERSION,
                       "acknowledged": self.prs if prs is None else prs, "legacy": self.legacy,
-                      "baselines": self.baselines, "migration_before": self.migration_before}))
+                      "baselines": self.baselines}))
 
 
 HTTP_STATUS_RE = re.compile(r"\bHTTP (\d{3})\b")
@@ -254,7 +247,7 @@ class ReviewStateWatcher(Poller):
         reviews = self.client.reviews(pr.number)
         verdict = evaluate(reviews, pr.head, self.trusted)
         with self.lock:
-            self.state.baseline(pr.number, pr.head, reviews)
+            self.state.baseline(pr.number, pr.head, reviews, self.trusted)
             rid = verdict.plus1_review_id
             if pr.draft or verdict.stage != PLUS1 or type(rid) is not int or not 0 < rid <= 2 ** 53 - 1:
                 self.outstanding.pop(pr.number, None)

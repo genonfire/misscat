@@ -49,6 +49,18 @@ def parse_header(body: Optional[str]) -> Optional[tuple]:
     return match.groups() if match else None
 
 
+def initial_plus1_review_id(reviews: list, head: str, trusted: frozenset) -> Optional[int]:
+    """First valid Stage 1 review, used only to baseline legacy HEAD-only delivery state.
+
+    Legacy state cannot identify the delivered review. Suppress just the initial valid
+    approval, never infer that later approvals were delivered from a file timestamp.
+    """
+    for review in sorted(reviews, key=lambda r: (r.submitted_at or "", r.id)):
+        if evaluate([review], head, trusted).stage == PLUS1:
+            return review.id
+    return None
+
+
 def evaluate(reviews: list, head: str, trusted: frozenset) -> Verdict:
     """Verdict for the current HEAD from the full submitted-review history.
 

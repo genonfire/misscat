@@ -47,8 +47,7 @@
     const event = { repo: repo.toLowerCase(), pr: pr, head: message.head,
       review_id: message.review_id, delivery_id: message.delivery_id };
     if (message.legacy_review_id !== undefined) {
-      if (!Number.isSafeInteger(message.legacy_review_id) || message.legacy_review_id < 0 ||
-          message.legacy_review_id >= message.review_id) return null;
+      if (!Number.isSafeInteger(message.legacy_review_id) || message.legacy_review_id < 0) return null;
       event.legacy_review_id = message.legacy_review_id;
     }
     return event;

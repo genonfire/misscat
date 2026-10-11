@@ -176,7 +176,7 @@ async function legacyDelivered(event) {
   if (legacyKey in baselines && (old[LEGACY_KEY] || []).includes(legacyKey)) {
     await chrome.storage.session.set({ [LEGACY_KEY]: old[LEGACY_KEY].filter(k => k !== legacyKey) });
   }
-  return event.review_id <= (baselines[legacyKey] || 0);
+  return event.review_id === baselines[legacyKey];
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
