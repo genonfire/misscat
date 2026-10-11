@@ -539,14 +539,6 @@ def submitted_by_run(reviews: list[GhReview], head: str, run_id: str) -> list[Gh
             and run_line(run_id) in (line.strip() for line in r.body.splitlines())]
 
 
-def carrying_run(reviews: list[GhReview], head: str, run_id: str) -> list[GhReview]:
-    """Submitted reviews of exactly `head` that carry this run's nonce line (any verdict format)."""
-    if not run_id:
-        return []
-    return [r for r in reviews if r.submitted_at and r.state != "PENDING" and r.commit_id == head
-            and run_line(run_id) in (line.strip() for line in r.body.splitlines())]
-
-
 def blocking_review(reviews: list[GhReview], head: str) -> GhReview | None:
     """The latest substantive marker review of `head` if it is a `-1`, else None.
 
@@ -1440,10 +1432,10 @@ class Watcher:
     def _reconcile_pending(self) -> None:
         """Settle attempts left over by a crash, restart or earlier GitHub error.
 
-        A re-review that really submitted its review counts even if its CLI died afterwards.
-        A normal run counts only if its CLI had exited cleanly (`ok`); otherwise, like any
-        failed run, it is dropped and the HEAD is reviewed again. A lookup failure keeps the
-        attempt pending, and its HEAD is not rerun until it can be settled.
+        A valid review submitted by this run counts even if its CLI died afterwards.
+        A lookup failure keeps the attempt pending, and its HEAD is not rerun until it
+        can be settled. Completion is saved before removing pending, so a crash between
+        the writes leaves enough information to settle again without another invocation.
         """
         if self.discussion is None:
             return
@@ -1466,8 +1458,8 @@ class Watcher:
                     log.info("PR #%d: settled a re-review submitted earlier", run.pr)
                     self._record_reply(run, review_id)
                     continue
-            elif run.ok:
-                found = carrying_run(reviews, run.head, run.run_id)
+            else:
+                found = submitted_by_run(reviews, run.head, run.run_id)
                 if found:
                     self.state.add(run.key(), tuple(sorted(r.id for r in found)))
                     self.state.drop_pending(run.run_id)
@@ -1480,9 +1472,6 @@ class Watcher:
                          pr.reply.comment_ids if pr.reply else (), cli_ok)
         if self.discussion is None:
             return cli_ok
-        if pr.reply is None and not cli_ok:
-            self.state.drop_pending(pr.run_id)
-            return False
         try:
             reviews = self.discussion.reviews(pr.number)
             head = self.discussion.head(pr.number) if pr.reply is not None else pr.head
@@ -1504,13 +1493,14 @@ class Watcher:
                 return False
             self._record_reply(run, review_id)  # even if the CLI failed after submitting
             return True
-        found = carrying_run(reviews, pr.head, pr.run_id)
-        self.state.drop_pending(pr.run_id)
+        found = submitted_by_run(reviews, pr.head, pr.run_id)
         if not found:
+            self.state.drop_pending(pr.run_id)
             log.error("PR #%d: review of %s has no submitted review carrying this run's id; "
                       "it will be retried", pr.number, pr.head[:7])
             return False
         self.state.add(self._key(pr), tuple(sorted(r.id for r in found)))
+        self.state.drop_pending(pr.run_id)
         return True
 
     def _review(self, pr: PR) -> bool:

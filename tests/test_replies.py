@@ -248,6 +248,36 @@ class AttributionTests(ReplyBase):
         self.assertEqual(len(run_id), 16)
         self.assertIn(m.run_line(run_id), m.build_prompt(self.cfg, REPO, self.calls[0]))
 
+    def test_invalid_normal_verdicts_never_complete_even_with_nonce(self):
+        invalid = [
+            {"state": "APPROVED"}, {"state": "CHANGES_REQUESTED"},
+            {"state": "PENDING"}, {"body": ""},
+            {"body": f"-1\nHEAD: {HEAD}\n"},
+            {"body": "-1: FAIL\nbecause"},
+            {"body": marker("-1", "b" * 40)},
+            {"head": "b" * 40},
+        ]
+        for kwargs in invalid:
+            with self.subTest(kwargs=kwargs):
+                d = FakeDiscussion()
+                pr = m.PR(9, HEAD, False, "u", "t")
+                w = self.watcher(d, [pr])
+
+                def reviewer(s, r, item, ws):
+                    d.review_list = [review(5, 0, run=item.run_id, **kwargs)]
+                    return True
+                w.reviewer = reviewer
+                with self.assertLogs("misscat", "ERROR"):
+                    w.cycle()
+                self.assertNotIn(m.Key(9, HEAD, "luna"), self.state.reviewed())
+                self.assertEqual(self.state.pending(), [])
+                # Recovery uses the same validation, including after a clean exit.
+                self.state.add_pending(m.PendingRun(9, HEAD, "luna", "abcd", (), True))
+                d.review_list = [review(5, 0, run="abcd", **kwargs)]
+                w._reconcile_pending()
+                self.assertNotIn(m.Key(9, HEAD, "luna"), self.state.reviewed())
+                self.assertEqual(self.state.pending(), [])
+
 
 class RecoveryTests(ReplyBase):
     """Outcomes survive GitHub errors, CLI crashes and restarts."""
@@ -368,15 +398,64 @@ class RecoveryTests(ReplyBase):
         w.cycle()
         self.assertEqual(len(self.calls), 2)
 
-    def test_interrupted_normal_run_without_clean_exit_is_not_marked_reviewed(self):
+    def test_interrupted_normal_run_with_submitted_review_is_recovered(self):
         d = FakeDiscussion()
         w = self.watcher(d, [self.normal_pr()])
         self.state.add_pending(m.PendingRun(9, HEAD, "luna", "abcd", (), False))
         d.review_list = [review(5, 0, run="abcd")]  # submitted, but the CLI never exited cleanly
-        w.reviewer = lambda s, r, pr, ws: False
-        with self.assertLogs("misscat", "WARNING"):
-            w.cycle()
-        self.assertEqual([r for r in self.state.records() if r.pr == 9], [])
+        self.state = m.State(m.state_path(REPO))
+        w = self.watcher(d, [self.normal_pr()], reviewer=lambda *a: self.fail("must not rerun"))
+        w.cycle()
+        self.assertEqual(self.state.review_ids(m.Key(9, HEAD, "luna")), {5})
+        self.assertEqual(self.state.pending(), [])
+
+    def test_normal_submission_survives_cli_failure_and_api_error(self):
+        for api_down in (False, True):
+            with self.subTest(api_down=api_down):
+                pr = dataclasses.replace(self.normal_pr(), number=90 + int(api_down))
+                d = FakeDiscussion()
+                w = self.watcher(d, [pr])
+
+                def reviewer(s, r, item, ws):
+                    d.review_list = [review(5, 0, run=item.run_id)]
+                    d.fail = api_down
+                    raise RuntimeError("CLI crashed after submitting")
+                w.reviewer = reviewer
+                with self.assertLogs("misscat", "ERROR"):
+                    w.cycle()
+                d.fail = False
+                self.state = m.State(m.state_path(REPO))
+                self.watcher(d, [pr], reviewer=lambda *a: self.fail("must not rerun")).cycle()
+                self.assertEqual(self.state.review_ids(m.Key(pr.number, HEAD, "luna")), {5})
+                self.assertEqual(self.state.pending(), [])
+
+    def test_crash_between_completion_and_pending_removal_does_not_rerun(self):
+        d = FakeDiscussion()
+        pr = self.normal_pr()
+        w = self.watcher(d, [pr])
+
+        def reviewer(s, r, item, ws):
+            d.review_list = [review(5, 0, run=item.run_id)]
+            return True
+        w.reviewer = reviewer
+        with mock.patch.object(self.state, "drop_pending", side_effect=RuntimeError("crash")):
+            with self.assertRaises(RuntimeError):
+                w.cycle()
+        self.state = m.State(m.state_path(REPO))
+        self.assertEqual(self.state.review_ids(m.Key(9, HEAD, "luna")), {5})
+        self.assertEqual(len(self.state.pending()), 1)
+        self.watcher(d, [pr], reviewer=lambda *a: self.fail("must not rerun")).cycle()
+        self.assertEqual(self.state.pending(), [])
+
+    def test_unsubmitted_interrupted_normal_run_retries(self):
+        d = FakeDiscussion()
+        self.state.add_pending(m.PendingRun(9, HEAD, "luna", "abcd"))
+        self.state = m.State(m.state_path(REPO))
+        with self.assertLogs("misscat", "ERROR"):
+            self.watcher(d, [self.normal_pr()]).cycle()
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.state.pending(), [])
+        self.assertNotIn(m.Key(9, HEAD, "luna"), self.state.reviewed())
 
     def test_pending_state_round_trips_and_rejects_garbage(self):
         run = m.PendingRun(9, HEAD, "luna", "abcd", (3, 4), True)
