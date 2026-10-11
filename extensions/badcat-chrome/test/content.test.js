@@ -226,3 +226,29 @@ test('rejects a PR number that is not a positive integer; nothing is typed', asy
   }
   assert.deepEqual(t.log.fills, []);
 });
+
+const event = (rid = 100) => ({ repo: 'o/r', pr: 123, head: 'a'.repeat(40), status: '+1', review_id: rid, delivery_id: 'c'.repeat(32) });
+test('same ID is idempotent across worker connections; fresh same-HEAD ID submits', async () => {
+  const t = boot({ initial: 'user text' });
+  await t.send({ type: 'badcat:activate', session: 'old' });
+  const message = { type: 'badcat:handoff', pr: 123, event: event(), session: 'old' };
+  assert.equal((await t.send(message)).ok, true);
+  await t.send({ type: 'badcat:activate', session: 'new' });
+  assert.equal((await t.send({ ...message, session: 'new' })).ok, true);
+  assert.equal(t.log.submitted.length, 1);
+  assert.equal(t.log.submitted[0], 'user text ' + TEXT);
+  assert.equal((await t.send({ ...message, session: 'new', event: event(200) })).ok, true);
+  assert.equal(t.log.submitted.length, 2);
+});
+
+test('stop while waiting never clicks a send fallback or permits a stale session', async () => {
+  const t = boot({ enterSubmits: false, buttonSubmits: true });
+  await t.send({ type: 'badcat:activate', session: 'old' });
+  const pending = t.send({ type: 'badcat:handoff', pr: 123, event: event(), session: 'old' });
+  await new Promise(resolve => setImmediate(resolve));
+  await t.send({ type: 'badcat:cancel', session: 'old' });
+  assert.equal((await pending).ok, false);
+  assert.equal(t.log.clicks, 0);
+  assert.equal(t.log.submitted.length, 0);
+  assert.equal((await t.send({ type: 'badcat:handoff', pr: 123, event: event(), session: 'old' })).ok, false);
+});

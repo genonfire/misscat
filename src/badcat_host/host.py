@@ -8,8 +8,9 @@ else; diagnostics go to stderr.
 Client -> host (one JSON object per frame):
     {"type": "start", "repo": "owner/repo"}   monitor one repository (replaces the current one)
     {"type": "stop"}                            stop monitoring
+    {"type": "ack", "repo": ..., "pr": ..., "head": ..., "review_id": ..., "delivery_id": ...}
 Host -> client:
-    {"repo": "owner/repo", "pr": 123, "head": "<40 hex>", "status": "+1"}   once per PR + HEAD
+    {"repo": "owner/repo", "pr": 123, "head": "<40 hex>", "status": "+1", "review_id": 456, "delivery_id": "<nonce>"}
     {"error": "<message>"}                      a rejected request or a failed start
 """
 from __future__ import annotations
@@ -20,9 +21,12 @@ import logging
 import os
 import re
 import shutil
+import secrets
+import time
 import struct
 import sys
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import BinaryIO, Callable, Optional
 
@@ -41,7 +45,7 @@ STATE_DIR = Path.home() / ".config" / "badcat-host"  # its own state, separate f
 HOST_NAME = "com.genonfire.badcat_host"
 MAX_INCOMING = 64 * 1024  # requests are tiny; anything larger is a protocol violation
 MAX_OUTGOING = 1024 * 1024  # Chrome's limit for host -> browser messages
-STATE_VERSION = 1
+STATE_VERSION = 2
 EXTENSION_ID_RE = re.compile(r"[a-p]{32}")  # Chrome extension IDs
 STOP_TIMEOUT = 5.0
 # A GUI-launched Chrome passes a minimal PATH; gh is usually installed in one of these.
@@ -113,33 +117,87 @@ class Sender:
 
 
 class EmittedState:
-    """PR -> HEADs already reported as +1. Only dedupes events; never authorizes anything."""
+    """Acknowledged review IDs plus one-time baselines for legacy emitted HEADs."""
 
     def __init__(self, path: Path):
-        self.path, self.prs = path, {}
+        self.path, self.prs, self.legacy, self.baselines = path, {}, {}, {}
+        self.lock = threading.RLock()
+        self.migration_before = None
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
-            if raw.get("version") != STATE_VERSION or not isinstance(raw.get("emitted"), dict):
+            version = raw.get("version")
+            if version == 1:
+                self.legacy = raw["emitted"]
+                self.migration_before = path.stat().st_mtime
+                if not isinstance(self.legacy, dict) or any(
+                        not isinstance(v, list) or any(not isinstance(h, str) for h in v)
+                        for v in self.legacy.values()):
+                    raise ValueError("incompatible legacy state")
+            elif version == STATE_VERSION:
+                self.prs, self.legacy = raw["acknowledged"], raw.get("legacy", {})
+                self.baselines = raw.get("baselines", {})
+                self.migration_before = raw.get("migration_before")
+                if not isinstance(self.prs, dict) or not isinstance(self.legacy, dict):
+                    raise ValueError("incompatible state")
+                for values in self.prs.values():
+                    if not isinstance(values, dict) or any(
+                            not isinstance(ids, list) or any(type(rid) is not int or rid < 1 for rid in ids)
+                            for ids in values.values()):
+                        raise ValueError("incompatible acknowledgements")
+            else:
                 raise ValueError("incompatible state")
-            self.prs = {str(k): [str(h) for h in v] for k, v in raw["emitted"].items()}
+            if not isinstance(self.baselines, dict) or any(
+                    not isinstance(values, dict) or any(type(rid) is not int or rid < 0
+                                                       for rid in values.values())
+                    for values in self.baselines.values()):
+                raise ValueError("incompatible baselines")
+            if not isinstance(self.legacy, dict) or any(
+                    not isinstance(values, list) or any(not isinstance(h, str) for h in values)
+                    for values in self.legacy.values()):
+                raise ValueError("incompatible legacy state")
         except FileNotFoundError:
             pass
-        except (OSError, ValueError, AttributeError, TypeError) as exc:
-            log.warning("ignoring unreadable host state %s (%s)", path, exc)
+        except (OSError, ValueError, KeyError, AttributeError, TypeError) as exc:
+            # Preserve the file and fail closed: corrupt history must not replay every PR.
+            raise MissCatError("cannot read host delivery state") from exc
 
-    def has(self, number: int, head: str) -> bool:
-        return head in self.prs.get(str(number), ())
+    def has(self, number: int, head: str, review_id: int) -> bool:
+        with self.lock:
+            return (review_id in self.prs.get(str(number), {}).get(head, []) or
+                    review_id <= self.baselines.get(str(number), {}).get(head, 0))
 
-    def add(self, number: int, head: str) -> None:
-        self.prs.setdefault(str(number), []).append(head)
-        self._save()
+    def baseline(self, number: int, head: str, reviews: list) -> None:
+        with self.lock:
+            if head not in self.legacy.get(str(number), []):
+                return
+            cutoff = (datetime.fromtimestamp(self.migration_before, timezone.utc)
+                      if self.migration_before is not None else None)
+            historical = []
+            for review in reviews:
+                if review.commit_id != head or not review.submitted_at:
+                    continue
+                submitted = datetime.fromisoformat(review.submitted_at.replace("Z", "+00:00"))
+                if cutoff is None or submitted <= cutoff:
+                    historical.append(review.id)
+            rid = max(historical, default=0)
+            self.baselines.setdefault(str(number), {}).setdefault(head, rid)
+            self._save()  # keep legacy until the baseline has been saved durably
+            self.legacy[str(number)].remove(head)
+            self._save()
 
-    def _save(self) -> None:
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            _write_atomic(self.path, json.dumps({"version": STATE_VERSION, "emitted": self.prs}))
-        except OSError as exc:
-            log.warning("cannot save host state: %s", exc)
+    def add(self, number: int, head: str, review_id: int) -> None:
+        with self.lock:
+            previous = self.prs.get(str(number), {}).get(head, [])
+            updated = {k: dict(v) for k, v in self.prs.items()}
+            updated.setdefault(str(number), {})[head] = sorted(set(previous) | {review_id})
+            self._save(updated)
+            self.prs = updated  # a failed write must not acknowledge only in memory
+
+    def _save(self, prs=None) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        _write_atomic(self.path, json.dumps({"version": STATE_VERSION,
+                      "acknowledged": self.prs if prs is None else prs, "legacy": self.legacy,
+                      "baselines": self.baselines, "migration_before": self.migration_before}))
 
 
 HTTP_STATUS_RE = re.compile(r"\bHTTP (\d{3})\b")
@@ -153,31 +211,88 @@ def describe_gh_error(exc: Exception) -> str:
 
 
 class ReviewStateWatcher(Poller):
-    """Emits one event per PR + HEAD that is at a valid +1. Read-only: no write is reachable."""
+    """Re-fetch effective +1s; retry unacknowledged frames with capped backoff."""
 
     def __init__(self, repo: str, client, state: EmittedState, trusted: frozenset,
-                 emit: Callable[[dict], None]):
+                 emit: Callable[[dict], None], now=time.monotonic):
         super().__init__(client)
         self.repo, self.state, self.trusted, self.emit = repo, state, trusted, emit
+        self.now, self.outstanding = now, {}
+        self.acknowledged = set()  # idempotent ACKs for this connection, never previous sessions
+        self.lock = threading.RLock()
 
     def _tracked(self):
-        return []  # reported (PR, HEAD) pairs are kept for good: a reopened PR must not re-emit
+        with self.lock:
+            return list(self.outstanding)
 
     def _detail(self, exc: Exception) -> str:
         return describe_gh_error(exc)
 
+    def acknowledge(self, message: dict) -> bool:
+        if not valid_ack(message, self.repo):
+            return False
+        with self.lock:
+            identity = tuple(message[k] for k in ("repo", "pr", "head", "review_id", "delivery_id"))
+            if identity in self.acknowledged:
+                return True
+            pending = self.outstanding.get(message["pr"])
+            if pending is None:
+                return False
+            event = pending[0]
+            if any(message[k] != event[k] for k in ("repo", "pr", "head", "review_id", "delivery_id")):
+                return False
+            self.state.add(event["pr"], event["head"], event["review_id"])
+            self.acknowledged.add(identity)
+            self.outstanding.pop(event["pr"], None)
+            return True
+
     def _process(self, pr: OpenPR) -> None:
-        if self.state.has(pr.number, pr.head):
+        if (type(pr.number) is not int or not 0 < pr.number <= 2 ** 53 - 1 or
+                not isinstance(pr.head, str) or not re.fullmatch(r"[0-9a-f]{40}", pr.head)):
+            self._finished(pr.number)
             return
-        verdict = evaluate(self.client.reviews(pr.number), pr.head, self.trusted)
-        if verdict.stage != PLUS1:  # READY (+1 then +2) is past the +1 state; anything else holds
-            return
-        self.emit({"repo": self.repo, "pr": pr.number, "head": pr.head, "status": "+1"})
-        self.state.add(pr.number, pr.head)  # only after the client was sent the event
-        log.info("PR #%d: +1 (%s)", pr.number, pr.head[:7])
+        reviews = self.client.reviews(pr.number)
+        verdict = evaluate(reviews, pr.head, self.trusted)
+        with self.lock:
+            self.state.baseline(pr.number, pr.head, reviews)
+            rid = verdict.plus1_review_id
+            if pr.draft or verdict.stage != PLUS1 or type(rid) is not int or not 0 < rid <= 2 ** 53 - 1:
+                self.outstanding.pop(pr.number, None)
+                return
+            if self.state.has(pr.number, pr.head, rid):
+                self.outstanding.pop(pr.number, None)
+                return
+            pending = self.outstanding.get(pr.number)
+            if pending is None or (pending[0]["head"], pending[0]["review_id"]) != (pr.head, rid):
+                pending = ({"repo": self.repo, "pr": pr.number, "head": pr.head, "status": "+1",
+                            "review_id": rid, "delivery_id": secrets.token_hex(16)}, 0, 0)
+                baseline = self.state.baselines.get(str(pr.number), {}).get(pr.head)
+                if baseline is not None:
+                    pending[0]["legacy_review_id"] = baseline
+            event, deadline, attempts = pending
+            self.outstanding[pr.number] = pending
+            if self.now() < deadline:
+                return
+            # Store before writing: a synchronous ack cannot miss its outstanding frame.
+            self.outstanding[pr.number] = (event, self.now() + (60, 120, 300)[min(attempts, 2)], attempts + 1)
+            self.emit(event)
+            log.info("PR #%d: +1 review %d sent, awaiting acknowledgement", pr.number, rid)
 
     def _finished(self, number: int) -> None:
-        pass  # never called: nothing is tracked for removal
+        with self.lock:
+            self.outstanding.pop(number, None)
+
+
+def valid_ack(message, repo: str) -> bool:
+    return (isinstance(message, dict) and set(message) ==
+            {"type", "repo", "pr", "head", "review_id", "delivery_id"} and
+            message.get("type") == "ack" and message.get("repo") == repo and
+            type(message.get("pr")) is int and message["pr"] > 0 and
+            type(message.get("review_id")) is int and message["review_id"] > 0 and
+            isinstance(message.get("head"), str) and
+            re.fullmatch(r"[0-9a-f]{40}", message["head"]) is not None and
+            isinstance(message.get("delivery_id"), str) and
+            re.fullmatch(r"[0-9a-f]{32}", message["delivery_id"]) is not None)
 
 
 class Monitor:
@@ -186,6 +301,7 @@ class Monitor:
     def __init__(self, repo: str, client, state: EmittedState, send: Sender):
         self.repo, self.client, self.state, self.send = repo, client, state, send
         self._stop = threading.Event()
+        self.watcher = None
         self._thread = threading.Thread(target=self._run, name=f"monitor-{repo}", daemon=True)
 
     def start(self) -> None:
@@ -198,6 +314,10 @@ class Monitor:
     def stop(self) -> None:
         self._stop.set()
         self._thread.join(STOP_TIMEOUT)  # a poll blocked in `gh` is a daemon thread and is abandoned
+
+    def acknowledge(self, message: dict) -> bool:
+        return bool(not self._stop.is_set() and self.watcher is not None and
+                    self.watcher.acknowledge(message))
 
     def _emit(self, event: dict) -> None:
         if self._stop.is_set():
@@ -214,6 +334,7 @@ class Monitor:
                 return
             log.info("Watching %s (trusted reviewer: %s)", self.repo, ", ".join(sorted(trusted)))
             watcher = ReviewStateWatcher(self.repo, self.client, self.state, trusted, self._emit)
+            self.watcher = watcher
             while not self._stop.is_set():
                 if self._stop.wait(watcher.cycle()):
                     break
@@ -284,8 +405,18 @@ def serve(stdin: BinaryIO, stdout: BinaryIO,
                     continue
                 if monitor is not None:
                     monitor.stop()
-                monitor = Monitor(repo, client_factory(repo), EmittedState(state_path(repo)), send)
-                monitor.start()
+                try:
+                    monitor = Monitor(repo, client_factory(repo), EmittedState(state_path(repo)), send)
+                    monitor.start()
+                except MissCatError:
+                    monitor = None
+                    send({"error": "cannot read host delivery state"})
+            elif kind == "ack":
+                try:
+                    if monitor is None or not monitor.acknowledge(message):
+                        send({"warning": "invalid or stale acknowledgement"})
+                except OSError:
+                    send({"warning": "cannot save acknowledgement; delivery remains retryable"})
             else:
                 send({"error": "unknown message"})
     except ConnectionClosed:

@@ -40,6 +40,7 @@ class Review:
 class Verdict:
     stage: str
     detail: str = ""
+    plus1_review_id: Optional[int] = None
 
 
 def parse_header(body: Optional[str]) -> Optional[tuple]:
@@ -53,46 +54,35 @@ def evaluate(reviews: list, head: str, trusted: frozenset) -> Verdict:
 
     `trusted` holds lowercase logins; an empty set trusts nobody (fail closed).
     """
-    # markers in submission order; None = malformed marker review on the current HEAD,
-    # "?" = any other trusted review on the current HEAD (CHANGES_REQUESTED, plain comments...)
-    events = []
-    untrusted = []
+    stage, detail, plus1 = WAITING, "", None
+    untrusted = set()
     for review in sorted(reviews, key=lambda r: (r.submitted_at or "", r.id)):
         if not review.submitted_at or review.state in NEUTRAL_STATES:
             continue
         parsed = parse_header(review.body)
-        if review.state != "COMMENTED":
+        if parsed is None:
             if review.commit_id != head:
                 continue
-            event = "?"  # never a pass, but it must not be silently outvoted by earlier passes
-        elif parsed is None:
-            if review.commit_id != head:
-                continue
-            event = None if LOOSE_RE.match(review.body or "") else "?"
+            event = None
         else:
             marker, sha, evidence = parsed
             if head not in (sha, review.commit_id):
-                continue  # an old HEAD never carries forward
-            ok = sha == review.commit_id == head and evidence.strip()
-            event = marker if ok else None
+                continue
+            event = marker if (review.state == "COMMENTED" and
+                               sha == review.commit_id == head and evidence.strip()) else None
         if (review.login or "").lower() not in trusted:
-            untrusted.append(review.login or "?")
+            untrusted.add(review.login or "?")
             continue
-        events.append(event)
-
-    if "-1" in events:
-        return Verdict(BLOCKED, "-1 on this HEAD")
-    if None in events:
-        return Verdict(INVALID, "malformed review on this HEAD")
-    if "+1" in events:
-        first = events.index("+1")
-        if "?" in events[first + 1:]:
-            return Verdict(INVALID, "non-pass review after +1 on this HEAD")
-        if "+2" in events[first + 1:]:
-            return Verdict(READY)
-        return Verdict(PLUS1)
-    if "+2" in events:
-        return Verdict(INVALID, "+2 without an earlier +1 on this HEAD")
-    if untrusted:
-        return Verdict(WAITING, "ignored untrusted reviewer(s): " + ", ".join(sorted(set(untrusted))))
-    return Verdict(WAITING)
+        if event == "-1":
+            stage, detail, plus1 = BLOCKED, "-1 on this HEAD", None
+        elif event == "+1":
+            stage, detail, plus1 = PLUS1, "", review.id
+        elif event == "+2" and stage in (PLUS1, READY):
+            stage, detail = READY, ""
+        elif event == "+2":
+            stage, detail, plus1 = INVALID, "+2 without an effective +1 on this HEAD", None
+        elif stage != WAITING or LOOSE_RE.match(review.body or ""):
+            stage, detail, plus1 = INVALID, "invalid review on this HEAD", None
+    if stage == WAITING and untrusted:
+        detail = "ignored untrusted reviewer(s): " + ", ".join(sorted(untrusted))
+    return Verdict(stage, detail, plus1)
