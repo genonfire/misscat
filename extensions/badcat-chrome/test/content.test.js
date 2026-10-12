@@ -163,7 +163,7 @@ test('the real limit alert is announced to the background, then "새 대화 시�
   const alert = t.limitAlert(LIMIT, ['새 대화 시작', '새 대화 시작']); // duplicated button as captured
   t.mutate(); t.mutate(); t.mutate();
   await t.settle(); await t.settle();
-  assert.equal(JSON.stringify(t.runtimeCalls.filter((m) => m.type === 'badcat:rollover')), JSON.stringify([{ type: 'badcat:rollover', session: SESSION }]));
+  assert.equal(JSON.stringify(t.runtimeCalls.filter((m) => m.type === 'badcat:rollover')), JSON.stringify([{ type: 'badcat:rollover', session: SESSION, projectName: '' }]));
   assert.deepEqual(alert.buttons.map((b) => b.clicks), [1, 0]);
 });
 
