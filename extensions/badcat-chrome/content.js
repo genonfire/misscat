@@ -138,7 +138,7 @@
 
   // Events whose submission could not be confirmed (the page moved on after Enter): never sent again from here.
   const uncertain = new Set();
-  const USER_MESSAGE = '[data-message-author-role="user"]';
+  const USER_MESSAGE = '[data-user-message-bubble="true"]'; // the user's message bubble; its text is compared exactly
   const countUserMessages = (text) => {
     let n = 0;
     for (const el of document.querySelectorAll(USER_MESSAGE)) if ((el.textContent || '').trim() === text) n += 1;

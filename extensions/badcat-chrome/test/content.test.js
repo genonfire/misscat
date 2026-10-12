@@ -468,3 +468,31 @@ test('a different event after an unconfirmed one is not blocked by it', async ()
   assert.notEqual(other.error, UNCERTAIN_TEXT);
 });
 const UNCERTAIN_TEXT = 'submission could not be confirmed; not sent again';
+
+test('confirmation by the user bubble is exact and relative to what was there before', async () => {
+  const dest = 'https://chatgpt.com/g/' + SLUG + '/c/new-id';
+  // slightly different text (other PR / extra words) is not our command
+  for (const shown of ['현재 작업 끝났으면 PR #124 리뷰해.', TEXT + ' 추가', 'x' + TEXT, '']) {
+    const t = await activated(projectOpts({ afterSubmit: { url: dest, render: true, shown } }));
+    const res = await t.send(handoffMsg({ project: SLUG }));
+    assert.equal(res.ambiguous, true, JSON.stringify(shown));
+  }
+  // an identical bubble that was already on the page does not confirm anything by itself
+  let t = await activated({ ...projectOpts({ afterSubmit: { url: dest, render: false } }), priorBubbles: [TEXT] });
+  assert.equal((await t.send(handoffMsg({ project: SLUG }))).ambiguous, true);
+  // ... but a new one next to it does
+  t = await activated({ ...projectOpts({ afterSubmit: { url: dest, render: true } }), priorBubbles: [TEXT] });
+  assert.equal((await t.send(handoffMsg({ project: SLUG }))).ok, true);
+});
+
+test('a slow confirmation (within the wait) is accepted once; one that arrives too late is unconfirmed and never resent', async () => {
+  const dest = 'https://chatgpt.com/g/' + SLUG + '/c/new-id';
+  let t = await activated(projectOpts({ afterSubmit: { url: dest, render: true, delayMs: 2500 } }));
+  assert.equal((await t.send(handoffMsg({ project: SLUG }))).ok, true);
+  assert.deepEqual(t.log.submitted, [TEXT]);
+  t = await activated(projectOpts({ afterSubmit: { url: dest, render: true, delayMs: 60000 } }));
+  const res = await t.send(handoffMsg({ project: SLUG }));
+  assert.equal(res.ambiguous, true);
+  assert.equal((await t.send(handoffMsg({ project: SLUG }))).ambiguous, true); // the retry does not resend even though the bubble exists by now
+  assert.deepEqual(t.log.submitted, [TEXT]);
+});

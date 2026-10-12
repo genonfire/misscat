@@ -49,7 +49,7 @@ function node(tag, attrs = {}, children = []) {
   return el;
 }
 
-function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubmits = false, sendButton = true, initial = '', label = 'Code Review의 새 채팅', rollover = { ok: true }, hello = { ok: false }, selector = null, menu = [], renameOnFill = null, restoreOnMenuOpen = null, alertOnEnter = null, onTimer = null, lateComposer = false, navigateOnMenuOpen = null, afterSubmit = null } = {}) {
+function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubmits = false, sendButton = true, initial = '', label = 'Code Review의 새 채팅', rollover = { ok: true }, hello = { ok: false }, selector = null, menu = [], renameOnFill = null, restoreOnMenuOpen = null, alertOnEnter = null, onTimer = null, lateComposer = false, navigateOnMenuOpen = null, afterSubmit = null, priorBubbles = [] } = {}) {
   let now = 0; // virtual clock: waits finish instantly
   let enterSubmitsNow = enterSubmits;
   const log = { submitted: [], keys: [], clicks: 0, decoyClicks: 0, fills: [] };
@@ -66,6 +66,14 @@ function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubm
     },
   });
   const text = () => editor.textContent;
+  let pendingBubble = null;
+  const materialize = () => {
+    if (pendingBubble && now >= pendingBubble.due) {
+      pendingBubble.msg.parentElement = page;
+      page.children.push(pendingBubble.msg);
+      pendingBubble = null;
+    }
+  };
   const submit = () => {
     log.submitted.push(text());
     if (!afterSubmit) { editor.textContent = ''; return; }
@@ -79,10 +87,10 @@ function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubm
     fresh.parentElement = wrapEl;
     wrapEl.children.push(fresh);
     if (afterSubmit.render) {
-      const msg = node('div', { 'data-message-author-role': 'user' });
-      msg.textContent = log.submitted[log.submitted.length - 1];
-      msg.parentElement = page;
-      page.children.push(msg);
+      // `shown` is what the bubble renders (default: exactly what was sent); it appears after `delayMs`.
+      const msg = node('div', { 'data-user-message-bubble': 'true' });
+      msg.textContent = afterSubmit.shown !== undefined ? afterSubmit.shown : log.submitted[log.submitted.length - 1];
+      pendingBubble = { msg, due: now + (afterSubmit.delayMs || 0) };
     }
   };
 
@@ -102,7 +110,8 @@ function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubm
     node('div', { 'data-composer-input': '' }, [wrap]),
     node('footer', {}, [stopOrVoice, ...(sendButton ? [send] : [])]),
   ]);
-  const page = node('body', {}, [node('form', {}, [otherSubmit]), legacy, ...(composer ? [otherEditable] : []), form]);
+  const prior = priorBubbles.map((t) => { const b = node('div', { 'data-user-message-bubble': 'true' }); b.textContent = t; return b; });
+  const page = node('body', {}, [...prior, node('form', {}, [otherSubmit]), legacy, ...(composer ? [otherEditable] : []), form]);
 
   // The project selector in the composer footer; clicking it lists the projects as [data-value] items.
   let projectMenu = null;
@@ -133,7 +142,7 @@ function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubm
   const document = {
     body: page,
     querySelector: (sel) => page.querySelector(sel),
-    querySelectorAll: (sel) => page.querySelectorAll(sel),
+    querySelectorAll: (sel) => { materialize(); return page.querySelectorAll(sel); },
     execCommand(cmd, _ui, value) {
       assert.equal(cmd, 'insertText');
       editor.textContent = editor.collapsed ? editor.textContent + value : value; // collapsed to the end = append
