@@ -49,7 +49,7 @@ function node(tag, attrs = {}, children = []) {
   return el;
 }
 
-function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubmits = false, sendButton = true, initial = '', label = 'Code Review의 새 채팅', rollover = { ok: true }, hello = { ok: false }, projectLink = null } = {}) {
+function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubmits = false, sendButton = true, initial = '', label = 'Code Review의 새 채팅', rollover = { ok: true }, hello = { ok: false }, selector = null, menu = [], renameOnFill = null } = {}) {
   let now = 0; // virtual clock: waits finish instantly
   let enterSubmitsNow = enterSubmits;
   const log = { submitted: [], keys: [], clicks: 0, decoyClicks: 0, fills: [] };
@@ -81,9 +81,31 @@ function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubm
     node('div', { 'data-composer-input': '' }, [node('div', {}, composer ? [editor] : [otherEditable])]),
     node('footer', {}, [stopOrVoice, ...(sendButton ? [send] : [])]),
   ]);
-  const link = projectLink ? node('a', { href: projectLink.href }) : null;
-  if (link) link.textContent = projectLink.text;
-  const page = node('body', {}, [...(link ? [link] : []), node('form', {}, [otherSubmit]), legacy, ...(composer ? [otherEditable] : []), form]);
+  const page = node('body', {}, [node('form', {}, [otherSubmit]), legacy, ...(composer ? [otherEditable] : []), form]);
+
+  // The project selector in the composer footer; clicking it lists the projects as [data-value] items.
+  let projectMenu = null;
+  const selectorButton = selector === null ? null : node('button', { type: 'button', 'data-composer-navigation-target': 'workspace-project', 'aria-expanded': 'false' });
+  if (selectorButton) {
+    selectorButton.textContent = selector;
+    selectorButton.clicks = 0;
+    selectorButton.click = () => {
+      selectorButton.clicks += 1;
+      if (projectMenu) {
+        page.children.splice(page.children.indexOf(projectMenu), 1);
+        projectMenu = null;
+        selectorButton.attrs['aria-expanded'] = 'false';
+      } else {
+        const items = menu.map((m) => { const i = node('div', { 'data-value': m.value }); i.textContent = m.text; return i; });
+        projectMenu = node('div', { role: 'menu' }, items);
+        projectMenu.parentElement = page;
+        page.children.push(projectMenu);
+        selectorButton.attrs['aria-expanded'] = 'true';
+      }
+    };
+    form.children.push(selectorButton);
+    selectorButton.parentElement = form;
+  }
 
   const document = {
     body: page,
@@ -93,6 +115,7 @@ function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubm
       assert.equal(cmd, 'insertText');
       editor.textContent = editor.collapsed ? editor.textContent + value : value; // collapsed to the end = append
       log.fills.push(value);
+      if (renameOnFill !== null && selectorButton) selectorButton.textContent = renameOnFill;
       return true;
     },
   };
@@ -136,7 +159,7 @@ function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubm
     const keep = listeners[0](message, sender, resolve);
     if (!keep) resolve(undefined);
   });
-  return { log, runtimeCalls, observers, limitAlert, mutate, setUrl: (u) => { ctx.url = u; }, editor, settle: () => new Promise((r) => setImmediate(r)), send: sendMessage, text, setEnterSubmits: (v) => { enterSubmitsNow = v; } };
+  return { log, selectorButton, runtimeCalls, observers, limitAlert, mutate, setUrl: (u) => { ctx.url = u; }, editor, settle: () => new Promise((r) => setImmediate(r)), send: sendMessage, text, setEnterSubmits: (v) => { enterSubmitsNow = v; } };
 }
 
 module.exports = { bootContent: boot };

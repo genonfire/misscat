@@ -320,12 +320,10 @@ async function rolled(opts = {}) {
   return { t, sid };
 }
 
-test('project rollover: "/" sends the same tab to the project home (URL identity), then settles on the new conversation', async () => {
+test('project rollover: the new-chat route stays valid without any redirect, then settles on the new conversation in the same project', async () => {
   const { t } = await rolled();
   await t.navigate(NEW_CHAT);
-  assert.deepEqual(t.updates, [HOME]);
-  assert.equal(t.session().active, true);
-  await t.navigate(HOME);
+  assert.deepEqual(t.updates, []); // the tab is never sent anywhere by the extension
   assert.equal(t.session().active, true);
   assert.equal(t.natives[0].disconnected, false);
   assert.equal(t.session().tabId, 7);
@@ -336,21 +334,14 @@ test('project rollover: "/" sends the same tab to the project home (URL identity
   assert.equal(t.session().active, false);
 });
 
-test('project rollover: another project home, or a conversation in another project, deactivates', async () => {
-  for (const url of ['https://chatgpt.com/g/g-p-2-other/project', 'https://chatgpt.com/g/g-p-1-proj-archive/project',
-    'https://chatgpt.com/g/g-p-2-other/c/new', 'https://example.com/']) {
+test('project rollover: a conversation in another project, a project home or another site deactivates', async () => {
+  for (const url of ['https://chatgpt.com/g/g-p-2-other/c/new', 'https://chatgpt.com/g/g-p-1-proj-archive/c/new',
+    HOME, 'https://example.com/']) {
     const { t } = await rolled();
     await t.navigate(NEW_CHAT);
     await t.navigate(url);
     assert.equal(t.session().active, false, url);
   }
-});
-
-test('a failed redirect to the project home deactivates', async () => {
-  const { t } = await rolled();
-  delete t.tabs[7]; // chrome.tabs.update will throw for a vanished tab
-  await t.listeners['tabs.onUpdated'](7, { url: NEW_CHAT });
-  assert.equal(t.session().active, false);
 });
 
 test('the new-chat route without an announced rollover still deactivates', async () => {
@@ -390,18 +381,16 @@ test('rollover without an active session is refused', async () => {
   assert.equal((await t.fromContent({ type: 'badcat:rollover', session: 'x' })).ok, false);
 });
 
-test('hello returns the live session id only to the bound tab on the exact project home', async () => {
+test('hello returns the live session id only to the bound tab on the new-chat route of a rollover', async () => {
   const { t, sid } = await rolled();
   await t.navigate(NEW_CHAT);
-  await t.navigate(HOME);
-  const answer = await t.fromContent({ type: 'badcat:hello' });
+  const answer = await t.fromContent({ type: 'badcat:hello' }, { url: NEW_CHAT });
   assert.equal(answer.ok, true);
   assert.equal(answer.session, sid);
-  assert.equal((await t.fromContent({ type: 'badcat:hello' }, { url: NEW_CHAT })).ok, false); // project rollover: "/" is not usable
-  assert.equal((await t.fromContent({ type: 'badcat:hello' }, { url: 'https://chatgpt.com/g/g-p-2-other/project' })).ok, false);
+  assert.equal((await t.fromContent({ type: 'badcat:hello' }, { url: HOME })).ok, false);
   assert.equal((await t.fromContent({ type: 'badcat:hello' }, { tab: { id: 8 } })).ok, false);
   await t.popup({ type: 'badcat:stop', tabId: 7 });
-  assert.equal((await t.fromContent({ type: 'badcat:hello' })).ok, false);
+  assert.equal((await t.fromContent({ type: 'badcat:hello' }, { url: NEW_CHAT })).ok, false);
 });
 
 test('without a rollover neither "/" nor a project home is a valid hello page', async () => {
@@ -410,10 +399,9 @@ test('without a rollover neither "/" nor a project home is a valid hello page', 
   assert.equal((await t.fromContent({ type: 'badcat:hello' }, { url: HOME })).ok, false);
 });
 
-test('a +1 on the project home carries the project slug and is acknowledged once, not resent', async () => {
+test('a +1 on the new-chat route carries the project slug, is acknowledged once and not resent', async () => {
   const { t } = await rolled();
   await t.navigate(NEW_CHAT);
-  t.tabs[7].url = HOME;
   t.natives[0].emit(plus1(123, HEAD1));
   await t.settle();
   assert.equal(t.sent.length, 1);
@@ -438,15 +426,4 @@ test('closing the tab during a rollover deactivates', async () => {
   const { t } = await rolled();
   await t.listeners['tabs.onRemoved'](7);
   assert.equal(t.session().active, false);
-});
-
-test('a +1 while the tab is still at "/" before the project redirect is not sent and not acknowledged', async () => {
-  const { t } = await rolled();
-  await t.navigate(NEW_CHAT);
-  t.tabs[7].url = NEW_CHAT; // redirect not complete yet
-  t.natives[0].emit(plus1(123, HEAD1));
-  await t.settle();
-  assert.equal(t.sent.length, 0);
-  assert.equal(t.session().active, true);
-  assert.equal(t.natives[0].posted.filter((m) => m.type === 'ack').length, 0);
 });

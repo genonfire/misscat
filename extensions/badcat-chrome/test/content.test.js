@@ -221,14 +221,6 @@ test('a freshly loaded page rebinds through the hello handshake', async () => {
 const EVENT = { repo: 'o/r', pr: 123, head: 'a'.repeat(40), status: '+1', review_id: 1, delivery_id: 'c'.repeat(32) };
 const handoffMsg = (extra = {}) => ({ type: 'badcat:handoff', pr: 123, session: SESSION, event: EVENT, ...extra });
 
-test('new chat after rollover: a restored draft that is this very command is submitted once', async () => {
-  const t = await activated({ url: 'https://chatgpt.com/g/g-p-1-proj/project', initial: TEXT });
-  const res = await t.send(handoffMsg({ project: 'g-p-1-proj' }));
-  assert.equal(res.ok, true);
-  assert.deepEqual(t.log.submitted, [TEXT]);
-  assert.deepEqual(t.log.fills, []); // not typed a second time
-});
-
 test('new chat after rollover: an empty composer is filled and submitted', async () => {
   const t = await activated({ url: 'https://chatgpt.com/' });
   assert.equal((await t.send(handoffMsg())).ok, true);
@@ -246,29 +238,68 @@ test('new chat after rollover: unrelated or other-PR drafts are kept and nothing
   }
 });
 
-test('after a project rollover only that exact project home is accepted, checked by URL slug before anything is typed', async () => {
-  const wrong = ['https://chatgpt.com/', 'https://chatgpt.com/g/g-p-2-other/project', 'https://chatgpt.com/g/g-p-1-proj-archive/project',
-    'https://chatgpt.com/g/g-p-1/project'];
-  for (const url of wrong) {
-    const t = await activated({ url, initial: '내 메모' });
-    const res = await t.send(handoffMsg({ project: 'g-p-1-proj' }));
-    assert.equal(res.ok, false, url);
-    assert.match(res.error, /original project/);
-    assert.equal(t.text(), '내 메모');
-    assert.deepEqual(t.log.submitted, []);
-    assert.deepEqual(t.log.keys, []);
+const SLUG = 'g-p-6a1b2c-code-review';
+const MENU = [{ text: 'Other', value: 'g-p-999-other' }, { text: 'Code Review', value: 'g-p-6a1b2c' }];
+const projectOpts = (extra = {}) => ({ url: 'https://chatgpt.com/', selector: 'Code Review', menu: MENU, ...extra });
+
+test('project rollover: the selected project is verified by ID, then the restored command is sent exactly once', async () => {
+  const t = await activated(projectOpts({ initial: TEXT }));
+  assert.equal((await t.send(handoffMsg({ project: SLUG }))).ok, true);
+  assert.deepEqual(t.log.submitted, [TEXT]);
+  assert.deepEqual(t.log.fills, []);
+  assert.equal(t.selectorButton.attrs['aria-expanded'], 'false'); // the menu was closed again
+  assert.equal((await t.send(handoffMsg({ project: SLUG }))).ok, true); // replay: deduped
+  assert.deepEqual(t.log.submitted, [TEXT]);
+});
+
+test('project rollover: an empty composer is filled after verification', async () => {
+  const t = await activated(projectOpts());
+  assert.equal((await t.send(handoffMsg({ project: SLUG }))).ok, true);
+  assert.deepEqual(t.log.submitted, [TEXT]);
+});
+
+test('project rollover: a same-named project with another ID, a duplicate name, an overlapping name or no selector stops before typing', async () => {
+  const cases = {
+    'another ID': projectOpts({ menu: [{ text: 'Code Review', value: 'g-p-777-code-review' }] }),
+    'duplicate name': projectOpts({ menu: [...MENU, { text: 'Code Review', value: 'g-p-777' }] }),
+    'overlapping name': projectOpts({ selector: 'Code Review Archive', menu: [{ text: 'Code Review Archive', value: 'g-p-777' }, ...MENU] }),
+    'name not in the menu': projectOpts({ selector: 'Code Review Archive' }),
+    'plain chat (no selector)': { url: 'https://chatgpt.com/' },
+    'empty menu': projectOpts({ menu: [] }),
+    'no selected name': projectOpts({ selector: '' }),
+  };
+  for (const [name, opts] of Object.entries(cases)) {
+    const t = await activated({ ...opts, initial: TEXT });
+    const res = await t.send(handoffMsg({ project: SLUG }));
+    assert.equal(res.ok, false, name);
+    assert.match(res.error, /cannot verify/, name);
+    assert.equal(t.text(), TEXT, name);
+    assert.deepEqual(t.log.keys, [], name);
+    assert.deepEqual(t.log.submitted, [], name);
+    if (t.selectorButton) assert.equal(t.selectorButton.attrs['aria-expanded'], 'false', name);
   }
-  // a project home that the background did not announce, or any label, is never enough
-  const t = await activated({ url: 'https://chatgpt.com/g/g-p-1-proj/project', label: 'Code Review의 새 채팅' });
-  assert.equal((await t.send(handoffMsg())).ok, false);
+});
+
+test('project rollover: a project switch right before sending aborts; the command stays pending, nothing is submitted', async () => {
+  const t = await activated(projectOpts({ renameOnFill: 'Other' }));
+  const res = await t.send(handoffMsg({ project: SLUG }));
+  assert.equal(res.ok, false);
+  assert.match(res.error, /project changed/);
+  assert.deepEqual(t.log.submitted, []);
+  assert.deepEqual(t.log.keys, []);
+});
+
+test('project rollover: an unrelated draft is still kept untouched and not sent', async () => {
+  const t = await activated(projectOpts({ initial: '내 메모' }));
+  const res = await t.send(handoffMsg({ project: SLUG }));
+  assert.equal(res.ok, false);
+  assert.equal(t.text(), '내 메모');
   assert.deepEqual(t.log.submitted, []);
 });
 
-test('the same project home is accepted and the +1 is sent once', async () => {
-  const t = await activated({ url: 'https://chatgpt.com/g/g-p-1-proj/project' });
-  assert.equal((await t.send(handoffMsg({ project: 'g-p-1-proj' }))).ok, true);
-  assert.equal((await t.send(handoffMsg({ project: 'g-p-1-proj' }))).ok, true); // replay: deduped
-  assert.deepEqual(t.log.submitted, [TEXT]);
+test('plain conversation rollover needs no project verification', async () => {
+  const t = await activated({ url: 'https://chatgpt.com/' });
+  assert.equal((await t.send(handoffMsg())).ok, true);
 });
 
 test('the new-chat route is rejected for a handoff that carries no session', async () => {

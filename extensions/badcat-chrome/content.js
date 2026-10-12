@@ -3,7 +3,7 @@
 // submitted (e.g. ChatGPT still answering) is left in the composer; the next handoff is appended to it.
 (function () {
   'use strict';
-  const { isConversationUrl, isNewChatUrl, projectHomeSlug, reviewMessage, parseEvent, eventKey } = self.BadCatShared;
+  const { isConversationUrl, isNewChatUrl, reviewMessage, parseEvent, eventKey } = self.BadCatShared;
 
   // ChatGPT's composer is a ProseMirror contenteditable. Match on semantic attributes only (no class
   // names or localized aria-labels); the send button is the submit button in the composer's own form (it sits outside [data-composer-input]).
@@ -15,6 +15,9 @@
   const LIMIT_TEXT_RE = /최대\s*(길이|깊이)|maximum\s+(conversation\s+)?(length|depth)/i;
   const NEW_CHAT_LABELS = ['새 대화 시작', '새 채팅 시작', 'Start new chat', 'Start a new chat'];
   const NEW_CHAT_SETTLE_MS = 800; // ChatGPT restores the unsent draft shortly after the composer appears
+  // The new chat's project selector (semantic attribute only) and the menu items it lists.
+  const PROJECT_BUTTON = '[data-composer-navigation-target="workspace-project"]';
+  const MENUS = '[role="menu"], [role="listbox"]';
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
   async function waitFor(check, timeoutMs) {
@@ -25,6 +28,37 @@
       if (Date.now() >= deadline) return null;
       await sleep(100);
     }
+  }
+
+  const projectLabel = () => {
+    const button = document.querySelector(PROJECT_BUTTON);
+    return button ? (button.textContent || '').trim() : '';
+  };
+
+  const menuItems = () => {
+    const items = [];
+    for (const menu of document.querySelectorAll(MENUS)) items.push(...menu.querySelectorAll('[data-value]'));
+    return items;
+  };
+
+  // The ID (data-value) the selector's menu lists must equal the project ID of the old conversation (its
+  // URL slug g-p-<id>-<name>, or exactly the ID). Returns the verified selected name, or null when the
+  // name is missing, listed twice, or maps to another ID. The menu is opened, read and closed again.
+  async function verifyProject(slug) {
+    const button = document.querySelector(PROJECT_BUTTON);
+    const name = projectLabel();
+    if (!button || !name) return null;
+    button.click();
+    const items = await waitFor(() => { const found = menuItems(); return found.length ? found : null; }, 2000);
+    let verified = null;
+    if (items) {
+      const same = items.filter((item) => (item.textContent || '').trim() === name);
+      const id = same.length === 1 ? same[0].getAttribute('data-value') : null;
+      if (id && (id === slug || slug.startsWith(id + '-'))) verified = name;
+    }
+    if (button.getAttribute('aria-expanded') === 'true') button.click();
+    await waitFor(() => menuItems().length === 0, 1000);
+    return verified;
   }
 
   const readComposer = (el) => (el.textContent || '').trim();
@@ -124,14 +158,8 @@
     const key = event ? eventKey(event) : null;
     if (key && submitted.has(key)) return { ok: true };
     const conversation = isConversationUrl(location.href);
-    const homeSlug = projectHomeSlug(location.href);
-    if (!conversation && !(session !== undefined && (isNewChatUrl(location.href) || homeSlug !== null))) {
+    if (!conversation && !(session !== undefined && isNewChatUrl(location.href))) {
       return { ok: false, error: 'not a conversation page' };
-    }
-    // After a rollover from a project the message may only go out on that project's own home, whose
-    // URL slug is the identity. Anywhere else (e.g. a plain new chat) nothing is typed or sent.
-    if (!conversation && (expectedProject || homeSlug !== null) && homeSlug !== expectedProject) {
-      return { ok: false, error: 'the new chat is not in the original project' };
     }
     const text = reviewMessage(pr);
     const composer = await waitFor(() => document.querySelector(COMPOSER), 5000);
@@ -150,12 +178,23 @@
     if (!conversation && existing !== '' && existing !== text) {
       return { ok: false, error: 'the composer holds an unrelated draft' };
     }
+    // After a rollover from a project the new chat must verifiably be in that same project, checked
+    // before anything is typed; otherwise nothing is sent and the composer is left as it is.
+    let verifiedName = null;
+    if (!conversation && expectedProject) {
+      verifiedName = await verifyProject(expectedProject);
+      if (!active()) return { ok: false, error: 'session stopped' };
+      if (verifiedName === null) return { ok: false, error: 'cannot verify the new chat is in the original project' };
+    }
     if (!containsCommand(existing, text)) {
       const full = appendToComposer(composer, existing, text);
       if (readComposer(composer) !== full) return { ok: false, error: 'could not fill the composer' };
     }
 
     if (!active()) return { ok: false, error: 'session stopped' };
+    if (verifiedName !== null && projectLabel() !== verifiedName) {
+      return { ok: false, error: 'the selected project changed; not sent' }; // the command stays pending in the composer
+    }
     pressEnter(composer);
     let sent = await waitFor(() => readComposer(composer) === '', 3000);
     if (!sent) {

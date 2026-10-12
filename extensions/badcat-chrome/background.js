@@ -2,7 +2,7 @@
 // The popup only asks it to start/stop; closing the popup changes nothing here.
 importScripts('shared.js');
 
-const { HOST_NAME, normalizeRepo, isConversationUrl, isNewChatUrl, projectOf, projectHomeSlug, parseEvent, eventKey } = self.BadCatShared;
+const { HOST_NAME, normalizeRepo, isConversationUrl, isNewChatUrl, projectOf, parseEvent, eventKey } = self.BadCatShared;
 
 const SESSION_KEY = 'badcat.session'; // {active, repo, tabId, error, rollover?: {project}}
 const DELIVERED_KEY = 'badcat.delivered.v2';
@@ -215,7 +215,6 @@ async function handleEvent(connection, message) {
     if (connection !== port) return;
     // Mid-rollover the tab legitimately sits on the new-chat route until the first message is sent.
     const newChat = rolloverPage(current, tab.url);
-    if (current.rollover && current.rollover.project && isNewChatUrl(tab.url)) continue; // still being sent back to the project
     if (!isConversationUrl(tab.url) && !newChat) {
       await deactivate('The tab is no longer a ChatGPT conversation.');
       return;
@@ -278,12 +277,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 // The exact top-level frame of the bound tab, on a page the session may legitimately use.
-// Mid-rollover pages: the plain new-chat route (no project) or exactly the original project's home.
-function rolloverPage(session, url) {
-  if (!session.rollover) return false;
-  const project = session.rollover.project;
-  return project ? projectHomeSlug(url) === project : isNewChatUrl(url);
-}
+// Mid-rollover, the plain new-chat route is a valid page (the content script verifies the project).
+const rolloverPage = (session, url) => Boolean(session.rollover) && isNewChatUrl(url);
 
 async function boundSender(sender, allowNewChat) {
   const session = await getSession();
@@ -329,15 +324,6 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
       return;
     }
     await setSession(rest);
-    return;
-  }
-  if (session.rollover && session.rollover.project && isNewChatUrl(changeInfo.url)) {
-    // The new chat at "/" cannot be tied to a project: return to the project's own home, whose URL is its identity.
-    try {
-      await chrome.tabs.update(tabId, { url: 'https://chatgpt.com/g/' + session.rollover.project + '/project' });
-    } catch (e) {
-      await deactivate('Cannot return to the original project.');
-    }
     return;
   }
   if (rolloverPage(session, changeInfo.url)) return;
