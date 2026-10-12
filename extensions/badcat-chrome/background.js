@@ -222,7 +222,7 @@ async function handleEvent(connection, message) {
 
     try {
       const request = { type: 'badcat:handoff', pr: event.pr, event: event, session: connection.sessionId };
-      if (newChat && current.rollover.project) request.requireProject = true;
+      if (newChat && current.rollover.name) request.projectName = current.rollover.name;
       const result = await chrome.tabs.sendMessage(current.tabId, request);
       if (result && result.ok === true) {
         // Save even if Stop raced with the response: the submission really happened.
@@ -296,7 +296,14 @@ async function hello(sender) {
 async function rollover(message, sender) {
   const session = await boundSender(sender, false);
   if (session === null || port === null || message.session !== port.sessionId) return { ok: false };
-  await setSession({ ...session, rollover: { project: projectOf(sender.url) } });
+  const project = projectOf(sender.url);
+  const name = typeof message.projectName === 'string' ? message.projectName.trim().slice(0, 100) : '';
+  if (project && !name) {
+    // Without a trusted project name the new chat could not be verified before sending: do not roll over.
+    await setSession({ ...session, error: 'Cannot identify the project; start a new chat manually.' });
+    return { ok: false };
+  }
+  await setSession({ ...session, rollover: { project, name } });
   return { ok: true };
 }
 

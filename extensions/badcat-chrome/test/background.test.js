@@ -314,7 +314,7 @@ const NEW_CHAT = 'https://chatgpt.com/';
 async function rolled(opts = {}) {
   const t = await started({ tabUrl: PROJECT_URL, ...opts });
   const sid = t.natives[0].sessionId;
-  assert.equal((await t.fromContent({ type: 'badcat:rollover', session: sid })).ok, true);
+  assert.equal((await t.fromContent({ type: 'badcat:rollover', session: sid, projectName: 'Code Review' })).ok, true);
   return { t, sid };
 }
 
@@ -391,7 +391,7 @@ test('a +1 on the new-chat route is handed off to the same tab and acknowledged;
   await t.settle();
   assert.equal(t.sent.length, 1);
   assert.equal(t.sent[0].id, 7);
-  assert.equal(t.sent[0].message.requireProject, true);
+  assert.equal(t.sent[0].message.projectName, 'Code Review');
   assert.equal(t.natives[0].posted.filter((m) => m.type === 'ack').length, 1);
   t.natives[0].emit(plus1(123, HEAD1)); // replay after a lost ack
   await t.settle();
@@ -411,4 +411,25 @@ test('closing the tab during a rollover deactivates', async () => {
   const { t } = await rolled();
   await t.listeners['tabs.onRemoved'](7);
   assert.equal(t.session().active, false);
+});
+
+test('a project conversation whose project name is unknown is not rolled over; the error is visible', async () => {
+  const t = await started({ tabUrl: PROJECT_URL });
+  const answer = await t.fromContent({ type: 'badcat:rollover', session: t.natives[0].sessionId, projectName: '' });
+  assert.equal(answer.ok, false);
+  assert.equal(t.session().active, true);
+  assert.match(t.session().error, /project/);
+  assert.equal('rollover' in t.session(), false);
+  await t.navigate(NEW_CHAT);
+  assert.equal(t.session().active, false);
+});
+
+test('a plain (non-project) conversation rolls over without a project name', async () => {
+  const t = await started();
+  assert.equal((await t.fromContent({ type: 'badcat:rollover', session: t.natives[0].sessionId, projectName: '' })).ok, true);
+  await t.navigate(NEW_CHAT);
+  assert.equal(t.session().active, true);
+  t.natives[0].emit(plus1(5, HEAD1));
+  await t.settle();
+  assert.equal('projectName' in t.sent[0].message, false);
 });

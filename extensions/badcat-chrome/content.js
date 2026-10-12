@@ -3,7 +3,7 @@
 // submitted (e.g. ChatGPT still answering) is left in the composer; the next handoff is appended to it.
 (function () {
   'use strict';
-  const { isConversationUrl, isNewChatUrl, reviewMessage, parseEvent, eventKey } = self.BadCatShared;
+  const { isConversationUrl, isNewChatUrl, projectOf, reviewMessage, parseEvent, eventKey } = self.BadCatShared;
 
   // ChatGPT's composer is a ProseMirror contenteditable. Match on semantic attributes only (no class
   // names or localized aria-labels); the send button is the submit button in the composer's own form (it sits outside [data-composer-input]).
@@ -76,6 +76,21 @@
     return null;
   }
 
+  // The display name of the current project, taken from the page's own link to that project
+  // (/g/<slug>/project). Empty when it cannot be determined.
+  function projectName() {
+    const slug = projectOf(location.href);
+    if (slug === null) return '';
+    for (const a of document.querySelectorAll('a')) {
+      const href = a.getAttribute('href') || '';
+      if (href === '/g/' + slug + '/project' || href === '/g/' + slug + '/project/') {
+        const name = (a.textContent || '').trim();
+        if (name) return name;
+      }
+    }
+    return '';
+  }
+
   async function checkRollover() {
     checkTimer = null;
     const session = activeSession;
@@ -90,7 +105,7 @@
     // The background must know before the click: the navigation to the new-chat route is then expected.
     let answer = null;
     try {
-      answer = await chrome.runtime.sendMessage({ type: 'badcat:rollover', session: session });
+      answer = await chrome.runtime.sendMessage({ type: 'badcat:rollover', session: session, projectName: projectName() });
     } catch (e) { /* background unavailable: leave the alert alone */ }
     if (!answer || answer.ok !== true || session !== activeSession) return;
     button.click();
@@ -116,7 +131,7 @@
   }
 
   const submitted = new Set(); // survives service-worker restart while this tab stays open
-  async function handoff(pr, session, event, requireProject) {
+  async function handoff(pr, session, event, expectedProject) {
     // A freshly reloaded page may still be rebinding to its session.
     if (session !== undefined && activeSession === null) await waitFor(() => activeSession !== null, 3000);
     const active = () => session === undefined || session === activeSession;
@@ -131,9 +146,11 @@
     if (!composer) return { ok: false, error: 'composer not found' };
 
     if (!conversation) {
-      // New chat after a rollover: it must still sit in the project the old conversation was in.
-      if (requireProject && !composer.getAttribute('aria-label')) {
-        return { ok: false, error: 'the new chat lost its project' };
+      // New chat after a rollover: its composer label must name the project the old conversation was in
+      // (checked before anything is typed; the draft stays untouched on a mismatch).
+      const label = (composer.getAttribute('aria-label') || '').toLowerCase();
+      if (expectedProject && !label.includes(expectedProject.toLowerCase())) {
+        return { ok: false, error: 'the new chat is not in the original project' };
       }
       await sleep(NEW_CHAT_SETTLE_MS);
       if (!active()) return { ok: false, error: 'session stopped' };
@@ -193,7 +210,8 @@
         sendResponse({ ok: false, error: 'invalid event' });
         return false;
       }
-      const task = queue.then(() => handoff(message.pr, message.session, event, message.requireProject === true));
+      const task = queue.then(() => handoff(message.pr, message.session, event,
+        typeof message.projectName === 'string' ? message.projectName : ''));
       queue = task.catch(() => {});
       task.then(sendResponse, (e) => sendResponse({ ok: false, error: String(e.message) }));
       return true;

@@ -49,7 +49,7 @@ function node(tag, attrs = {}, children = []) {
   return el;
 }
 
-function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubmits = false, sendButton = true, initial = '', label = 'Code Review의 새 채팅', rollover = { ok: true }, hello = { ok: false } } = {}) {
+function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubmits = false, sendButton = true, initial = '', label = 'Code Review의 새 채팅', rollover = { ok: true }, hello = { ok: false }, projectLink = null } = {}) {
   let now = 0; // virtual clock: waits finish instantly
   let enterSubmitsNow = enterSubmits;
   const log = { submitted: [], keys: [], clicks: 0, decoyClicks: 0, fills: [] };
@@ -81,7 +81,9 @@ function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubm
     node('div', { 'data-composer-input': '' }, [node('div', {}, composer ? [editor] : [otherEditable])]),
     node('footer', {}, [stopOrVoice, ...(sendButton ? [send] : [])]),
   ]);
-  const page = node('body', {}, [node('form', {}, [otherSubmit]), legacy, ...(composer ? [otherEditable] : []), form]);
+  const link = projectLink ? node('a', { href: projectLink.href }) : null;
+  if (link) link.textContent = projectLink.text;
+  const page = node('body', {}, [...(link ? [link] : []), node('form', {}, [otherSubmit]), legacy, ...(composer ? [otherEditable] : []), form]);
 
   const document = {
     body: page,
