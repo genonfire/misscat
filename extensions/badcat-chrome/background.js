@@ -75,7 +75,7 @@ async function start(repoInput, tabId) {
     return { ok: false, error: 'Reload the ChatGPT tab, then try again.' };
   }
 
-  await chrome.storage.local.remove(UNCERTAIN_KEY); // starting again is the explicit recovery from an unconfirmed send
+  await clearUncertain(); // starting again is the explicit recovery from an unconfirmed send
   let connection;
   try {
     connection = chrome.runtime.connectNative(HOST_NAME);
@@ -146,13 +146,24 @@ async function uncertainKeys() {
   return stored[UNCERTAIN_KEY] || [];
 }
 
-function rememberUncertain(key) {
+// Every write of the uncertain list goes through storageQueue, in order with Start's reset. A write on behalf
+// of a connection that is no longer the live one is dropped when its turn comes. Returns whether it was saved.
+function rememberUncertain(key, connection) {
+  let saved = false;
   const save = storageQueue.then(async () => {
+    if (connection !== port) return;
     const latest = await uncertainKeys();
     await chrome.storage.local.set({ [UNCERTAIN_KEY]: [...new Set(latest.concat(key))].slice(-MAX_DELIVERED) });
+    saved = true;
   });
   storageQueue = save.catch(() => {});
-  return save;
+  return save.then(() => saved);
+}
+
+function clearUncertain() {
+  const clear = storageQueue.then(() => chrome.storage.local.remove(UNCERTAIN_KEY));
+  storageQueue = clear.catch(() => {});
+  return clear;
 }
 
 function forgetUncertain(key) {
@@ -295,7 +306,7 @@ async function deliverEvent(connection, message) {
       if (result && result.ambiguous === true) {
         // It may have been submitted: never resend automatically, never ACK; leave it visible to the user.
         console.error('handoff unconfirmed:', key);
-        await rememberUncertain(key);
+        await rememberUncertain(key, connection);
         await reportError(connection, 'Delivery could not be confirmed; check ChatGPT. Not sent again.');
         return;
       }
@@ -366,8 +377,7 @@ async function attempt(message, sender) {
   const session = await boundSender(sender, true);
   if (session === null || port === null || message.session !== port.sessionId) return { ok: false };
   if (inFlight === null || inFlight.connection !== port) return { ok: false };
-  await rememberUncertain(inFlight.key);
-  return { ok: true };
+  return { ok: await rememberUncertain(inFlight.key, inFlight.connection) };
 }
 
 // A freshly loaded content script (e.g. after a full-page rollover navigation) asks for its session id.

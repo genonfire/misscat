@@ -618,3 +618,26 @@ test('late answers of an older session never touch the new session (OFF then ON 
     assert.equal(acks(t, 1) >= 1, true, how);
   }
 });
+
+test('a pending write of an old session\'s uncertain key cannot outlive the Start of the next session', async () => {
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  let hold = false;
+  const t = await started({ fakeTimers: true, handoff: async () => ({ ok: false, ambiguous: true }),
+    beforeLocalSet: async (obj) => { if (hold && 'badcat.uncertain.v1' in obj) await gate; } });
+  hold = true;
+  t.natives[0].emit(plus1(5, HEAD1));
+  await t.settle(); // A's uncertain write is now waiting inside the storage queue
+  await t.popup({ type: 'badcat:stop', tabId: 7 });
+  const started2 = t.popup({ type: 'badcat:start', repo: 'o/r', tabId: 7 }); // B
+  await t.settle();
+  release();
+  assert.equal((await started2).ok, true);
+  await t.settle();
+  hold = false;
+  assert.equal(t.store['badcat.uncertain.v1'], undefined); // A's stale key was dropped, not resurrected
+  assert.equal(t.session().error, null);
+  t.natives[1].emit(plus1(5, HEAD1)); // the same event in B is handled, not blocked
+  await t.settle();
+  assert.equal(t.sent.length, 2);
+});
