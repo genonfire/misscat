@@ -45,6 +45,8 @@ function boot({ tabUrl = GOOD_URL, handoff = async () => ({ ok: true }), seed = 
     tabs: {
       onRemoved: hook('tabs.onRemoved'),
       onUpdated: hook('tabs.onUpdated'),
+      updates: [],
+      async update(id, props) { tabs[id].url = props.url; this.updates.push(props.url); },
       async get(id) { if (!tabs[id]) throw new Error('No tab'); return tabs[id]; },
       async sendMessage(id, message) {
         if (message.type !== 'badcat:handoff') { controls.push(message); return control(message); }
@@ -75,7 +77,7 @@ function boot({ tabUrl = GOOD_URL, handoff = async () => ({ ok: true }), seed = 
   const navigate = async (url, id = 7) => { tabs[id].url = url; await listeners['tabs.onUpdated'](id, { url }); };
   const session = () => store['badcat.session'];
   const settle = () => new Promise((r) => setImmediate(r));
-  return { popup, fromContent, navigate, session, store, tabs, sent, controls, listeners, natives, settle, timers };
+  return { popup, fromContent, updates: chrome.tabs.updates, navigate, session, store, tabs, sent, controls, listeners, natives, settle, timers };
 }
 
 module.exports = { bootBackground: boot };

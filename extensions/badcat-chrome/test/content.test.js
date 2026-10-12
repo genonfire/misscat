@@ -163,7 +163,7 @@ test('the real limit alert is announced to the background, then "새 대화 시�
   const alert = t.limitAlert(LIMIT, ['새 대화 시작', '새 대화 시작']); // duplicated button as captured
   t.mutate(); t.mutate(); t.mutate();
   await t.settle(); await t.settle();
-  assert.equal(JSON.stringify(t.runtimeCalls.filter((m) => m.type === 'badcat:rollover')), JSON.stringify([{ type: 'badcat:rollover', session: SESSION, projectName: '' }]));
+  assert.equal(JSON.stringify(t.runtimeCalls.filter((m) => m.type === 'badcat:rollover')), JSON.stringify([{ type: 'badcat:rollover', session: SESSION,  }]));
   assert.deepEqual(alert.buttons.map((b) => b.clicks), [1, 0]);
 });
 
@@ -222,8 +222,8 @@ const EVENT = { repo: 'o/r', pr: 123, head: 'a'.repeat(40), status: '+1', review
 const handoffMsg = (extra = {}) => ({ type: 'badcat:handoff', pr: 123, session: SESSION, event: EVENT, ...extra });
 
 test('new chat after rollover: a restored draft that is this very command is submitted once', async () => {
-  const t = await activated({ url: 'https://chatgpt.com/', initial: TEXT });
-  const res = await t.send(handoffMsg({ projectName: 'Code Review' }));
+  const t = await activated({ url: 'https://chatgpt.com/g/g-p-1-proj/project', initial: TEXT });
+  const res = await t.send(handoffMsg({ project: 'g-p-1-proj' }));
   assert.equal(res.ok, true);
   assert.deepEqual(t.log.submitted, [TEXT]);
   assert.deepEqual(t.log.fills, []); // not typed a second time
@@ -246,31 +246,29 @@ test('new chat after rollover: unrelated or other-PR drafts are kept and nothing
   }
 });
 
-test('new chat after rollover: a non-empty label of another project or a plain chat stops the handoff before sending', async () => {
-  for (const label of ['ChatGPT에게 물어보세요', 'Other의 새 채팅', '']) {
-    const t = await activated({ url: 'https://chatgpt.com/', label, initial: '내 메모' });
-    const res = await t.send(handoffMsg({ projectName: 'Code Review' }));
-    assert.equal(res.ok, false);
+test('after a project rollover only that exact project home is accepted, checked by URL slug before anything is typed', async () => {
+  const wrong = ['https://chatgpt.com/', 'https://chatgpt.com/g/g-p-2-other/project', 'https://chatgpt.com/g/g-p-1-proj-archive/project',
+    'https://chatgpt.com/g/g-p-1/project'];
+  for (const url of wrong) {
+    const t = await activated({ url, initial: '내 메모' });
+    const res = await t.send(handoffMsg({ project: 'g-p-1-proj' }));
+    assert.equal(res.ok, false, url);
     assert.match(res.error, /original project/);
     assert.equal(t.text(), '내 메모');
     assert.deepEqual(t.log.submitted, []);
     assert.deepEqual(t.log.keys, []);
   }
-  const t = await activated({ url: 'https://chatgpt.com/' }); // no project expected: plain conversations roll over freely
-  assert.equal((await t.send(handoffMsg())).ok, true);
+  // a project home that the background did not announce, or any label, is never enough
+  const t = await activated({ url: 'https://chatgpt.com/g/g-p-1-proj/project', label: 'Code Review의 새 채팅' });
+  assert.equal((await t.send(handoffMsg())).ok, false);
+  assert.deepEqual(t.log.submitted, []);
 });
 
-test('the project name is read from the page link and sent with the rollover; it is empty when unknown', async () => {
-  let t = boot({ url: 'https://chatgpt.com/g/g-p-1-proj/c/old', projectLink: { href: '/g/g-p-1-proj/project', text: ' Code Review ' } });
-  t.limitAlert(LIMIT, ['새 대화 시작']);
-  await t.send({ type: 'badcat:activate', session: SESSION });
-  await t.settle(); await t.settle();
-  assert.equal(t.runtimeCalls.find((m) => m.type === 'badcat:rollover').projectName, 'Code Review');
-  t = boot({ url: 'https://chatgpt.com/g/g-p-1-proj/c/old', projectLink: { href: '/g/g-p-9-else/project', text: 'Else' } });
-  t.limitAlert(LIMIT, ['새 대화 시작']);
-  await t.send({ type: 'badcat:activate', session: SESSION });
-  await t.settle(); await t.settle();
-  assert.equal(t.runtimeCalls.find((m) => m.type === 'badcat:rollover').projectName, '');
+test('the same project home is accepted and the +1 is sent once', async () => {
+  const t = await activated({ url: 'https://chatgpt.com/g/g-p-1-proj/project' });
+  assert.equal((await t.send(handoffMsg({ project: 'g-p-1-proj' }))).ok, true);
+  assert.equal((await t.send(handoffMsg({ project: 'g-p-1-proj' }))).ok, true); // replay: deduped
+  assert.deepEqual(t.log.submitted, [TEXT]);
 });
 
 test('the new-chat route is rejected for a handoff that carries no session', async () => {

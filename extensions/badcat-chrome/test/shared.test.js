@@ -75,3 +75,12 @@ test('isNewChatUrl accepts only the chatgpt.com root; projectOf reads the projec
   assert.equal(S.projectOf('https://chatgpt.com/c/68a1'), null);
   assert.equal(S.projectOf('nope'), null);
 });
+
+test('projectHomeSlug reads only /g/<slug>/project on https://chatgpt.com', () => {
+  assert.equal(S.projectHomeSlug('https://chatgpt.com/g/g-p-1-proj/project'), 'g-p-1-proj');
+  assert.equal(S.projectHomeSlug('https://chatgpt.com/g/g-p-1-proj/project/'), 'g-p-1-proj');
+  for (const bad of ['https://chatgpt.com/g/g-p-1-proj/c/1', 'https://chatgpt.com/', 'https://chatgpt.com/g/x/project/y',
+    'https://evil.com/g/x/project', 'http://chatgpt.com/g/x/project', 'nope', undefined]) {
+    assert.equal(S.projectHomeSlug(bad), null, String(bad));
+  }
+});

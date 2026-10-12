@@ -53,6 +53,17 @@
     }
   }
 
+  // The project home /g/<slug>/project; its slug (from the URL itself) is the project identity.
+  function projectHomeSlug(url) {
+    try {
+      const u = new URL(url);
+      const m = u.pathname.match(/^\/g\/([A-Za-z0-9_-]+)\/project\/?$/);
+      return u.protocol === 'https:' && u.hostname === 'chatgpt.com' && m ? m[1] : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
   // The only host message that triggers a handoff: a "+1" for the watched repo.
   // Returns the validated event contract for forwarding and re-validation by content.js.
   // Normalization preserves status and IDs; errors, +2, malformed/other-repo events return null.
@@ -94,6 +105,7 @@
     isConversationUrl: isConversationUrl,
     isNewChatUrl: isNewChatUrl,
     projectOf: projectOf,
+    projectHomeSlug: projectHomeSlug,
     parseEvent: parseEvent,
     eventKey: eventKey,
     reviewMessage: reviewMessage,

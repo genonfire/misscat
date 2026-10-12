@@ -3,7 +3,7 @@
 // submitted (e.g. ChatGPT still answering) is left in the composer; the next handoff is appended to it.
 (function () {
   'use strict';
-  const { isConversationUrl, isNewChatUrl, projectOf, reviewMessage, parseEvent, eventKey } = self.BadCatShared;
+  const { isConversationUrl, isNewChatUrl, projectHomeSlug, reviewMessage, parseEvent, eventKey } = self.BadCatShared;
 
   // ChatGPT's composer is a ProseMirror contenteditable. Match on semantic attributes only (no class
   // names or localized aria-labels); the send button is the submit button in the composer's own form (it sits outside [data-composer-input]).
@@ -76,21 +76,6 @@
     return null;
   }
 
-  // The display name of the current project, taken from the page's own link to that project
-  // (/g/<slug>/project). Empty when it cannot be determined.
-  function projectName() {
-    const slug = projectOf(location.href);
-    if (slug === null) return '';
-    for (const a of document.querySelectorAll('a')) {
-      const href = a.getAttribute('href') || '';
-      if (href === '/g/' + slug + '/project' || href === '/g/' + slug + '/project/') {
-        const name = (a.textContent || '').trim();
-        if (name) return name;
-      }
-    }
-    return '';
-  }
-
   async function checkRollover() {
     checkTimer = null;
     const session = activeSession;
@@ -105,7 +90,7 @@
     // The background must know before the click: the navigation to the new-chat route is then expected.
     let answer = null;
     try {
-      answer = await chrome.runtime.sendMessage({ type: 'badcat:rollover', session: session, projectName: projectName() });
+      answer = await chrome.runtime.sendMessage({ type: 'badcat:rollover', session: session });
     } catch (e) { /* background unavailable: leave the alert alone */ }
     if (!answer || answer.ok !== true || session !== activeSession) return;
     button.click();
@@ -139,19 +124,21 @@
     const key = event ? eventKey(event) : null;
     if (key && submitted.has(key)) return { ok: true };
     const conversation = isConversationUrl(location.href);
-    if (!conversation && !(session !== undefined && isNewChatUrl(location.href))) return { ok: false, error: 'not a conversation page' };
+    const homeSlug = projectHomeSlug(location.href);
+    if (!conversation && !(session !== undefined && (isNewChatUrl(location.href) || homeSlug !== null))) {
+      return { ok: false, error: 'not a conversation page' };
+    }
+    // After a rollover from a project the message may only go out on that project's own home, whose
+    // URL slug is the identity. Anywhere else (e.g. a plain new chat) nothing is typed or sent.
+    if (!conversation && (expectedProject || homeSlug !== null) && homeSlug !== expectedProject) {
+      return { ok: false, error: 'the new chat is not in the original project' };
+    }
     const text = reviewMessage(pr);
     const composer = await waitFor(() => document.querySelector(COMPOSER), 5000);
     if (!active()) return { ok: false, error: 'session stopped' };
     if (!composer) return { ok: false, error: 'composer not found' };
 
     if (!conversation) {
-      // New chat after a rollover: its composer label must name the project the old conversation was in
-      // (checked before anything is typed; the draft stays untouched on a mismatch).
-      const label = (composer.getAttribute('aria-label') || '').toLowerCase();
-      if (expectedProject && !label.includes(expectedProject.toLowerCase())) {
-        return { ok: false, error: 'the new chat is not in the original project' };
-      }
       await sleep(NEW_CHAT_SETTLE_MS);
       if (!active()) return { ok: false, error: 'session stopped' };
     }
@@ -211,7 +198,7 @@
         return false;
       }
       const task = queue.then(() => handoff(message.pr, message.session, event,
-        typeof message.projectName === 'string' ? message.projectName : ''));
+        typeof message.project === 'string' ? message.project : ''));
       queue = task.catch(() => {});
       task.then(sendResponse, (e) => sendResponse({ ok: false, error: String(e.message) }));
       return true;
