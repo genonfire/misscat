@@ -518,3 +518,17 @@ test('send-button fallback: the page moved but nothing confirms it: ambiguous, n
   assert.equal(t.log.clicks, 1);
   assert.deepEqual(t.log.submitted, [TEXT]);
 });
+
+test('the attempt marker is recorded before Enter; without it nothing is pressed or sent', async () => {
+  let t = await activated();
+  await t.send({ type: 'badcat:handoff', pr: 123, session: SESSION, event: EVENT });
+  const types = t.runtimeCalls.map((m) => m.type);
+  assert.equal(types.includes('badcat:attempt'), true);
+  assert.deepEqual(t.log.submitted, [TEXT]);
+  t = await activated({ attempt: { ok: false } });
+  const res = await t.send({ type: 'badcat:handoff', pr: 123, session: SESSION, event: EVENT });
+  assert.equal(res.ok, false);
+  assert.match(res.error, /record the attempt/);
+  assert.deepEqual(t.log.keys, []);
+  assert.deepEqual(t.log.submitted, []);
+});

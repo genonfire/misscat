@@ -215,6 +215,17 @@
     if (verifiedName !== null && projectLabel() !== verifiedName) {
       return { ok: false, error: 'the selected project changed; not sent' }; // the command stays pending in the composer
     }
+    if (session !== undefined) {
+      // Durable "may be submitted" marker first: a channel broken by the navigation after Enter must not
+      // lead to an automatic resend. No marker, no send.
+      let marked = null;
+      try {
+        marked = await chrome.runtime.sendMessage({ type: 'badcat:attempt', session: session });
+      } catch (e) { /* background unavailable */ }
+      if (!marked || marked.ok !== true) return { ok: false, error: 'could not record the attempt; not sent' };
+      if (!active()) return { ok: false, error: 'session stopped' };
+      if (moved()) return changed;
+    }
     const before = countUserMessages(text);
     // Enter and the send button share one outcome routine: 'sent' (composer emptied in place, or the exact
     // command appeared as a new user message), 'uncertain' (the page moved on without that proof) or 'pending'.

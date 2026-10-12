@@ -49,7 +49,7 @@ function node(tag, attrs = {}, children = []) {
   return el;
 }
 
-function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubmits = false, sendButton = true, initial = '', label = 'Code Review의 새 채팅', rollover = { ok: true }, hello = { ok: false }, selector = null, menu = [], renameOnFill = null, restoreOnMenuOpen = null, alertOnEnter = null, onTimer = null, lateComposer = false, navigateOnMenuOpen = null, afterSubmit = null, priorBubbles = [] } = {}) {
+function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubmits = false, sendButton = true, initial = '', label = 'Code Review의 새 채팅', rollover = { ok: true }, hello = { ok: false }, attempt = { ok: true }, selector = null, menu = [], renameOnFill = null, restoreOnMenuOpen = null, alertOnEnter = null, onTimer = null, lateComposer = false, navigateOnMenuOpen = null, afterSubmit = null, priorBubbles = [] } = {}) {
   let now = 0; // virtual clock: waits finish instantly
   let enterSubmitsNow = enterSubmits;
   const log = { submitted: [], keys: [], clicks: 0, decoyClicks: 0, fills: [] };
@@ -178,7 +178,7 @@ function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubm
       disconnect() { this.disconnected = true; }
     },
     chrome: { runtime: { id: 'me', onMessage: { addListener: (fn) => listeners.push(fn) },
-      async sendMessage(m) { runtimeCalls.push(m); return m.type === 'badcat:hello' ? hello : (typeof rollover === 'function' ? rollover(m) : rollover); } } },
+      async sendMessage(m) { runtimeCalls.push(m); return m.type === 'badcat:hello' ? hello : m.type === 'badcat:attempt' ? attempt : (typeof rollover === 'function' ? rollover(m) : rollover); } } },
     setTimeout: (fn, ms) => {
       now += ms;
       if (lateAttach) { lateAttach(); lateAttach = null; }

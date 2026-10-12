@@ -514,3 +514,107 @@ test('the block survives a service-worker restart and is lifted only by an expli
   await t.popup({ type: 'badcat:start', repo: 'o/r', tabId: 7 });
   assert.equal(t.store['badcat.uncertain.v1'], undefined);
 });
+
+// --- attempt marker: a broken channel after the submit must never cause a resend ---
+const KEY5 = 'o/r#5@' + HEAD1 + ':100';
+const uncertainStore = (t) => t.store['badcat.uncertain.v1'];
+const acks = (t, i = 0) => t.natives[i].posted.filter((m) => m.type === 'ack').length;
+
+// A handoff stub that records the attempt first (as the content script does right before Enter), then ends as `how`.
+function attempting(boxRef, how) {
+  return async () => {
+    const t = boxRef.t;
+    const res = await t.fromContent({ type: 'badcat:attempt', session: t.natives[t.natives.length - 1].sessionId });
+    assert.equal(res.ok, true);
+    if (how === 'throw') throw new Error('The message channel is closed before a response was received.');
+    return how === 'ok' ? { ok: true } : how === 'ambiguous' ? { ok: false, ambiguous: true, error: 'u' } : { ok: false, error: 'message was not submitted' };
+  };
+}
+const bootAttempting = async (how) => {
+  const box = {};
+  box.t = await started({ fakeTimers: true, handoff: attempting(box, how) });
+  return box.t;
+};
+
+test('the channel breaks after the attempt was recorded (page navigation right after the submit): no retry, no ACK, no resend after replay or hello', async () => {
+  const t = await bootAttempting('throw');
+  t.natives[0].emit(plus1(5, HEAD1));
+  await t.settle();
+  assert.equal(t.sent.length, 1);
+  assert.equal(t.timers.length, 0); // no retry sleep
+  assert.deepEqual(uncertainStore(t), [KEY5]);
+  assert.equal(acks(t), 0);
+  assert.equal(t.store['badcat.delivered.v2'], undefined);
+  assert.match(t.session().error, /could not be confirmed/);
+  assert.equal((await t.fromContent({ type: 'badcat:hello' })).ok, true); // the new page rebinds
+  t.natives[0].emit(plus1(5, HEAD1)); // the host replays the event
+  await t.settle();
+  assert.equal(t.sent.length, 1);
+  assert.equal(acks(t), 0);
+});
+
+test('control: a channel error before any attempt (nothing was submitted) is retried as before', async () => {
+  const t = await started({ fakeTimers: true, handoff: async () => { throw new Error('Could not establish connection. Receiving end does not exist.'); } });
+  t.natives[0].emit(plus1(5, HEAD1));
+  await t.settle();
+  assert.equal(t.timers.length, 1); // sleeping before the retry
+  assert.equal(uncertainStore(t), undefined);
+});
+
+test('a definite "not submitted" after the attempt withdraws the marker and keeps the retry policy', async () => {
+  const t = await bootAttempting('notsubmitted');
+  t.natives[0].emit(plus1(5, HEAD1));
+  await t.settle();
+  assert.equal(t.timers.length, 1);
+  assert.deepEqual(uncertainStore(t), []);
+});
+
+test('a confirmed submission after the attempt clears the marker, saves delivered and acknowledges once', async () => {
+  const t = await bootAttempting('ok');
+  t.natives[0].emit(plus1(5, HEAD1));
+  await t.settle();
+  assert.deepEqual(uncertainStore(t), []);
+  assert.deepEqual(t.store['badcat.delivered.v2'], [KEY5]);
+  assert.equal(acks(t), 1);
+});
+
+test('an attempt is accepted only for the event being sent, from the bound tab and the live session', async () => {
+  const t = await started({ fakeTimers: true, handoff: async () => ({ ok: false, error: 'busy' }) });
+  const sid = t.natives[0].sessionId;
+  assert.equal((await t.fromContent({ type: 'badcat:attempt', session: sid })).ok, false); // nothing in flight
+  assert.equal(uncertainStore(t), undefined);
+});
+
+test('late answers of an older session never touch the new session (OFF then ON while a handoff was in flight)', async () => {
+  for (const how of ['ambiguous', 'throw', 'ok', 'notsubmitted']) {
+    let release;
+    const gate = new Promise((r) => { release = r; });
+    const box = {};
+    let first = true;
+    box.t = await started({ fakeTimers: true, handoff: async () => {
+      if (first) {
+        first = false;
+        const t = box.t;
+        await t.fromContent({ type: 'badcat:attempt', session: t.natives[0].sessionId }); // A had recorded an attempt
+        await gate;
+        if (how === 'throw') throw new Error('closed');
+        return how === 'ok' ? { ok: true } : how === 'ambiguous' ? { ok: false, ambiguous: true } : { ok: false, error: 'x' };
+      }
+      return { ok: true };
+    } });
+    const t = box.t;
+    t.natives[0].emit(plus1(5, HEAD1));
+    await t.settle();
+    await OFF_ON(t); // session B; its start clears the stale marker of A
+    assert.equal(t.store['badcat.uncertain.v1'], undefined, how);
+    release();
+    await t.settle();
+    if (how !== 'ok') assert.equal(t.store['badcat.uncertain.v1'], undefined, how); // A's late answer left no trace
+    assert.equal(t.session().error, null, how);
+    assert.equal(t.session().active, true, how);
+    assert.equal(acks(t, 1), 0, how);
+    t.natives[1].emit(plus1(5, HEAD1, { review_id: 100 })); // the same event in B is handled normally
+    await t.settle();
+    assert.equal(acks(t, 1) >= 1, true, how);
+  }
+});

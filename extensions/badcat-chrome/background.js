@@ -155,6 +155,15 @@ function rememberUncertain(key) {
   return save;
 }
 
+function forgetUncertain(key) {
+  const save = storageQueue.then(async () => {
+    const latest = await uncertainKeys();
+    await chrome.storage.local.set({ [UNCERTAIN_KEY]: latest.filter((k) => k !== key) });
+  });
+  storageQueue = save.catch(() => {});
+  return save;
+}
+
 async function reportError(connection, error) {
   const session = await getSession();
   if (connection === port && session.active) {
@@ -199,6 +208,7 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // Every handoff belongs to the connection that received the event; once that connection is no longer
 // the live one, the handoff is abandoned, even if repo and tab are unchanged in a newer session.
+let inFlight = null; // {connection, key}: the handoff currently being sent to the tab (one at a time)
 let pendingEvents = 0; // validated +1 handoffs in progress; a rollover is only ever authorized by one of them
 
 async function handleEvent(connection, message) {
@@ -259,6 +269,7 @@ async function deliverEvent(connection, message) {
       return;
     }
 
+    inFlight = { connection: connection, key: key };
     try {
       const request = { type: 'badcat:handoff', pr: event.pr, event: event, session: connection.sessionId };
       if (current.rollover && current.rollover.project) request.project = current.rollover.project;
@@ -274,10 +285,13 @@ async function deliverEvent(connection, message) {
         });
         storageQueue = save.catch(() => {});
         await save;
+        await forgetUncertain(key); // it was confirmed after all
         await clearError(connection);
         acknowledge(connection, event);
         return;
       }
+      // From here on a late answer of an older session must not touch the live one.
+      if (connection !== port) return;
       if (result && result.ambiguous === true) {
         // It may have been submitted: never resend automatically, never ACK; leave it visible to the user.
         console.error('handoff unconfirmed:', key);
@@ -285,9 +299,20 @@ async function deliverEvent(connection, message) {
         await reportError(connection, 'Delivery could not be confirmed; check ChatGPT. Not sent again.');
         return;
       }
+      // Definitely not submitted: the attempt marker (if any) is withdrawn and the retry policy applies.
       console.error('handoff not delivered:', result && result.error);
+      await forgetUncertain(key);
     } catch (e) {
       console.error('handoff not delivered:', e && e.message);
+      if (connection !== port) return;
+      // The channel broke (e.g. a full page navigation right after the submit): if the content script had
+      // already recorded the attempt, the message may be out there. Never resend it automatically.
+      if ((await uncertainKeys()).includes(key)) {
+        await reportError(connection, 'Delivery could not be confirmed; check ChatGPT. Not sent again.');
+        return;
+      }
+    } finally {
+      if (inFlight && inFlight.connection === connection) inFlight = null;
     }
   }
   console.error('giving up on', key, '- not marked delivered');
@@ -298,10 +323,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (sender.id !== chrome.runtime.id || !message || typeof message !== 'object') return false;
   // A content script may only rebind itself to, or announce a rollover of, the session's own tab.
   if (sender.tab) {
-    if (message.type !== 'badcat:hello' && message.type !== 'badcat:rollover') return false;
+    if (message.type !== 'badcat:hello' && message.type !== 'badcat:rollover' && message.type !== 'badcat:attempt') return false;
     const handle = async () => {
       await ready;
-      return message.type === 'badcat:hello' ? hello(sender) : rollover(message, sender);
+      if (message.type === 'badcat:hello') return hello(sender);
+      return message.type === 'badcat:attempt' ? attempt(message, sender) : rollover(message, sender);
     };
     const action = controlQueue.then(handle);
     controlQueue = action.catch(() => {});
@@ -332,6 +358,16 @@ async function boundSender(sender, allowNewChat) {
   const url = sender.url;
   if (isConversationUrl(url) || (allowNewChat && rolloverPage(session, url))) return session;
   return null;
+}
+
+// The content script is about to press Enter / click send: persist "this event may now be submitted" first, so
+// that a broken messaging channel afterwards can never lead to an automatic resubmission.
+async function attempt(message, sender) {
+  const session = await boundSender(sender, true);
+  if (session === null || port === null || message.session !== port.sessionId) return { ok: false };
+  if (inFlight === null || inFlight.connection !== port) return { ok: false };
+  await rememberUncertain(inFlight.key);
+  return { ok: true };
 }
 
 // A freshly loaded content script (e.g. after a full-page rollover navigation) asks for its session id.
