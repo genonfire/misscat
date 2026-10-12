@@ -430,3 +430,41 @@ test('moving during the new-chat settle wait: nothing is typed or sent', async (
   assert.deepEqual(t.log.keys, []);
   assert.deepEqual(t.log.submitted, []);
 });
+
+// --- a successful first send that moves the page and re-mounts the composer ---
+test('new chat: Enter submits, the URL moves and the editor is replaced (old node keeps its text): confirmed by the rendered message, sent once', async () => {
+  const t = await activated(projectOpts({ afterSubmit: { url: 'https://chatgpt.com/g/' + SLUG + '/c/new-id', render: true } }));
+  const res = await t.send(handoffMsg({ project: SLUG }));
+  assert.equal(res.ok, true);
+  assert.deepEqual(t.log.submitted, [TEXT]);
+  assert.equal((await t.send(handoffMsg({ project: SLUG }))).ok, true); // replay: acknowledged without resending
+  assert.deepEqual(t.log.submitted, [TEXT]);
+  assert.equal(t.log.clicks, 0);
+});
+
+test('the URL moved but no such message appeared: unconfirmed, no ACK path, and never sent again', async () => {
+  const t = await activated(projectOpts({ afterSubmit: { url: 'https://chatgpt.com/g/' + SLUG + '/c/new-id', render: false } }));
+  const res = await t.send(handoffMsg({ project: SLUG }));
+  assert.equal(res.ok, false);
+  assert.equal(res.ambiguous, true);
+  const again = await t.send(handoffMsg({ project: SLUG })); // the retry / host replay
+  assert.equal(again.ok, false);
+  assert.equal(again.ambiguous, true);
+  assert.deepEqual(t.log.submitted, [TEXT]); // typed and sent exactly once
+  assert.equal(t.log.clicks, 0);
+});
+
+test('the message appeared but in a conversation of another project: not confirmed', async () => {
+  const t = await activated(projectOpts({ afterSubmit: { url: 'https://chatgpt.com/g/g-p-2-other/c/x', render: true } }));
+  const res = await t.send(handoffMsg({ project: SLUG }));
+  assert.equal(res.ok, false);
+  assert.equal(res.ambiguous, true);
+});
+
+test('a different event after an unconfirmed one is not blocked by it', async () => {
+  const t = await activated(projectOpts({ afterSubmit: { url: 'https://chatgpt.com/g/' + SLUG + '/c/n', render: false } }));
+  await t.send(handoffMsg({ project: SLUG }));
+  const other = await t.send({ ...handoffMsg({ project: SLUG }), event: { ...EVENT, review_id: 2 } });
+  assert.notEqual(other.error, UNCERTAIN_TEXT);
+});
+const UNCERTAIN_TEXT = 'submission could not be confirmed; not sent again';

@@ -471,3 +471,15 @@ test('Watching alone (no event) never triggers anything: no message to the tab b
   assert.equal(t.sent.length, 0);
   assert.equal(t.controls.filter((m) => m.type !== 'badcat:ping' && m.type !== 'badcat:activate').length, 0);
 });
+
+test('an unconfirmed submission is neither retried, acknowledged nor marked delivered; the error stays visible', async () => {
+  const t = await started({ fakeTimers: true, handoff: async () => ({ ok: false, ambiguous: true, error: 'unconfirmed' }) });
+  t.natives[0].emit(plus1(5, HEAD1));
+  await t.settle();
+  assert.equal(t.sent.length, 1);
+  assert.equal(t.timers.length, 0); // no retry sleep
+  assert.equal(t.natives[0].posted.filter((m) => m.type === 'ack').length, 0);
+  assert.equal(t.store['badcat.delivered.v2'], undefined);
+  assert.match(t.session().error, /could not be confirmed/);
+  assert.equal(t.session().active, true);
+});

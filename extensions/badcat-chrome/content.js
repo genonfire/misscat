@@ -101,6 +101,7 @@
 
   let activeSession = null;
   let queue = Promise.resolve();
+  const UNCERTAIN = { ok: false, ambiguous: true, error: 'submission could not be confirmed; not sent again' };
   const ROLLOVER_COOLDOWN_MS = 30000;
   let rolloverClickedAt = null;
   // The "new chat" button of the real limit alert, or null. Duplicated buttons: the first match wins.
@@ -135,6 +136,15 @@
     return { ok: false, rollover: true, error: 'rolling over to a new conversation' };
   }
 
+  // Events whose submission could not be confirmed (the page moved on after Enter): never sent again from here.
+  const uncertain = new Set();
+  const USER_MESSAGE = '[data-message-author-role="user"]';
+  const countUserMessages = (text) => {
+    let n = 0;
+    for (const el of document.querySelectorAll(USER_MESSAGE)) if ((el.textContent || '').trim() === text) n += 1;
+    return n;
+  };
+
   const submitted = new Set(); // survives service-worker restart while this tab stays open
   async function handoff(pr, session, event, expectedProject) {
     // A freshly reloaded page may still be rebinding to its session.
@@ -143,6 +153,7 @@
     if (!active()) return { ok: false, error: 'stale session' };
     const key = event ? eventKey(event) : null;
     if (key && submitted.has(key)) return { ok: true };
+    if (key && uncertain.has(key)) return UNCERTAIN;
     const conversation = isConversationUrl(location.href);
     if (!conversation && !(session !== undefined && isNewChatUrl(location.href))) {
       return { ok: false, error: 'not a conversation page' };
@@ -204,11 +215,25 @@
     if (verifiedName !== null && projectLabel() !== verifiedName) {
       return { ok: false, error: 'the selected project changed; not sent' }; // the command stays pending in the composer
     }
+    const before = countUserMessages(text);
     pressEnter(composer);
-    let sent = await waitFor(() => readComposer(composer) === '', 3000);
+    await waitFor(() => readComposer(composer) === '' || moved(), 3000);
+    let sent = false;
+    if (moved()) {
+      // ChatGPT left the new chat and re-mounted the composer: the old node proves nothing. Only the exact
+      // command appearing as a new user message (in a conversation of the expected project) confirms the send.
+      const landed = () => countUserMessages(text) > before && (location.href === startUrl ||
+        (isConversationUrl(location.href) && (!expectedProject || projectOf(location.href) === expectedProject)));
+      sent = Boolean(await waitFor(landed, 5000));
+      if (!sent) {
+        if (key) uncertain.add(key);
+        return UNCERTAIN; // it may have gone out: never resend automatically
+      }
+    } else {
+      sent = readComposer(composer) === '';
+    }
     if (!sent) {
       const button = findSendButton(composer);
-      // A moved page after Enter means the send most likely went through: never click again there.
       if (active() && !moved() && button && !button.disabled) {
         button.click();
         sent = await waitFor(() => readComposer(composer) === '', 3000);

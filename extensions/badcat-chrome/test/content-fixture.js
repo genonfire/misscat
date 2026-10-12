@@ -49,7 +49,7 @@ function node(tag, attrs = {}, children = []) {
   return el;
 }
 
-function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubmits = false, sendButton = true, initial = '', label = 'Code Review의 새 채팅', rollover = { ok: true }, hello = { ok: false }, selector = null, menu = [], renameOnFill = null, restoreOnMenuOpen = null, alertOnEnter = null, onTimer = null, lateComposer = false, navigateOnMenuOpen = null } = {}) {
+function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubmits = false, sendButton = true, initial = '', label = 'Code Review의 새 채팅', rollover = { ok: true }, hello = { ok: false }, selector = null, menu = [], renameOnFill = null, restoreOnMenuOpen = null, alertOnEnter = null, onTimer = null, lateComposer = false, navigateOnMenuOpen = null, afterSubmit = null } = {}) {
   let now = 0; // virtual clock: waits finish instantly
   let enterSubmitsNow = enterSubmits;
   const log = { submitted: [], keys: [], clicks: 0, decoyClicks: 0, fills: [] };
@@ -66,7 +66,25 @@ function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubm
     },
   });
   const text = () => editor.textContent;
-  const submit = () => { log.submitted.push(text()); editor.textContent = ''; };
+  const submit = () => {
+    log.submitted.push(text());
+    if (!afterSubmit) { editor.textContent = ''; return; }
+    // ChatGPT leaves the new chat: the old editor node is detached with its text still in it, a fresh composer
+    // is mounted, and (when `render`) the user's message shows up in the conversation.
+    ctx.url = afterSubmit.url;
+    const wrapEl = editor.parentElement;
+    wrapEl.children.splice(wrapEl.children.indexOf(editor), 1);
+    const fresh = node('div', { contenteditable: 'true', 'data-composer-markdown': '', class: 'ProseMirror' });
+    fresh.textContent = '';
+    fresh.parentElement = wrapEl;
+    wrapEl.children.push(fresh);
+    if (afterSubmit.render) {
+      const msg = node('div', { 'data-message-author-role': 'user' });
+      msg.textContent = log.submitted[log.submitted.length - 1];
+      msg.parentElement = page;
+      page.children.push(msg);
+    }
+  };
 
   const send = node('button', { type: 'submit', 'data-testid': 'whatever-it-is-now' });
   send.click = () => { log.clicks += 1; if (buttonSubmits) submit(); };

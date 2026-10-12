@@ -256,6 +256,12 @@ async function deliverEvent(connection, message) {
         acknowledge(connection, event);
         return;
       }
+      if (result && result.ambiguous === true) {
+        // It may have been submitted: never resend automatically, never ACK; leave it visible to the user.
+        console.error('handoff unconfirmed:', key);
+        await reportError(connection, 'Delivery could not be confirmed; check ChatGPT. Not sent again.');
+        return;
+      }
       console.error('handoff not delivered:', result && result.error);
     } catch (e) {
       console.error('handoff not delivered:', e && e.message);
