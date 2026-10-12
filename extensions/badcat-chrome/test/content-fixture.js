@@ -49,7 +49,7 @@ function node(tag, attrs = {}, children = []) {
   return el;
 }
 
-function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubmits = false, sendButton = true, initial = '', label = 'Code Review의 새 채팅', rollover = { ok: true }, hello = { ok: false }, selector = null, menu = [], renameOnFill = null } = {}) {
+function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubmits = false, sendButton = true, initial = '', label = 'Code Review의 새 채팅', rollover = { ok: true }, hello = { ok: false }, selector = null, menu = [], renameOnFill = null, restoreOnMenuOpen = null } = {}) {
   let now = 0; // virtual clock: waits finish instantly
   let enterSubmitsNow = enterSubmits;
   const log = { submitted: [], keys: [], clicks: 0, decoyClicks: 0, fills: [] };
@@ -101,6 +101,7 @@ function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubm
         projectMenu.parentElement = page;
         page.children.push(projectMenu);
         selectorButton.attrs['aria-expanded'] = 'true';
+        if (restoreOnMenuOpen !== null) editor.textContent = restoreOnMenuOpen; // ChatGPT restores a draft late
       }
     };
     form.children.push(selectorButton);

@@ -427,3 +427,22 @@ test('closing the tab during a rollover deactivates', async () => {
   await t.listeners['tabs.onRemoved'](7);
   assert.equal(t.session().active, false);
 });
+
+test('a +1 is not sent when the tab is already in another project\'s conversation, even before onUpdated has run', async () => {
+  const { t } = await rolled();
+  t.tabs[7].url = 'https://chatgpt.com/g/g-p-2-other/c/new'; // no onUpdated delivered yet
+  t.natives[0].emit(plus1(123, HEAD1));
+  await t.settle();
+  assert.equal(t.sent.length, 0);
+  assert.equal(t.natives[0].posted.filter((m) => m.type === 'ack').length, 0);
+  assert.equal(t.session().active, false);
+});
+
+test('a +1 in the same project\'s new conversation during the rollover still carries the project', async () => {
+  const { t } = await rolled();
+  t.tabs[7].url = 'https://chatgpt.com/g/g-p-1-proj/c/new';
+  t.natives[0].emit(plus1(123, HEAD1));
+  await t.settle();
+  assert.equal(t.sent.length, 1);
+  assert.equal(t.sent[0].message.project, 'g-p-1-proj');
+});

@@ -3,7 +3,7 @@
 // submitted (e.g. ChatGPT still answering) is left in the composer; the next handoff is appended to it.
 (function () {
   'use strict';
-  const { isConversationUrl, isNewChatUrl, reviewMessage, parseEvent, eventKey } = self.BadCatShared;
+  const { isConversationUrl, isNewChatUrl, projectOf, reviewMessage, parseEvent, eventKey } = self.BadCatShared;
 
   // ChatGPT's composer is a ProseMirror contenteditable. Match on semantic attributes only (no class
   // names or localized aria-labels); the send button is the submit button in the composer's own form (it sits outside [data-composer-input]).
@@ -186,10 +186,17 @@
     // After a rollover from a project the new chat must verifiably be in that same project, checked
     // before anything is typed; otherwise nothing is sent and the composer is left as it is.
     let verifiedName = null;
+    if (expectedProject && conversation && projectOf(location.href) !== expectedProject) {
+      return { ok: false, error: 'the conversation is not in the original project' };
+    }
     if (!conversation && expectedProject) {
       verifiedName = await verifyProject(expectedProject);
       if (!active()) return { ok: false, error: 'session stopped' };
       if (verifiedName === null) return { ok: false, error: 'cannot verify the new chat is in the original project' };
+      // The picker took a while: the composer may have been re-mounted or a draft restored/typed meanwhile.
+      if (document.querySelector(COMPOSER) !== composer || readComposer(composer) !== existing) {
+        return { ok: false, error: 'the composer changed during verification; not sent' };
+      }
     }
     if (!containsCommand(existing, text)) {
       const full = appendToComposer(composer, existing, text);

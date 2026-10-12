@@ -317,3 +317,34 @@ test('an already submitted event is not sent again after the rollover', async ()
   assert.equal((await t.send(handoffMsg())).ok, true);
   assert.equal(t.log.submitted.length, 1);
 });
+
+test('project rollover: a draft restored while the picker is open is kept, nothing is typed or sent; the retry sends the pending command once', async () => {
+  let t = await activated(projectOpts({ restoreOnMenuOpen: '내 메모' }));
+  let res = await t.send(handoffMsg({ project: SLUG }));
+  assert.equal(res.ok, false);
+  assert.match(res.error, /changed during verification/);
+  assert.equal(t.text(), '내 메모');
+  assert.deepEqual(t.log.keys, []);
+  assert.deepEqual(t.log.fills, []);
+  assert.deepEqual(t.log.submitted, []);
+  // the exact command restored late: also not typed over; the retry (which reads it up front) submits it once
+  t = await activated(projectOpts({ restoreOnMenuOpen: TEXT }));
+  res = await t.send(handoffMsg({ project: SLUG }));
+  assert.equal(res.ok, false);
+  assert.deepEqual(t.log.fills, []);
+  assert.deepEqual(t.log.submitted, []);
+  assert.equal(t.text(), TEXT);
+  res = await t.send(handoffMsg({ project: SLUG }));
+  assert.equal(res.ok, true);
+  assert.deepEqual(t.log.submitted, [TEXT]);
+});
+
+test('a conversation of another project is rejected right before sending when a project is required', async () => {
+  const t = await activated({ url: 'https://chatgpt.com/g/g-p-2-other/c/new' });
+  const res = await t.send(handoffMsg({ project: SLUG }));
+  assert.equal(res.ok, false);
+  assert.match(res.error, /original project/);
+  assert.deepEqual(t.log.keys, []);
+  const same = await activated({ url: 'https://chatgpt.com/g/' + SLUG + '/c/new' });
+  assert.equal((await same.send(handoffMsg({ project: SLUG }))).ok, true);
+});

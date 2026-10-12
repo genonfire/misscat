@@ -215,6 +215,12 @@ async function handleEvent(connection, message) {
     if (connection !== port) return;
     // Mid-rollover the tab legitimately sits on the new-chat route until the first message is sent.
     const newChat = rolloverPage(current, tab.url);
+    // Before the onUpdated handler has run, a conversation of another project must still not get a message.
+    if (current.rollover && current.rollover.project && isConversationUrl(tab.url) &&
+        projectOf(tab.url) !== current.rollover.project) {
+      await deactivate('The new conversation is not in the original project.');
+      return;
+    }
     if (!isConversationUrl(tab.url) && !newChat) {
       await deactivate('The tab is no longer a ChatGPT conversation.');
       return;
@@ -222,7 +228,7 @@ async function handleEvent(connection, message) {
 
     try {
       const request = { type: 'badcat:handoff', pr: event.pr, event: event, session: connection.sessionId };
-      if (newChat && current.rollover.project) request.project = current.rollover.project;
+      if (current.rollover && current.rollover.project) request.project = current.rollover.project;
       const result = await chrome.tabs.sendMessage(current.tabId, request);
       if (result && result.ok === true) {
         // Save even if Stop raced with the response: the submission really happened.
