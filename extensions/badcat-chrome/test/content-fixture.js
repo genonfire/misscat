@@ -49,7 +49,7 @@ function node(tag, attrs = {}, children = []) {
   return el;
 }
 
-function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubmits = false, sendButton = true, initial = '', label = 'Code Review의 새 채팅', rollover = { ok: true }, hello = { ok: false }, selector = null, menu = [], renameOnFill = null, restoreOnMenuOpen = null, alertOnEnter = null } = {}) {
+function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubmits = false, sendButton = true, initial = '', label = 'Code Review의 새 채팅', rollover = { ok: true }, hello = { ok: false }, selector = null, menu = [], renameOnFill = null, restoreOnMenuOpen = null, alertOnEnter = null, onTimer = null, lateComposer = false, navigateOnMenuOpen = null } = {}) {
   let now = 0; // virtual clock: waits finish instantly
   let enterSubmitsNow = enterSubmits;
   const log = { submitted: [], keys: [], clicks: 0, decoyClicks: 0, fills: [] };
@@ -78,8 +78,10 @@ function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubm
   const legacy = node('textarea', { id: 'prompt-textarea' }); // the old selector must no longer be relied on
   legacy.click = () => {};
 
+  const wrap = node('div', {}, composer && !lateComposer ? [editor] : composer ? [] : [otherEditable]);
+  let lateAttach = lateComposer ? () => { wrap.children.push(editor); editor.parentElement = wrap; } : null; // the composer mounts after the first wait
   const form = node('form', {}, [
-    node('div', { 'data-composer-input': '' }, [node('div', {}, composer ? [editor] : [otherEditable])]),
+    node('div', { 'data-composer-input': '' }, [wrap]),
     node('footer', {}, [stopOrVoice, ...(sendButton ? [send] : [])]),
   ]);
   const page = node('body', {}, [node('form', {}, [otherSubmit]), legacy, ...(composer ? [otherEditable] : []), form]);
@@ -102,6 +104,7 @@ function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubm
         projectMenu.parentElement = page;
         page.children.push(projectMenu);
         selectorButton.attrs['aria-expanded'] = 'true';
+        if (navigateOnMenuOpen !== null) ctx.url = navigateOnMenuOpen; // the user moves on while the picker is open
         if (restoreOnMenuOpen !== null) editor.textContent = restoreOnMenuOpen; // ChatGPT restores a draft late
       }
     };
@@ -149,7 +152,12 @@ function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubm
     },
     chrome: { runtime: { id: 'me', onMessage: { addListener: (fn) => listeners.push(fn) },
       async sendMessage(m) { runtimeCalls.push(m); return m.type === 'badcat:hello' ? hello : (typeof rollover === 'function' ? rollover(m) : rollover); } } },
-    setTimeout: (fn, ms) => { now += ms; setImmediate(fn); },
+    setTimeout: (fn, ms) => {
+      now += ms;
+      if (lateAttach) { lateAttach(); lateAttach = null; }
+      if (onTimer) onTimer(ms, ctx);
+      setImmediate(fn);
+    },
     Date: { now: () => now },
     console,
   };

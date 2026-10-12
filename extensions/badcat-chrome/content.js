@@ -147,6 +147,8 @@
     if (!conversation && !(session !== undefined && isNewChatUrl(location.href))) {
       return { ok: false, error: 'not a conversation page' };
     }
+    const startUrl = location.href;
+    const changed = { ok: false, error: 'the page changed during the handoff; not sent' };
     const text = reviewMessage(pr);
     const limit = await tryRollover(session); // an already-limited conversation cannot take the command
     if (limit) return limit;
@@ -154,10 +156,15 @@
     const composer = await waitFor(() => document.querySelector(COMPOSER), 5000);
     if (!active()) return { ok: false, error: 'session stopped' };
     if (!composer) return (await tryRollover(session)) || { ok: false, error: 'composer not found' };
+    // Every asynchronous step below may let the user (or ChatGPT) move to another chat: the decision to
+    // type or send is never based on what was true at the start, only on the live page and composer.
+    const moved = () => location.href !== startUrl || document.querySelector(COMPOSER) !== composer;
+    if (moved()) return changed;
 
     if (!conversation) {
       await sleep(NEW_CHAT_SETTLE_MS);
       if (!active()) return { ok: false, error: 'session stopped' };
+      if (moved()) return changed;
     }
 
     // Never discard what is already there: append after exactly one space, unless this very command
@@ -178,16 +185,22 @@
       if (!active()) return { ok: false, error: 'session stopped' };
       if (verifiedName === null) return { ok: false, error: 'cannot verify the new chat is in the original project' };
       // The picker took a while: the composer may have been re-mounted or a draft restored/typed meanwhile.
-      if (document.querySelector(COMPOSER) !== composer || readComposer(composer) !== existing) {
+      if (moved()) return changed;
+      if (readComposer(composer) !== existing) {
         return { ok: false, error: 'the composer changed during verification; not sent' };
       }
     }
+    if (moved()) return changed;
     if (!containsCommand(existing, text)) {
       const full = appendToComposer(composer, existing, text);
       if (readComposer(composer) !== full) return { ok: false, error: 'could not fill the composer' };
     }
 
     if (!active()) return { ok: false, error: 'session stopped' };
+    if (moved()) return changed;
+    if (expectedProject && conversation && projectOf(location.href) !== expectedProject) {
+      return { ok: false, error: 'the conversation is not in the original project' };
+    }
     if (verifiedName !== null && projectLabel() !== verifiedName) {
       return { ok: false, error: 'the selected project changed; not sent' }; // the command stays pending in the composer
     }
@@ -195,7 +208,8 @@
     let sent = await waitFor(() => readComposer(composer) === '', 3000);
     if (!sent) {
       const button = findSendButton(composer);
-      if (active() && button && !button.disabled) {
+      // A moved page after Enter means the send most likely went through: never click again there.
+      if (active() && !moved() && button && !button.disabled) {
         button.click();
         sent = await waitFor(() => readComposer(composer) === '', 3000);
       }

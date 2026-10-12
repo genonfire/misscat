@@ -394,3 +394,39 @@ test('a conversation of another project is rejected right before sending when a 
   const same = await activated({ url: 'https://chatgpt.com/g/' + SLUG + '/c/new' });
   assert.equal((await same.send(handoffMsg({ project: SLUG }))).ok, true);
 });
+
+test('moving to another chat while the project picker is open: nothing is typed or sent, even though composer and label still look right', async () => {
+  for (const url of ['https://chatgpt.com/g/g-p-2-other/c/new', 'https://chatgpt.com/c/elsewhere', 'https://chatgpt.com/g/' + SLUG + '/c/new']) {
+    const t = await activated(projectOpts({ navigateOnMenuOpen: url }));
+    const res = await t.send(handoffMsg({ project: SLUG }));
+    assert.equal(res.ok, false, url);
+    assert.match(res.error, /page changed/, url);
+    assert.deepEqual(t.log.keys, [], url);
+    assert.deepEqual(t.log.fills, [], url);
+    assert.deepEqual(t.log.submitted, [], url);
+  }
+});
+
+test('moving to another conversation while waiting for the composer: nothing is typed or sent', async () => {
+  const start = 'https://chatgpt.com/g/' + SLUG + '/c/old';
+  const t = await activated({ url: start, lateComposer: true,
+    onTimer: (ms, ctx) => { ctx.url = 'https://chatgpt.com/g/g-p-2-other/c/new'; } });
+  const res = await t.send(handoffMsg({ project: SLUG }));
+  assert.equal(res.ok, false);
+  assert.match(res.error, /page changed/);
+  assert.deepEqual(t.log.keys, []);
+  assert.deepEqual(t.log.fills, []);
+  // without the move, the late composer is used normally
+  const ok = await activated({ url: start, lateComposer: true });
+  assert.equal((await ok.send(handoffMsg({ project: SLUG }))).ok, true);
+  assert.deepEqual(ok.log.submitted, [TEXT]);
+});
+
+test('moving during the new-chat settle wait: nothing is typed or sent', async () => {
+  const t = await activated(projectOpts({ onTimer: (ms, ctx) => { if (ms === 800) ctx.url = 'https://chatgpt.com/c/elsewhere'; } }));
+  const res = await t.send(handoffMsg({ project: SLUG }));
+  assert.equal(res.ok, false);
+  assert.match(res.error, /page changed/);
+  assert.deepEqual(t.log.keys, []);
+  assert.deepEqual(t.log.submitted, []);
+});
