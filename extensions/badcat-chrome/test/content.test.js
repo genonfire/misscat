@@ -34,21 +34,22 @@ test('finds the composer by its data-composer-markdown contenteditable, not by #
   assert.equal(t.log.fills.length, 1); // the other contenteditable and the legacy textarea were left alone
 });
 
-test('puts exactly "현재 작업 끝났으면 PR #123 리뷰해." in the composer and submits it with Enter', async () => {
-  const t = boot();
+test('puts exactly "현재 작업 끝났으면 PR #123 리뷰해." in the composer and submits it with the send button', async () => {
+  const t = boot({ buttonSubmits: true });
   const res = await t.send({ type: 'badcat:handoff', pr: 123 });
   assert.equal(res.ok, true);
   assert.deepEqual(t.log.submitted, [TEXT]);
-  assert.deepEqual(t.log.keys, ['keydown:Enter', 'keyup:Enter']);
-  assert.equal(t.log.clicks, 0); // Enter was enough; the button is only a fallback
+  assert.equal(t.log.clicks, 1);
+  assert.equal(t.log.decoyClicks, 0); // not the other form's submit, not the type="button" controls
+  assert.deepEqual(t.log.keys, []); // a synthetic Enter is only the fallback
 });
 
-test('falls back to the submit button inside the composer form when Enter does not submit', async () => {
-  const t = boot({ enterSubmits: false, buttonSubmits: true });
+test('falls back to Enter when the button click does not submit', async () => {
+  const t = boot();
   const res = await t.send({ type: 'badcat:handoff', pr: 123 });
   assert.equal(res.ok, true);
   assert.equal(t.log.clicks, 1);
-  assert.equal(t.log.decoyClicks, 0); // not the other form's submit, not the type="button" controls
+  assert.deepEqual(t.log.keys, ['keydown:Enter', 'keyup:Enter']);
   assert.deepEqual(t.log.submitted, [TEXT]);
 });
 
@@ -137,13 +138,13 @@ test('same ID is idempotent across worker connections; fresh same-HEAD ID submit
 });
 
 test('stop while waiting never clicks a send fallback or permits a stale session', async () => {
-  const t = boot({ enterSubmits: false, buttonSubmits: true });
+  const t = boot({ enterSubmits: false, buttonSubmits: false });
   await t.send({ type: 'badcat:activate', session: 'old' });
   const pending = t.send({ type: 'badcat:handoff', pr: 123, event: event(), session: 'old' });
   await new Promise(resolve => setImmediate(resolve));
   await t.send({ type: 'badcat:cancel', session: 'old' });
   assert.equal((await pending).ok, false);
-  assert.equal(t.log.clicks, 0);
+  assert.deepEqual(t.log.keys, []); // the Enter fallback never ran
   assert.equal(t.log.submitted.length, 0);
   assert.equal((await t.send({ type: 'badcat:handoff', pr: 123, event: event(), session: 'old' })).ok, false);
 });
@@ -321,7 +322,7 @@ test('project rollover: a same-named project with another ID, a duplicate name, 
     const t = await activated({ ...opts, initial: TEXT });
     const res = await t.send(handoffMsg({ project: SLUG }));
     assert.equal(res.ok, false, name);
-    assert.match(res.error, /cannot verify/, name);
+    assert.match(res.error, /cannot verify|not in the original project/, name);
     assert.equal(t.text(), TEXT, name);
     assert.deepEqual(t.log.keys, [], name);
     assert.deepEqual(t.log.submitted, [], name);
@@ -439,7 +440,7 @@ test('new chat: Enter submits, the URL moves and the editor is replaced (old nod
   assert.deepEqual(t.log.submitted, [TEXT]);
   assert.equal((await t.send(handoffMsg({ project: SLUG }))).ok, true); // replay: acknowledged without resending
   assert.deepEqual(t.log.submitted, [TEXT]);
-  assert.equal(t.log.clicks, 0);
+  assert.equal(t.log.clicks, 1); // the ineffective click, never repeated
 });
 
 test('the URL moved but no such message appeared: unconfirmed, no ACK path, and never sent again', async () => {
@@ -451,7 +452,7 @@ test('the URL moved but no such message appeared: unconfirmed, no ACK path, and 
   assert.equal(again.ok, false);
   assert.equal(again.ambiguous, true);
   assert.deepEqual(t.log.submitted, [TEXT]); // typed and sent exactly once
-  assert.equal(t.log.clicks, 0);
+  assert.equal(t.log.clicks, 1);
 });
 
 test('the message appeared but in a conversation of another project: not confirmed', async () => {
@@ -531,4 +532,98 @@ test('the attempt marker is recorded before Enter; without it nothing is pressed
   assert.match(res.error, /record the attempt/);
   assert.deepEqual(t.log.keys, []);
   assert.deepEqual(t.log.submitted, []);
+});
+
+// --- #64: the rollover failure sequence and its recovery rules ---
+test('#64 sequence: slow selector menu, delayed composer fill, button-only submit: sent once after the real click', async () => {
+  const t = await activated({ ...projectOpts({ emptyMenuOpens: 2, fillDelayed: true }), enterSubmits: false, buttonSubmits: true });
+  const res = await t.send(handoffMsg({ project: SLUG }));
+  assert.equal(res.ok, true);
+  assert.equal(t.selectorButton.clicks >= 4, true); // two empty menus were opened, read and closed again
+  assert.equal(t.selectorButton.attrs['aria-expanded'], 'false');
+  assert.deepEqual(t.log.submitted, [TEXT]);
+  assert.deepEqual(t.log.fills, [TEXT]);
+  assert.equal(t.log.clicks, 1);
+  assert.deepEqual(t.log.keys, []); // Enter is not needed (and a synthetic one is no proof)
+});
+
+test('#64: a menu that never renders stops with a clear error; nothing is typed or sent', async () => {
+  const t = await activated(projectOpts({ emptyMenuOpens: 99 }));
+  const res = await t.send(handoffMsg({ project: SLUG }));
+  assert.equal(res.ok, false);
+  assert.match(res.error, /cannot verify/);
+  assert.deepEqual(t.log.fills, []);
+  assert.deepEqual(t.log.submitted, []);
+  assert.equal(t.selectorButton.attrs['aria-expanded'], 'false');
+});
+
+test('#64: the exact command as an unsent draft (even re-wrapped) is reused, not duplicated, then sent', async () => {
+  for (const initial of [TEXT, ' ' + TEXT + '\n', TEXT.replace(' ', '  ')]) {
+    const t = await activated({ ...projectOpts({ initial }), enterSubmits: false, buttonSubmits: true });
+    const res = await t.send(handoffMsg({ project: SLUG }));
+    assert.equal(res.ok, true);
+    assert.deepEqual(t.log.fills, []);
+    assert.equal(t.log.submitted.length, 1);
+    assert.equal(t.log.clicks, 1);
+  }
+});
+
+test('#64: user drafts, other PR commands, partial or doubled text are never overwritten or sent', async () => {
+  const drafts = ['내 메모', '현재 작업 끝났으면 PR #124 리뷰해.', '현재 작업 끝났으면 PR #123', TEXT + ' ' + TEXT, TEXT + ' 그리고'];
+  for (const initial of drafts) {
+    const t = await activated({ ...projectOpts({ initial }), buttonSubmits: true });
+    const res = await t.send(handoffMsg({ project: SLUG }));
+    assert.equal(res.ok, false, initial);
+    assert.match(res.error, /unrelated draft/);
+    assert.equal(t.text(), initial);
+    assert.deepEqual(t.log.fills, []);
+    assert.deepEqual(t.log.submitted, []);
+    assert.equal(t.log.clicks + t.log.keys.length, 0);
+  }
+});
+
+test('#64: a draft restored while the picker is open is judged again before sending', async () => {
+  const t = await activated({ ...projectOpts({ restoreOnMenuOpen: '다른 초안' }), buttonSubmits: true });
+  const res = await t.send(handoffMsg({ project: SLUG }));
+  assert.equal(res.ok, false);
+  assert.deepEqual(t.log.submitted, []);
+  assert.equal(t.text(), '다른 초안');
+});
+
+test('#64: a disabled send button means nothing is pressed, clicked or recorded; the text stays', async () => {
+  const t = await activated({ ...projectOpts({ buttonDisabled: true }), buttonSubmits: true });
+  const res = await t.send(handoffMsg({ project: SLUG }));
+  assert.equal(res.ok, false);
+  assert.match(res.error, /send button is disabled/);
+  assert.equal(t.log.clicks + t.log.keys.length, 0);
+  assert.equal(t.runtimeCalls.some((m) => m.type === 'badcat:attempt'), false);
+  assert.equal(t.text(), TEXT);
+  assert.deepEqual(t.log.submitted, []);
+});
+
+test('#64: a send button that becomes enabled shortly after the fill is clicked', async () => {
+  let t;
+  t = await activated({ ...projectOpts({ buttonDisabled: true, fillDelayed: true }), buttonSubmits: true,
+    onTimer: () => { if (t && t.text() === TEXT) t.sendButton.disabled = false; } });
+  const res = await t.send(handoffMsg({ project: SLUG }));
+  assert.equal(res.ok, true);
+  assert.equal(t.log.clicks, 1);
+  assert.deepEqual(t.log.submitted, [TEXT]);
+});
+
+test('#64: an ID mismatch is a definite stop (no retries, nothing typed)', async () => {
+  const t = await activated(projectOpts({ menu: [{ text: 'Code Review', value: 'g-p-777' }] }));
+  const res = await t.send(handoffMsg({ project: SLUG }));
+  assert.equal(res.ok, false);
+  assert.match(res.error, /not in the original project/);
+  assert.equal(t.selectorButton.clicks, 2); // opened once, closed once: no retry loop for a real mismatch
+  assert.deepEqual(t.log.fills, []);
+});
+
+test('#64: a replayed event after a confirmed send is acknowledged without another click', async () => {
+  const t = await activated({ ...projectOpts(), enterSubmits: false, buttonSubmits: true });
+  assert.equal((await t.send(handoffMsg({ project: SLUG }))).ok, true);
+  assert.equal((await t.send(handoffMsg({ project: SLUG }))).ok, true);
+  assert.equal(t.log.clicks, 1);
+  assert.deepEqual(t.log.submitted, [TEXT]);
 });

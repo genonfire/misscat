@@ -11,6 +11,8 @@ const UNCERTAIN_KEY = 'badcat.uncertain.v1'; // handoffs that may have been subm
 const BASELINES_KEY = 'badcat.delivery-baselines'; // keys of handoffs already submitted
 const MAX_DELIVERED = 500;
 const RETRY_DELAYS_MS = [0, 5000, 15000]; // e.g. ChatGPT still answering when the +1 arrives
+const ROLLOVER_WAIT_MS = 3000; // a started rollover is progress, not a failed attempt: look again shortly
+const MAX_ROLLOVER_WAITS = 10;
 
 let storageQueue = Promise.resolve();
 let controlQueue = Promise.resolve();
@@ -239,7 +241,12 @@ async function deliverEvent(connection, message) {
   if (event === null) return; // invalid payload, +2, other repo: do nothing
   const key = eventKey(event);
 
-  for (const delay of RETRY_DELAYS_MS) {
+  let attemptNo = 0;
+  let rolloverWaits = 0;
+  let pause = 0;
+  while (attemptNo < RETRY_DELAYS_MS.length) {
+    const delay = pause || RETRY_DELAYS_MS[attemptNo];
+    pause = 0;
     if (delay) await sleep(delay);
     if (connection !== port) return;
     const current = await getSession();
@@ -313,6 +320,12 @@ async function deliverEvent(connection, message) {
       // Definitely not submitted: the attempt marker (if any) is withdrawn and the retry policy applies.
       console.error('handoff not delivered:', result && result.error);
       await forgetUncertain(key);
+      if (result && result.rollover === true && rolloverWaits < MAX_ROLLOVER_WAITS) {
+        // The tab is moving to the new chat: that is not a failed submission, so it keeps its attempts.
+        rolloverWaits += 1;
+        pause = ROLLOVER_WAIT_MS;
+        continue;
+      }
     } catch (e) {
       console.error('handoff not delivered:', e && e.message);
       if (connection !== port) return;
@@ -325,6 +338,7 @@ async function deliverEvent(connection, message) {
     } finally {
       if (inFlight && inFlight.connection === connection) inFlight = null;
     }
+    attemptNo += 1;
   }
   console.error('giving up on', key, '- not marked delivered');
   await reportError(connection, 'Handoff failed; waiting for host retry.');

@@ -47,26 +47,41 @@
   };
 
   // The ID (data-value) the selector's menu lists must equal the project ID of the old conversation (the
-  // value between /g/ and /c/ in its URL, compared exactly). Returns the verified selected name, or null when the
-  // name is missing, listed twice, or maps to another ID. The menu is opened, read and closed again.
-  async function verifyProject(slug) {
+  // value between /g/ and /c/ in its URL, compared exactly). One look: {name} when verified, {mismatch} when the
+  // name is listed twice or maps to another ID (never retried, never sent), {notReady} when the selector or its
+  // menu has not rendered yet. The menu is opened, read and closed again.
+  async function verifyProjectOnce(slug) {
     const button = document.querySelector(PROJECT_BUTTON);
     const label = projectLabel();
-    if (!button || !label) return null;
+    if (!button || !label) return { notReady: true };
     button.click();
     const items = await waitFor(() => { const found = menuItems(); return found.length ? found : null; }, 2000);
-    let verified = null;
+    let result = { notReady: true };
     if (items) {
       const same = items.filter((item) => labelNames(label, (item.textContent || '').trim()));
-      const id = same.length === 1 ? same[0].getAttribute('data-value') : null;
-      if (id && id === slug) verified = label;
+      if (same.length > 1) result = { mismatch: true };
+      else if (same.length === 1) result = same[0].getAttribute('data-value') === slug ? { name: label } : { mismatch: true };
     }
     if (button.getAttribute('aria-expanded') === 'true') button.click();
     await waitFor(() => menuItems().length === 0, 1000);
-    return verified;
+    return result;
+  }
+
+  // Right after a rollover the selector and its menu may still be rendering: look a few more times, but only
+  // for "not ready"; a definite mismatch ends the check at once.
+  const PROJECT_TRIES = 5;
+  async function verifyProject(slug) {
+    let result = { notReady: true };
+    for (let i = 0; i < PROJECT_TRIES; i += 1) {
+      if (i) await sleep(500);
+      result = await verifyProjectOnce(slug);
+      if (result.name || result.mismatch) break;
+    }
+    return result;
   }
 
   const readComposer = (el) => (el.textContent || '').trim();
+  const normalize = (value) => value.replace(/\s+/g, ' ').trim(); // ProseMirror may re-wrap whitespace
 
   // True when `command` already sits in `existing` as its own space-delimited piece.
   function containsCommand(existing, command) {
@@ -164,7 +179,7 @@
     const limit = await tryRollover(session); // an already-limited conversation cannot take the command
     if (limit) return limit;
     if (!active()) return { ok: false, error: 'session stopped' };
-    const composer = await waitFor(() => document.querySelector(COMPOSER), 5000);
+    let composer = await waitFor(() => document.querySelector(COMPOSER), 5000);
     if (!active()) return { ok: false, error: 'session stopped' };
     if (!composer) return (await tryRollover(session)) || { ok: false, error: 'composer not found' };
     // Every asynchronous step below may let the user (or ChatGPT) move to another chat: the decision to
@@ -180,9 +195,11 @@
 
     // Never discard what is already there: append after exactly one space, unless this very command
     // is already pending (a retry or duplicate event), in which case just submit again.
-    const existing = readComposer(composer);
-    // A restored draft in a new chat is only ever this very command; anything else belongs to the user.
-    if (!conversation && existing !== '' && existing !== text) {
+    let existing = readComposer(composer);
+    // A restored draft in a new chat is only ever this very command (whitespace aside); anything else
+    // belongs to the user and is left untouched.
+    const ownDraft = (value) => value === '' || normalize(value) === text;
+    if (!conversation && !ownDraft(existing)) {
       return { ok: false, error: 'the composer holds an unrelated draft' };
     }
     // After a rollover from a project the new chat must verifiably be in that same project, checked
@@ -192,19 +209,39 @@
       return { ok: false, error: 'the conversation is not in the original project' };
     }
     if (!conversation && expectedProject) {
-      verifiedName = await verifyProject(expectedProject);
+      const verified = await verifyProject(expectedProject);
       if (!active()) return { ok: false, error: 'session stopped' };
-      if (verifiedName === null) return { ok: false, error: 'cannot verify the new chat is in the original project' };
-      // The picker took a while: the composer may have been re-mounted or a draft restored/typed meanwhile.
-      if (moved()) return changed;
+      if (verified.mismatch) return { ok: false, error: 'the new chat is not in the original project; not sent' };
+      if (!verified.name) return { ok: false, error: 'cannot verify the new chat is in the original project' };
+      verifiedName = verified.name;
+      if (location.href !== startUrl) return changed;
+      // The picker took a while: ChatGPT may have re-mounted the composer (the old node is gone) or restored a
+      // draft meanwhile. A new node of the same new chat is adopted if it holds nothing but this very command.
+      const live = document.querySelector(COMPOSER);
+      if (!live) return changed;
+      if (live !== composer) {
+        const now = readComposer(live);
+        if (!ownDraft(now)) return { ok: false, error: 'the composer holds an unrelated draft' };
+        composer = live;
+        existing = now;
+      }
       if (readComposer(composer) !== existing) {
         return { ok: false, error: 'the composer changed during verification; not sent' };
       }
     }
     if (moved()) return changed;
-    if (!containsCommand(existing, text)) {
-      const full = appendToComposer(composer, existing, text);
-      if (readComposer(composer) !== full) return { ok: false, error: 'could not fill the composer' };
+    if (!containsCommand(normalize(existing), text)) {
+      const full = existing ? existing + ' ' + text : text;
+      appendToComposer(composer, existing, text);
+      // ProseMirror applies the insertion asynchronously and may re-wrap it: wait for the composer to settle
+      // on what was typed. Text that never shows up and text that shows up with something else are different.
+      await waitFor(() => normalize(readComposer(composer)) === normalize(full), 1500);
+      if (!active()) return { ok: false, error: 'session stopped' };
+      if (moved()) return changed;
+      const now = normalize(readComposer(composer));
+      if (now !== normalize(full)) {
+        return { ok: false, error: now.includes(text) ? 'the composer changed while filling; not sent' : 'could not fill the composer' };
+      }
     }
 
     if (!active()) return { ok: false, error: 'session stopped' };
@@ -215,8 +252,23 @@
     if (verifiedName !== null && projectLabel() !== verifiedName) {
       return { ok: false, error: 'the selected project changed; not sent' }; // the command stays pending in the composer
     }
+    // A new chat sends only the command itself; in a conversation it must at least be a piece of the composer.
+    const now = normalize(readComposer(composer));
+    if (conversation ? !containsCommand(now, text) : now !== text) {
+      return { ok: false, error: 'the composer changed before sending; not sent' };
+    }
+    // The real send button is preferred: a synthetic Enter is not a trusted key press. It may need a moment to
+    // become enabled after the text arrived; a button that stays disabled (e.g. ChatGPT is answering) means no send.
+    const isEnabled = (b) => b && !b.disabled && b.getAttribute('aria-disabled') !== 'true';
+    let button = findSendButton(composer);
+    if (button) {
+      button = await waitFor(() => { const b = findSendButton(composer); return isEnabled(b) ? b : null; }, 2000);
+      if (!active()) return { ok: false, error: 'session stopped' };
+      if (moved()) return changed;
+      if (!button) return (await tryRollover(session)) || { ok: false, error: 'the send button is disabled; not sent' };
+    }
     if (session !== undefined) {
-      // Durable "may be submitted" marker first: a channel broken by the navigation after Enter must not
+      // Durable "may be submitted" marker first: a channel broken by the navigation after sending must not
       // lead to an automatic resend. No marker, no send.
       let marked = null;
       try {
@@ -227,7 +279,7 @@
       if (moved()) return changed;
     }
     const before = countUserMessages(text);
-    // Enter and the send button share one outcome routine: 'sent' (composer emptied in place, or the exact
+    // The button and Enter share one outcome routine: 'sent' (composer emptied in place, or the exact
     // command appeared as a new user message), 'uncertain' (the page moved on without that proof) or 'pending'.
     const submit = async (trigger) => {
       trigger();
@@ -239,12 +291,9 @@
         (isConversationUrl(location.href) && (!expectedProject || projectOf(location.href) === expectedProject)));
       return (await waitFor(landed, 5000)) ? 'sent' : 'uncertain';
     };
-    let outcome = await submit(() => pressEnter(composer));
-    if (outcome === 'pending') {
-      const button = findSendButton(composer);
-      // A moved page means the send may already have gone out: never click again there.
-      if (active() && !moved() && button && !button.disabled) outcome = await submit(() => button.click());
-    }
+    let outcome = await submit(button ? () => button.click() : () => pressEnter(composer));
+    // The button was accepted but nothing happened: Enter as the fallback, never after the page moved on.
+    if (outcome === 'pending' && button && active() && !moved()) outcome = await submit(() => pressEnter(composer));
     if (outcome === 'uncertain') {
       if (key) uncertain.add(key);
       return UNCERTAIN; // it may have gone out: never resend automatically
