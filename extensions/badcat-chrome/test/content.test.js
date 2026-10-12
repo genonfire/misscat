@@ -238,7 +238,7 @@ test('new chat after rollover: unrelated or other-PR drafts are kept and nothing
   }
 });
 
-const SLUG = 'g-p-6acc5689a7f48191b27144cee2289958-code-review';
+const SLUG = 'g-p-6acc5689a7f48191b27144cee2289958';
 const MENU = [{ text: 'Other', value: 'g-p-999-other' }, { text: 'Code Review', value: 'g-p-6acc5689a7f48191b27144cee2289958' }];
 const projectOpts = (extra = {}) => ({ url: 'https://chatgpt.com/', selector: 'Code Review', menu: MENU, ...extra });
 
@@ -260,6 +260,8 @@ test('project rollover: an empty composer is filled after verification', async (
 
 test('project rollover: a same-named project with another ID, a duplicate name, an overlapping name or no selector stops before typing', async () => {
   const cases = {
+    'ID with a suffix': projectOpts({ menu: [{ text: 'Code Review', value: 'g-p-6acc5689a7f48191b27144cee2289958-code-review' }] }),
+    'ID that is only a prefix': projectOpts({ menu: [{ text: 'Code Review', value: 'g-p-6acc5689' }] }),
     'another ID': projectOpts({ menu: [{ text: 'Code Review', value: 'g-p-777-code-review' }] }),
     'duplicate name': projectOpts({ menu: [...MENU, { text: 'Code Review', value: 'g-p-777' }] }),
     'overlapping name': projectOpts({ selector: 'Code Review Archive', menu: [{ text: 'Code Review Archive', value: 'g-p-777' }, ...MENU] }),

@@ -46,8 +46,8 @@
     return items;
   };
 
-  // The ID (data-value) the selector's menu lists must equal the project ID of the old conversation (its
-  // URL slug g-p-<id>-<name>, or exactly the ID). Returns the verified selected name, or null when the
+  // The ID (data-value) the selector's menu lists must equal the project ID of the old conversation (the
+  // value between /g/ and /c/ in its URL, compared exactly). Returns the verified selected name, or null when the
   // name is missing, listed twice, or maps to another ID. The menu is opened, read and closed again.
   async function verifyProject(slug) {
     const button = document.querySelector(PROJECT_BUTTON);
@@ -59,7 +59,7 @@
     if (items) {
       const same = items.filter((item) => labelNames(label, (item.textContent || '').trim()));
       const id = same.length === 1 ? same[0].getAttribute('data-value') : null;
-      if (id && (id === slug || slug.startsWith(id + '-'))) verified = label;
+      if (id && id === slug) verified = label;
     }
     if (button.getAttribute('aria-expanded') === 'true') button.click();
     await waitFor(() => menuItems().length === 0, 1000);
