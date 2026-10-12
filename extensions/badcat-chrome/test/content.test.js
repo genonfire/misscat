@@ -627,3 +627,14 @@ test('#64: a replayed event after a confirmed send is acknowledged without anoth
   assert.equal(t.log.clicks, 1);
   assert.deepEqual(t.log.submitted, [TEXT]);
 });
+
+test('#64 review: the picker is re-read right before sending; a same-named project with another ID sends nothing and records no attempt', async () => {
+  const t = await activated({ ...projectOpts({ menuLater: [{ text: 'Code Review', value: 'g-p-777' }] }), buttonSubmits: true });
+  const res = await t.send(handoffMsg({ project: SLUG }));
+  assert.equal(res.ok, false);
+  assert.match(res.error, /selected project changed/);
+  assert.equal(t.log.clicks + t.log.keys.length, 0);
+  assert.deepEqual(t.log.submitted, []);
+  assert.equal(t.runtimeCalls.some((m) => m.type === 'badcat:attempt'), false);
+  assert.equal(t.selectorButton.attrs['aria-expanded'], 'false');
+});

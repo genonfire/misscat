@@ -257,6 +257,17 @@
     if (conversation ? !containsCommand(now, text) : now !== text) {
       return { ok: false, error: 'the composer changed before sending; not sent' };
     }
+    // The selection may have changed (to a same-named project of another ID) while the text was typed and the
+    // button awaited: the picker is read again right before anything is recorded or sent.
+    if (verifiedName !== null) {
+      const again = await verifyProject(expectedProject);
+      if (!active()) return { ok: false, error: 'session stopped' };
+      if (!again.name || again.name !== verifiedName || projectLabel() !== verifiedName) {
+        return { ok: false, error: 'the selected project changed; not sent' };
+      }
+      if (moved()) return changed;
+      if (normalize(readComposer(composer)) !== text) return { ok: false, error: 'the composer changed before sending; not sent' };
+    }
     // The real send button is preferred: a synthetic Enter is not a trusted key press. It may need a moment to
     // become enabled after the text arrived; a button that stays disabled (e.g. ChatGPT is answering) means no send.
     const isEnabled = (b) => b && !b.disabled && b.getAttribute('aria-disabled') !== 'true';

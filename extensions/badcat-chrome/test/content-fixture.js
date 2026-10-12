@@ -49,7 +49,7 @@ function node(tag, attrs = {}, children = []) {
   return el;
 }
 
-function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubmits = false, sendButton = true, initial = '', label = 'Code Review의 새 채팅', rollover = { ok: true }, hello = { ok: false }, attempt = { ok: true }, selector = null, menu = [], renameOnFill = null, restoreOnMenuOpen = null, alertOnEnter = null, onTimer = null, lateComposer = false, navigateOnMenuOpen = null, afterSubmit = null, priorBubbles = [], buttonDisabled = false, emptyMenuOpens = 0, fillDelayed = false } = {}) {
+function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubmits = false, sendButton = true, initial = '', label = 'Code Review의 새 채팅', rollover = { ok: true }, hello = { ok: false }, attempt = { ok: true }, selector = null, menu = [], renameOnFill = null, restoreOnMenuOpen = null, alertOnEnter = null, onTimer = null, lateComposer = false, navigateOnMenuOpen = null, afterSubmit = null, priorBubbles = [], buttonDisabled = false, emptyMenuOpens = 0, menuLater = null, fillDelayed = false } = {}) {
   let delayedFill = null;
   let now = 0; // virtual clock: waits finish instantly
   let enterSubmitsNow = enterSubmits;
@@ -128,7 +128,7 @@ function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubm
         projectMenu = null;
         selectorButton.attrs['aria-expanded'] = 'false';
       } else {
-        const items = (selectorButton.clicks <= emptyMenuOpens ? [] : menu).map((m) => { const i = node('div', { 'data-value': m.value }); i.textContent = m.text; return i; });
+        const items = (selectorButton.clicks <= emptyMenuOpens ? [] : menuLater && selectorButton.clicks > 2 ? menuLater : menu).map((m) => { const i = node('div', { 'data-value': m.value }); i.textContent = m.text; return i; });
         projectMenu = node('div', { role: 'dialog' }, items);
         projectMenu.parentElement = page;
         page.children.push(projectMenu);
