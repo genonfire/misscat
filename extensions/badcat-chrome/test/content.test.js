@@ -147,3 +147,124 @@ test('stop while waiting never clicks a send fallback or permits a stale session
   assert.equal(t.log.submitted.length, 0);
   assert.equal((await t.send({ type: 'badcat:handoff', pr: 123, event: event(), session: 'old' })).ok, false);
 });
+
+// --- conversation-limit rollover ---
+const SESSION = 's1';
+const LIMIT = '이 대화의 최대 길이에 도달했으나,새 채팅을 시작해 계속 이야기할 수 있습니다.';
+const activated = async (opts) => {
+  const t = boot(opts);
+  await t.send({ type: 'badcat:activate', session: SESSION });
+  await t.settle();
+  return t;
+};
+
+test('the real limit alert is announced to the background, then "새 대화 시작" is clicked exactly once', async () => {
+  const t = await activated();
+  const alert = t.limitAlert(LIMIT, ['새 대화 시작', '새 대화 시작']); // duplicated button as captured
+  t.mutate(); t.mutate(); t.mutate();
+  await t.settle(); await t.settle();
+  assert.equal(JSON.stringify(t.runtimeCalls.filter((m) => m.type === 'badcat:rollover')), JSON.stringify([{ type: 'badcat:rollover', session: SESSION }]));
+  assert.deepEqual(alert.buttons.map((b) => b.clicks), [1, 0]);
+});
+
+test('the alert already on the page at activation is handled by the initial check ("최대 깊이" wording too)', async () => {
+  const t = boot();
+  const alert = t.limitAlert('이 대화는 최대 깊이에 도달했습니다.', ['새 대화 시작']);
+  await t.send({ type: 'badcat:activate', session: SESSION });
+  await t.settle(); await t.settle();
+  assert.equal(alert.buttons[0].clicks, 1);
+});
+
+test('other alerts, or a limit text without the new-chat button, are never clicked', async () => {
+  const t = await activated();
+  const other = t.limitAlert('네트워크 오류가 발생했습니다.', ['새 대화 시작']);
+  const noButton = t.limitAlert(LIMIT, ['닫기']);
+  t.mutate();
+  await t.settle(); await t.settle();
+  assert.equal(other.buttons[0].clicks + noButton.buttons[0].clicks, 0);
+  assert.equal(t.runtimeCalls.length, 1); // only the hello at load
+});
+
+test('without an active session nothing is clicked; a refusal by the background leaves the alert alone', async () => {
+  let t = boot();
+  const a = t.limitAlert(LIMIT, ['새 대화 시작']);
+  t.mutate();
+  await t.settle(); await t.settle();
+  assert.equal(a.buttons[0].clicks, 0);
+  t = boot({ rollover: { ok: false } });
+  const b = t.limitAlert(LIMIT, ['새 대화 시작']);
+  await t.send({ type: 'badcat:activate', session: SESSION });
+  await t.settle(); await t.settle();
+  t.mutate(); await t.settle(); await t.settle();
+  assert.equal(b.buttons[0].clicks, 0);
+  assert.equal(t.runtimeCalls.filter((m) => m.type === 'badcat:rollover').length, 1); // no retry loop
+});
+
+test('stopping while the rollover is being announced cancels the click', async () => {
+  const t = boot();
+  const a = t.limitAlert(LIMIT, ['새 대화 시작']);
+  await t.send({ type: 'badcat:activate', session: SESSION });
+  await t.send({ type: 'badcat:cancel', session: SESSION });
+  await t.settle(); await t.settle();
+  assert.equal(a.buttons[0].clicks, 0);
+  assert.equal(t.observers[0].disconnected, true);
+});
+
+test('a freshly loaded page rebinds through the hello handshake', async () => {
+  const t = boot({ url: 'https://chatgpt.com/', hello: { ok: true, session: SESSION } });
+  await t.settle();
+  const res = await t.send({ type: 'badcat:handoff', pr: 123, session: SESSION, event: EVENT });
+  assert.equal(res.ok, true);
+  assert.equal(t.observers.length, 1);
+});
+
+const EVENT = { repo: 'o/r', pr: 123, head: 'a'.repeat(40), status: '+1', review_id: 1, delivery_id: 'c'.repeat(32) };
+const handoffMsg = (extra = {}) => ({ type: 'badcat:handoff', pr: 123, session: SESSION, event: EVENT, ...extra });
+
+test('new chat after rollover: a restored draft that is this very command is submitted once', async () => {
+  const t = await activated({ url: 'https://chatgpt.com/', initial: TEXT });
+  const res = await t.send(handoffMsg({ requireProject: true }));
+  assert.equal(res.ok, true);
+  assert.deepEqual(t.log.submitted, [TEXT]);
+  assert.deepEqual(t.log.fills, []); // not typed a second time
+});
+
+test('new chat after rollover: an empty composer is filled and submitted', async () => {
+  const t = await activated({ url: 'https://chatgpt.com/' });
+  assert.equal((await t.send(handoffMsg())).ok, true);
+  assert.deepEqual(t.log.submitted, [TEXT]);
+});
+
+test('new chat after rollover: unrelated or other-PR drafts are kept and nothing is sent', async () => {
+  for (const initial of ['내 메모', '현재 작업 끝났으면 PR #586 리뷰해.']) {
+    const t = await activated({ url: 'https://chatgpt.com/', initial });
+    const res = await t.send(handoffMsg());
+    assert.equal(res.ok, false);
+    assert.match(res.error, /unrelated draft/);
+    assert.equal(t.text(), initial);
+    assert.deepEqual(t.log.submitted, []);
+  }
+});
+
+test('new chat after rollover: a lost project binding stops the handoff; without a required project it is fine', async () => {
+  let t = await activated({ url: 'https://chatgpt.com/', label: '' });
+  const res = await t.send(handoffMsg({ requireProject: true }));
+  assert.equal(res.ok, false);
+  assert.match(res.error, /project/);
+  assert.deepEqual(t.log.submitted, []);
+  t = await activated({ url: 'https://chatgpt.com/', label: '' });
+  assert.equal((await t.send(handoffMsg())).ok, true);
+});
+
+test('the new-chat route is rejected for a handoff that carries no session', async () => {
+  const t = boot({ url: 'https://chatgpt.com/' });
+  assert.match((await t.send({ type: 'badcat:handoff', pr: 1 })).error, /not a conversation/);
+});
+
+test('an already submitted event is not sent again after the rollover', async () => {
+  const t = await activated();
+  assert.equal((await t.send(handoffMsg())).ok, true);
+  t.setUrl('https://chatgpt.com/');
+  assert.equal((await t.send(handoffMsg())).ok, true);
+  assert.equal(t.log.submitted.length, 1);
+});

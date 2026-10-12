@@ -27,6 +27,15 @@ function node(tag, attrs = {}, children = []) {
       for (let n = el; n; n = n.parentElement) if (n.matches(selector)) return n;
       return null;
     },
+    getAttribute(name) { return name in el.attrs ? el.attrs[name] : null; },
+    querySelectorAll(selector) {
+      const found = [];
+      for (const child of el.children) {
+        if (child.matches(selector)) found.push(child);
+        found.push(...child.querySelectorAll(selector));
+      }
+      return found;
+    },
     querySelector(selector) {
       for (const child of el.children) {
         if (child.matches(selector)) return child;
@@ -40,12 +49,12 @@ function node(tag, attrs = {}, children = []) {
   return el;
 }
 
-function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubmits = false, sendButton = true, initial = '' } = {}) {
+function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubmits = false, sendButton = true, initial = '', label = 'Code Review의 새 채팅', rollover = { ok: true }, hello = { ok: false } } = {}) {
   let now = 0; // virtual clock: waits finish instantly
   let enterSubmitsNow = enterSubmits;
   const log = { submitted: [], keys: [], clicks: 0, decoyClicks: 0, fills: [] };
 
-  const editor = node('div', { contenteditable: 'true', 'data-composer-markdown': '', class: 'ProseMirror' });
+  const editor = node('div', { contenteditable: 'true', 'data-composer-markdown': '', class: 'ProseMirror', 'aria-label': label });
   Object.assign(editor, {
     textContent: initial, selected: false, collapsed: false,
     focus() {},
@@ -75,7 +84,9 @@ function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubm
   const page = node('body', {}, [node('form', {}, [otherSubmit]), legacy, ...(composer ? [otherEditable] : []), form]);
 
   const document = {
+    body: page,
     querySelector: (sel) => page.querySelector(sel),
+    querySelectorAll: (sel) => page.querySelectorAll(sel),
     execCommand(cmd, _ui, value) {
       assert.equal(cmd, 'insertText');
       editor.textContent = editor.collapsed ? editor.textContent + value : value; // collapsed to the end = append
@@ -84,14 +95,33 @@ function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubm
     },
   };
   const listeners = [];
+  const runtimeCalls = [];
+  const observers = [];
+  const ctx = { url };
+  const limitAlert = (text, labels) => {
+    const buttons = labels.map((l) => { const b = node('button', { type: 'button' }); b.textContent = l; b.clicks = 0; b.click = () => { b.clicks += 1; }; return b; });
+    const aside = node('aside', { role: 'alert' }, buttons);
+    aside.textContent = text + labels.join('');
+    aside.buttons = buttons;
+    page.children.push(aside);
+    aside.parentElement = page;
+    return aside;
+  };
+  const mutate = () => observers.forEach((o) => o.callback());
   const context = {
-    document, location: { href: url },
+    document, location: { get href() { return ctx.url; } },
     window: { getSelection: () => ({
       selectAllChildren() { editor.selected = true; editor.collapsed = false; },
       collapseToEnd() { editor.collapsed = true; },
     }) },
     KeyboardEvent: class { constructor(type, init) { this.type = type; Object.assign(this, init); } },
-    chrome: { runtime: { id: 'me', onMessage: { addListener: (fn) => listeners.push(fn) } } },
+    MutationObserver: class {
+      constructor(callback) { this.callback = callback; this.disconnected = false; observers.push(this); }
+      observe() {}
+      disconnect() { this.disconnected = true; }
+    },
+    chrome: { runtime: { id: 'me', onMessage: { addListener: (fn) => listeners.push(fn) },
+      async sendMessage(m) { runtimeCalls.push(m); return m.type === 'badcat:hello' ? hello : rollover; } } },
     setTimeout: (fn, ms) => { now += ms; setImmediate(fn); },
     Date: { now: () => now },
     console,
@@ -104,7 +134,7 @@ function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubm
     const keep = listeners[0](message, sender, resolve);
     if (!keep) resolve(undefined);
   });
-  return { log, send: sendMessage, text, setEnterSubmits: (v) => { enterSubmitsNow = v; } };
+  return { log, runtimeCalls, observers, limitAlert, mutate, setUrl: (u) => { ctx.url = u; }, editor, settle: () => new Promise((r) => setImmediate(r)), send: sendMessage, text, setEnterSubmits: (v) => { enterSubmitsNow = v; } };
 }
 
 module.exports = { bootContent: boot };

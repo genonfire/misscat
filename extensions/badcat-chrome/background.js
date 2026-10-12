@@ -2,9 +2,9 @@
 // The popup only asks it to start/stop; closing the popup changes nothing here.
 importScripts('shared.js');
 
-const { HOST_NAME, normalizeRepo, isConversationUrl, parseEvent, eventKey } = self.BadCatShared;
+const { HOST_NAME, normalizeRepo, isConversationUrl, isNewChatUrl, projectOf, parseEvent, eventKey } = self.BadCatShared;
 
-const SESSION_KEY = 'badcat.session'; // {active, repo, tabId, error}
+const SESSION_KEY = 'badcat.session'; // {active, repo, tabId, error, rollover?: {project}}
 const DELIVERED_KEY = 'badcat.delivered.v2';
 const LEGACY_KEY = 'badcat.delivered';
 const BASELINES_KEY = 'badcat.delivery-baselines'; // keys of handoffs already submitted
@@ -213,16 +213,17 @@ async function handleEvent(connection, message) {
       return;
     }
     if (connection !== port) return;
-    if (!isConversationUrl(tab.url)) {
+    // Mid-rollover the tab legitimately sits on the new-chat route until the first message is sent.
+    const newChat = Boolean(current.rollover) && isNewChatUrl(tab.url);
+    if (!isConversationUrl(tab.url) && !newChat) {
       await deactivate('The tab is no longer a ChatGPT conversation.');
       return;
     }
 
     try {
-      const result = await chrome.tabs.sendMessage(current.tabId, {
-        type: 'badcat:handoff',
-        pr: event.pr, event: event, session: connection.sessionId,
-      });
+      const request = { type: 'badcat:handoff', pr: event.pr, event: event, session: connection.sessionId };
+      if (newChat && current.rollover.project) request.requireProject = true;
+      const result = await chrome.tabs.sendMessage(current.tabId, request);
       if (result && result.ok === true) {
         // Save even if Stop raced with the response: the submission really happened.
         // ACK is still restricted to the original live connection.
@@ -248,9 +249,20 @@ async function handleEvent(connection, message) {
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (sender.id !== chrome.runtime.id || !message || typeof message !== 'object') return false;
+  // A content script may only rebind itself to, or announce a rollover of, the session's own tab.
+  if (sender.tab) {
+    if (message.type !== 'badcat:hello' && message.type !== 'badcat:rollover') return false;
+    const handle = async () => {
+      await ready;
+      return message.type === 'badcat:hello' ? hello(sender) : rollover(message, sender);
+    };
+    const action = controlQueue.then(handle);
+    controlQueue = action.catch(() => {});
+    action.then(sendResponse, () => sendResponse({ ok: false }));
+    return true;
+  }
   // Only the extension's own pages (the popup) may control the session, never a content script.
-  if (sender.id !== chrome.runtime.id || sender.tab) return false;
-  if (!message || typeof message !== 'object') return false;
   const run = async () => {
     await ready;
     if (message.type === 'badcat:status') return { ok: true, session: await getSession() };
@@ -264,6 +276,30 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return true;
 });
 
+// The exact top-level frame of the bound tab, on a page the session may legitimately use.
+async function boundSender(sender, allowNewChat) {
+  const session = await getSession();
+  if (!session.active || port === null || sender.frameId !== 0 || !sender.tab || sender.tab.id !== session.tabId) return null;
+  const url = sender.url;
+  if (isConversationUrl(url) || (allowNewChat && session.rollover && isNewChatUrl(url))) return session;
+  return null;
+}
+
+// A freshly loaded content script (e.g. after a full-page rollover navigation) asks for its session id.
+async function hello(sender) {
+  const session = await boundSender(sender, true);
+  return session === null ? { ok: false } : { ok: true, session: port.sessionId };
+}
+
+// The content script saw the conversation-limit alert and is about to click "new chat". Record it
+// first so the resulting navigation to the new-chat route is not mistaken for leaving the conversation.
+async function rollover(message, sender) {
+  const session = await boundSender(sender, false);
+  if (session === null || port === null || message.session !== port.sessionId) return { ok: false };
+  await setSession({ ...session, rollover: { project: projectOf(sender.url) } });
+  return { ok: true };
+}
+
 chrome.tabs.onRemoved.addListener(async (tabId) => {
   await ready;
   const session = await getSession();
@@ -276,7 +312,17 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
   if (!changeInfo.url) return;
   await ready;
   const session = await getSession();
-  if (session.active && session.tabId === tabId && !isConversationUrl(changeInfo.url)) {
-    await deactivate('The tab is no longer a ChatGPT conversation.');
+  if (!session.active || session.tabId !== tabId) return;
+  if (isConversationUrl(changeInfo.url)) {
+    if (!session.rollover) return;
+    const { rollover: { project }, ...rest } = session; // rollover finished: the new conversation exists
+    if (project && projectOf(changeInfo.url) !== project) {
+      await deactivate('The new conversation is not in the original project.');
+      return;
+    }
+    await setSession(rest);
+    return;
   }
+  if (session.rollover && isNewChatUrl(changeInfo.url)) return;
+  await deactivate('The tab is no longer a ChatGPT conversation.');
 });
