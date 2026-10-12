@@ -49,7 +49,7 @@ function node(tag, attrs = {}, children = []) {
   return el;
 }
 
-function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubmits = false, sendButton = true, initial = '', label = 'Code Review의 새 채팅', rollover = { ok: true }, hello = { ok: false }, selector = null, menu = [], renameOnFill = null, restoreOnMenuOpen = null } = {}) {
+function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubmits = false, sendButton = true, initial = '', label = 'Code Review의 새 채팅', rollover = { ok: true }, hello = { ok: false }, selector = null, menu = [], renameOnFill = null, restoreOnMenuOpen = null, alertOnEnter = null } = {}) {
   let now = 0; // virtual clock: waits finish instantly
   let enterSubmitsNow = enterSubmits;
   const log = { submitted: [], keys: [], clicks: 0, decoyClicks: 0, fills: [] };
@@ -60,6 +60,7 @@ function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubm
     focus() {},
     dispatchEvent(ev) {
       log.keys.push(ev.type + ':' + ev.key);
+      if (alertOnEnter && ev.type === 'keydown' && !alertOnEnter.done) { alertOnEnter.done = true; ctx.alert = limitAlert(alertOnEnter.text, alertOnEnter.labels); }
       if (ev.type === 'keydown' && ev.key === 'Enter' && enterSubmitsNow) submit();
       return true;
     },
@@ -147,7 +148,7 @@ function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubm
       disconnect() { this.disconnected = true; }
     },
     chrome: { runtime: { id: 'me', onMessage: { addListener: (fn) => listeners.push(fn) },
-      async sendMessage(m) { runtimeCalls.push(m); return m.type === 'badcat:hello' ? hello : rollover; } } },
+      async sendMessage(m) { runtimeCalls.push(m); return m.type === 'badcat:hello' ? hello : (typeof rollover === 'function' ? rollover(m) : rollover); } } },
     setTimeout: (fn, ms) => { now += ms; setImmediate(fn); },
     Date: { now: () => now },
     console,
@@ -160,7 +161,7 @@ function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubm
     const keep = listeners[0](message, sender, resolve);
     if (!keep) resolve(undefined);
   });
-  return { log, selectorButton, runtimeCalls, observers, limitAlert, mutate, setUrl: (u) => { ctx.url = u; }, editor, settle: () => new Promise((r) => setImmediate(r)), send: sendMessage, text, setEnterSubmits: (v) => { enterSubmitsNow = v; } };
+  return { log, ctx, selectorButton, runtimeCalls, observers, limitAlert, mutate, setUrl: (u) => { ctx.url = u; }, editor, settle: () => new Promise((r) => setImmediate(r)), send: sendMessage, text, setEnterSubmits: (v) => { enterSubmitsNow = v; } };
 }
 
 module.exports = { bootContent: boot };

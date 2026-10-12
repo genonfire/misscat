@@ -307,23 +307,33 @@ test('host migration baseline does not suppress a fresh same-HEAD review in the 
   assert.equal(t.store['badcat.delivered'].length, 0);
 });
 
-// --- conversation-limit rollover ---
+// --- conversation-limit rollover (only ever started while a +1 is being handed off) ---
 const PROJECT_URL = 'https://chatgpt.com/g/g-p-1-proj/c/old';
 const PLAIN_URL = 'https://chatgpt.com/c/old';
 const HOME = 'https://chatgpt.com/g/g-p-1-proj/project';
 const NEW_CHAT = 'https://chatgpt.com/';
 
-async function rolled(opts = {}) {
-  const t = await started({ tabUrl: PROJECT_URL, ...opts });
-  const sid = t.natives[0].sessionId;
-  assert.equal((await t.fromContent({ type: 'badcat:rollover', session: sid })).ok, true);
-  return { t, sid };
+// A session whose first handoff attempt for E0 finds the limit alert: content announces the rollover and clicks.
+// Later attempts succeed. The retry of E0 stays asleep until `wake`.
+async function announced(opts = {}) {
+  const box = {};
+  const t = await started({ tabUrl: PROJECT_URL, fakeTimers: true, ...opts, handoff: async () => {
+    if (box.announced) return { ok: true };
+    box.announced = await box.t.fromContent({ type: 'badcat:rollover', session: box.t.natives[0].sessionId });
+    return { ok: false, rollover: true, error: 'rolling over' };
+  } });
+  box.t = t;
+  t.natives[0].emit(plus1(1, HEAD1));
+  await t.settle();
+  assert.equal(box.announced.ok, true);
+  return { t, sid: t.natives[0].sessionId };
 }
 
-test('project rollover: the new-chat route stays valid without any redirect, then settles on the new conversation in the same project', async () => {
-  const { t } = await rolled();
+test('a +1 handoff authorizes a rollover; the session survives the new-chat route and settles on the new conversation in the same project', async () => {
+  const { t } = await announced();
+  assert.equal(t.session().rollover.project, 'g-p-1-proj');
   await t.navigate(NEW_CHAT);
-  assert.deepEqual(t.updates, []); // the tab is never sent anywhere by the extension
+  assert.deepEqual(t.updates, []); // no forced redirect
   assert.equal(t.session().active, true);
   assert.equal(t.natives[0].disconnected, false);
   assert.equal(t.session().tabId, 7);
@@ -334,14 +344,39 @@ test('project rollover: the new-chat route stays valid without any redirect, the
   assert.equal(t.session().active, false);
 });
 
-test('project rollover: a conversation in another project, a project home or another site deactivates', async () => {
-  for (const url of ['https://chatgpt.com/g/g-p-2-other/c/new', 'https://chatgpt.com/g/g-p-1-proj-archive/c/new',
-    HOME, 'https://example.com/']) {
-    const { t } = await rolled();
-    await t.navigate(NEW_CHAT);
-    await t.navigate(url);
-    assert.equal(t.session().active, false, url);
-  }
+test('the same pending +1 is delivered after the rollover, with the project, acknowledged once and never resent', async () => {
+  const { t } = await announced();
+  assert.equal(t.natives[0].posted.filter((m) => m.type === 'ack').length, 0);
+  await t.navigate(NEW_CHAT);
+  await wake(t); // the retry of the same event
+  assert.equal(t.sent.length, 2);
+  assert.equal(t.sent[1].id, 7);
+  assert.equal(t.sent[1].message.project, 'g-p-1-proj');
+  assert.equal(t.natives[0].posted.filter((m) => m.type === 'ack').length, 1);
+  assert.equal(t.store['badcat.delivered.v2'].length, 1);
+  t.natives[0].emit(plus1(1, HEAD1)); // replay after a lost ack
+  await t.settle();
+  assert.equal(t.sent.length, 2);
+  assert.equal(t.natives[0].posted.filter((m) => m.type === 'ack').length, 2);
+});
+
+test('a plain (non-project) conversation rolls over to the bare new-chat route without a project', async () => {
+  const { t } = await announced({ tabUrl: PLAIN_URL });
+  assert.equal(t.session().rollover.project, null);
+  await t.navigate(NEW_CHAT);
+  assert.equal(t.session().active, true);
+  await wake(t);
+  assert.equal('project' in t.sent[1].message, false);
+  assert.equal(t.natives[0].posted.filter((m) => m.type === 'ack').length, 1);
+});
+
+test('a rollover cannot be announced without a pending +1, nor twice while one is in progress', async () => {
+  const t = await started({ tabUrl: PROJECT_URL, fakeTimers: true });
+  const sid = t.natives[0].sessionId;
+  assert.equal((await t.fromContent({ type: 'badcat:rollover', session: sid })).ok, false); // no event: no rollover
+  assert.equal('rollover' in t.session(), false);
+  const { t: u, sid: usid } = await announced();
+  assert.equal((await u.fromContent({ type: 'badcat:rollover', session: usid })).ok, false);
 });
 
 test('the new-chat route without an announced rollover still deactivates', async () => {
@@ -352,20 +387,24 @@ test('the new-chat route without an announced rollover still deactivates', async
   assert.deepEqual(t.updates, []);
 });
 
-test('plain conversation rollover keeps the new-chat route as is', async () => {
-  const t = await started({ tabUrl: PLAIN_URL });
-  assert.equal((await t.fromContent({ type: 'badcat:rollover', session: t.natives[0].sessionId })).ok, true);
-  await t.navigate(NEW_CHAT);
-  assert.equal(t.session().active, true);
-  assert.deepEqual(t.updates, []);
-  t.natives[0].emit(plus1(5, HEAD1));
-  await t.settle();
-  assert.equal('project' in t.sent[0].message, false);
+test('during a rollover a conversation in another project, a project home or another site deactivates', async () => {
+  for (const url of ['https://chatgpt.com/g/g-p-2-other/c/new', 'https://chatgpt.com/g/g-p-1-proj-archive/c/new',
+    HOME, 'https://example.com/']) {
+    const { t } = await announced();
+    await t.navigate(NEW_CHAT);
+    await t.navigate(url);
+    assert.equal(t.session().active, false, url);
+  }
 });
 
 test('rollover is accepted only from the bound tab, top frame, live session id and a conversation URL', async () => {
-  const t = await started({ tabUrl: PROJECT_URL });
-  const sid = t.natives[0].sessionId;
+  const { t, sid } = await (async () => {
+    // keep the event pending without announcing: the handoff just fails
+    const t = await started({ tabUrl: PROJECT_URL, fakeTimers: true, handoff: async () => ({ ok: false, error: 'busy' }) });
+    t.natives[0].emit(plus1(1, HEAD1));
+    await t.settle();
+    return { t, sid: t.natives[0].sessionId };
+  })();
   const msg = { type: 'badcat:rollover', session: sid };
   assert.equal((await t.fromContent({ ...msg, session: 'other' })).ok, false);
   assert.equal((await t.fromContent(msg, { tab: { id: 8 } })).ok, false);
@@ -374,6 +413,7 @@ test('rollover is accepted only from the bound tab, top frame, live session id a
   assert.equal((await t.fromContent(msg, { id: 'other' })), undefined);
   assert.equal((await t.fromContent({ type: 'badcat:start', repo: 'o/r', tabId: 7 })), undefined); // no control from content
   assert.equal('rollover' in t.session(), false);
+  assert.equal((await t.fromContent(msg)).ok, true); // the same message from the right place works
 });
 
 test('rollover without an active session is refused', async () => {
@@ -382,7 +422,7 @@ test('rollover without an active session is refused', async () => {
 });
 
 test('hello returns the live session id only to the bound tab on the new-chat route of a rollover', async () => {
-  const { t, sid } = await rolled();
+  const { t, sid } = await announced();
   await t.navigate(NEW_CHAT);
   const answer = await t.fromContent({ type: 'badcat:hello' }, { url: NEW_CHAT });
   assert.equal(answer.ok, true);
@@ -399,50 +439,35 @@ test('without a rollover neither "/" nor a project home is a valid hello page', 
   assert.equal((await t.fromContent({ type: 'badcat:hello' }, { url: HOME })).ok, false);
 });
 
-test('a +1 on the new-chat route carries the project slug, is acknowledged once and not resent', async () => {
-  const { t } = await rolled();
-  await t.navigate(NEW_CHAT);
-  t.natives[0].emit(plus1(123, HEAD1));
-  await t.settle();
-  assert.equal(t.sent.length, 1);
-  assert.equal(t.sent[0].id, 7);
-  assert.equal(t.sent[0].message.project, 'g-p-1-proj');
-  assert.equal(t.natives[0].posted.filter((m) => m.type === 'ack').length, 1);
-  t.natives[0].emit(plus1(123, HEAD1)); // replay after a lost ack
-  await t.settle();
-  assert.equal(t.sent.length, 1);
-  assert.equal(t.natives[0].posted.filter((m) => m.type === 'ack').length, 2);
-});
-
-test('stopping mid-rollover deactivates and the rollover state is gone', async () => {
-  const { t } = await rolled();
-  await t.popup({ type: 'badcat:stop', tabId: 7 });
-  assert.equal(t.session().active, false);
-  assert.equal(t.natives[0].disconnected, true);
-  assert.equal('rollover' in t.session(), false);
-});
-
-test('closing the tab during a rollover deactivates', async () => {
-  const { t } = await rolled();
-  await t.listeners['tabs.onRemoved'](7);
-  assert.equal(t.session().active, false);
-});
-
 test('a +1 is not sent when the tab is already in another project\'s conversation, even before onUpdated has run', async () => {
-  const { t } = await rolled();
+  const { t } = await announced();
   t.tabs[7].url = 'https://chatgpt.com/g/g-p-2-other/c/new'; // no onUpdated delivered yet
-  t.natives[0].emit(plus1(123, HEAD1));
-  await t.settle();
-  assert.equal(t.sent.length, 0);
+  await wake(t);
+  assert.equal(t.sent.length, 1); // only the attempt that announced the rollover
   assert.equal(t.natives[0].posted.filter((m) => m.type === 'ack').length, 0);
   assert.equal(t.session().active, false);
 });
 
-test('a +1 in the same project\'s new conversation during the rollover still carries the project', async () => {
-  const { t } = await rolled();
-  t.tabs[7].url = 'https://chatgpt.com/g/g-p-1-proj/c/new';
-  t.natives[0].emit(plus1(123, HEAD1));
-  await t.settle();
+test('stopping mid-rollover deactivates; the sleeping retry never sends or acknowledges', async () => {
+  const { t } = await announced();
+  await t.popup({ type: 'badcat:stop', tabId: 7 });
+  assert.equal(t.session().active, false);
+  assert.equal(t.natives[0].disconnected, true);
+  assert.equal('rollover' in t.session(), false);
+  await wake(t);
   assert.equal(t.sent.length, 1);
-  assert.equal(t.sent[0].message.project, 'g-p-1-proj');
+  assert.equal(t.natives[0].posted.filter((m) => m.type === 'ack').length, 0);
+});
+
+test('closing the tab during a rollover deactivates', async () => {
+  const { t } = await announced();
+  await t.listeners['tabs.onRemoved'](7);
+  assert.equal(t.session().active, false);
+});
+
+test('Watching alone (no event) never triggers anything: no message to the tab beyond activation', async () => {
+  const t = await started({ tabUrl: PROJECT_URL });
+  await t.settle();
+  assert.equal(t.sent.length, 0);
+  assert.equal(t.controls.filter((m) => m.type !== 'badcat:ping' && m.type !== 'badcat:activate').length, 0);
 });

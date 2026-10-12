@@ -158,56 +158,103 @@ const activated = async (opts) => {
   return t;
 };
 
-test('the real limit alert is announced to the background, then "새 대화 시작" is clicked exactly once', async () => {
+const pending = (t, extra = {}) => t.send({ type: 'badcat:handoff', pr: 123, session: SESSION, event: EVENT, ...extra });
+const announced = (t) => t.runtimeCalls.filter((m) => m.type === 'badcat:rollover');
+const clicks = (alert) => alert.buttons.map((b) => b.clicks);
+
+test('a +1 handoff on a limited conversation announces the rollover, then clicks "새 대화 시작" once and types nothing', async () => {
   const t = await activated();
   const alert = t.limitAlert(LIMIT, ['새 대화 시작', '새 대화 시작']); // duplicated button as captured
-  t.mutate(); t.mutate(); t.mutate();
-  await t.settle(); await t.settle();
-  assert.equal(JSON.stringify(t.runtimeCalls.filter((m) => m.type === 'badcat:rollover')), JSON.stringify([{ type: 'badcat:rollover', session: SESSION,  }]));
-  assert.deepEqual(alert.buttons.map((b) => b.clicks), [1, 0]);
+  const res = await pending(t);
+  assert.equal(res.ok, false);
+  assert.equal(res.rollover, true);
+  assert.equal(JSON.stringify(announced(t)), JSON.stringify([{ type: 'badcat:rollover', session: SESSION }]));
+  assert.deepEqual(clicks(alert), [1, 0]);
+  assert.deepEqual(t.log.fills, []);
+  assert.deepEqual(t.log.keys, []);
+  const again = await pending(t); // the retry while the old page is still shown: no second click
+  assert.equal(again.rollover, true);
+  assert.deepEqual(clicks(alert), [1, 0]);
+  assert.equal(announced(t).length, 1);
 });
 
-test('the alert already on the page at activation is handled by the initial check ("최대 깊이" wording too)', async () => {
+test('an old limited conversation is left alone without a handoff: no observer, no announcement, no click', async () => {
   const t = boot();
   const alert = t.limitAlert('이 대화는 최대 깊이에 도달했습니다.', ['새 대화 시작']);
   await t.send({ type: 'badcat:activate', session: SESSION });
+  t.mutate();
   await t.settle(); await t.settle();
-  assert.equal(alert.buttons[0].clicks, 1);
+  assert.equal(t.observers.length, 0);
+  assert.deepEqual(clicks(alert), [0]);
+  assert.equal(announced(t).length, 0);
+  const res = await pending(t); // "최대 깊이" wording is recognized once an event is pending
+  assert.equal(res.rollover, true);
+  assert.deepEqual(clicks(alert), [1]);
 });
 
-test('other alerts, or a limit text without the new-chat button, are never clicked', async () => {
+test('English wording is recognized too', async () => {
+  const t = await activated();
+  const alert = t.limitAlert('You have reached the maximum length for this conversation.', ['Start a new chat']);
+  assert.equal((await pending(t)).rollover, true);
+  assert.deepEqual(clicks(alert), [1]);
+});
+
+test('no alert: the handoff is delivered normally in the existing conversation', async () => {
+  const t = await activated();
+  assert.equal((await pending(t)).ok, true);
+  assert.equal(announced(t).length, 0);
+  assert.deepEqual(t.log.submitted, [TEXT]);
+});
+
+test('false-positive alerts or a limit text without the new-chat button are never clicked; delivery proceeds', async () => {
   const t = await activated();
   const other = t.limitAlert('네트워크 오류가 발생했습니다.', ['새 대화 시작']);
   const noButton = t.limitAlert(LIMIT, ['닫기']);
-  t.mutate();
-  await t.settle(); await t.settle();
-  assert.equal(other.buttons[0].clicks + noButton.buttons[0].clicks, 0);
-  assert.equal(t.runtimeCalls.length, 1); // only the hello at load
+  assert.equal((await pending(t)).ok, true);
+  assert.deepEqual([...clicks(other), ...clicks(noButton)], [0, 0]);
+  assert.equal(announced(t).length, 0);
 });
 
-test('without an active session nothing is clicked; a refusal by the background leaves the alert alone', async () => {
-  let t = boot();
-  const a = t.limitAlert(LIMIT, ['새 대화 시작']);
-  t.mutate();
-  await t.settle(); await t.settle();
-  assert.equal(a.buttons[0].clicks, 0);
-  t = boot({ rollover: { ok: false } });
-  const b = t.limitAlert(LIMIT, ['새 대화 시작']);
-  await t.send({ type: 'badcat:activate', session: SESSION });
-  await t.settle(); await t.settle();
-  t.mutate(); await t.settle(); await t.settle();
-  assert.equal(b.buttons[0].clicks, 0);
-  assert.equal(t.runtimeCalls.filter((m) => m.type === 'badcat:rollover').length, 1); // no retry loop
+test('a refusal by the background leaves the alert alone', async () => {
+  const t = await activated({ rollover: { ok: false } });
+  const alert = t.limitAlert(LIMIT, ['새 대화 시작']);
+  await pending(t);
+  assert.deepEqual(clicks(alert), [0]);
+  assert.equal(announced(t).length, 1);
 });
 
 test('stopping while the rollover is being announced cancels the click', async () => {
+  let t;
+  t = await activated({ rollover: async () => { await t.send({ type: 'badcat:cancel', session: SESSION }); return { ok: true }; } });
+  const alert = t.limitAlert(LIMIT, ['새 대화 시작']);
+  const res = await pending(t);
+  assert.equal(res.rollover, undefined);
+  assert.deepEqual(clicks(alert), [0]);
+  assert.deepEqual(t.log.submitted, []);
+});
+
+test('a limit alert that appears in response to a failed send is caught by one bounded recheck', async () => {
+  const t = await activated({ enterSubmits: false, sendButton: false, alertOnEnter: { text: LIMIT, labels: ['새 대화 시작'] } });
+  const res = await pending(t);
+  assert.equal(res.rollover, true);
+  assert.deepEqual(clicks(t.ctx.alert), [1]);
+  assert.equal(announced(t).length, 1);
+});
+
+test('a failed send without any alert reports its own error and does not roll over', async () => {
+  const t = await activated({ enterSubmits: false, sendButton: false });
+  const res = await pending(t);
+  assert.equal(res.ok, false);
+  assert.equal(res.rollover, undefined);
+  assert.equal(announced(t).length, 0);
+});
+
+test('a handoff without a session never rolls over', async () => {
   const t = boot();
-  const a = t.limitAlert(LIMIT, ['새 대화 시작']);
-  await t.send({ type: 'badcat:activate', session: SESSION });
-  await t.send({ type: 'badcat:cancel', session: SESSION });
-  await t.settle(); await t.settle();
-  assert.equal(a.buttons[0].clicks, 0);
-  assert.equal(t.observers[0].disconnected, true);
+  const alert = t.limitAlert(LIMIT, ['새 대화 시작']);
+  await t.send({ type: 'badcat:handoff', pr: 123 });
+  assert.deepEqual(clicks(alert), [0]);
+  assert.equal(announced(t).length, 0);
 });
 
 test('a freshly loaded page rebinds through the hello handshake', async () => {
@@ -215,7 +262,6 @@ test('a freshly loaded page rebinds through the hello handshake', async () => {
   await t.settle();
   const res = await t.send({ type: 'badcat:handoff', pr: 123, session: SESSION, event: EVENT });
   assert.equal(res.ok, true);
-  assert.equal(t.observers.length, 1);
 });
 
 const EVENT = { repo: 'o/r', pr: 123, head: 'a'.repeat(40), status: '+1', review_id: 1, delivery_id: 'c'.repeat(32) };

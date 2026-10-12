@@ -183,7 +183,18 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // Every handoff belongs to the connection that received the event; once that connection is no longer
 // the live one, the handoff is abandoned, even if repo and tab are unchanged in a newer session.
+let pendingEvents = 0; // validated +1 handoffs in progress; a rollover is only ever authorized by one of them
+
 async function handleEvent(connection, message) {
+  pendingEvents += 1;
+  try {
+    await deliverEvent(connection, message);
+  } finally {
+    pendingEvents -= 1;
+  }
+}
+
+async function deliverEvent(connection, message) {
   if (connection !== port) return;
   const session = await getSession();
   if (connection !== port || !session.active) return;
@@ -305,6 +316,8 @@ async function hello(sender) {
 async function rollover(message, sender) {
   const session = await boundSender(sender, false);
   if (session === null || port === null || message.session !== port.sessionId) return { ok: false };
+  // Only while a +1 is being handed off, and only one rollover at a time (until its new conversation exists).
+  if (pendingEvents === 0 || session.rollover) return { ok: false };
   await setSession({ ...session, rollover: { project: projectOf(sender.url) } });
   return { ok: true };
 }

@@ -101,9 +101,8 @@
 
   let activeSession = null;
   let queue = Promise.resolve();
-  let observer = null;
-  let checkTimer = null;
-  let armed = true; // one rollover per limit alert: re-armed only once the alert is gone
+  const ROLLOVER_COOLDOWN_MS = 30000;
+  let rolloverClickedAt = null;
   // The "new chat" button of the real limit alert, or null. Duplicated buttons: the first match wins.
   function findLimitButton() {
     for (const alert of document.querySelectorAll(LIMIT_ALERT)) {
@@ -115,43 +114,25 @@
     return null;
   }
 
-  async function checkRollover() {
-    checkTimer = null;
-    const session = activeSession;
-    if (session === null) return;
-    const button = findLimitButton();
-    if (!button) {
-      armed = true;
-      return;
+  // Only ever called from a pending, validated handoff (never from an observer or timer): a single,
+  // bounded look for the real limit alert. Returns a retryable result when a rollover was started or is
+  // still in progress, otherwise null (the caller carries on, or reports its own failure).
+  async function tryRollover(session) {
+    if (session === undefined || !isConversationUrl(location.href)) return null;
+    if (rolloverClickedAt !== null && Date.now() - rolloverClickedAt < ROLLOVER_COOLDOWN_MS) {
+      return { ok: false, rollover: true, error: 'rolling over to a new conversation' };
     }
-    if (!armed || button.disabled) return;
-    armed = false;
+    const button = findLimitButton();
+    if (!button || button.disabled) return null;
     // The background must know before the click: the navigation to the new-chat route is then expected.
     let answer = null;
     try {
       answer = await chrome.runtime.sendMessage({ type: 'badcat:rollover', session: session });
     } catch (e) { /* background unavailable: leave the alert alone */ }
-    if (!answer || answer.ok !== true || session !== activeSession) return;
+    if (!answer || answer.ok !== true || session !== activeSession) return null;
+    rolloverClickedAt = Date.now();
     button.click();
-  }
-
-  function scheduleCheck() {
-    if (checkTimer === null) checkTimer = setTimeout(checkRollover, 250);
-  }
-
-  function startWatching(session) {
-    activeSession = session;
-    if (observer === null && typeof MutationObserver !== 'undefined') {
-      observer = new MutationObserver(scheduleCheck);
-      observer.observe(document.body, { childList: true, subtree: true });
-    }
-    scheduleCheck();
-  }
-
-  function stopWatching() {
-    activeSession = null;
-    if (observer !== null) observer.disconnect();
-    observer = null;
+    return { ok: false, rollover: true, error: 'rolling over to a new conversation' };
   }
 
   const submitted = new Set(); // survives service-worker restart while this tab stays open
@@ -167,9 +148,12 @@
       return { ok: false, error: 'not a conversation page' };
     }
     const text = reviewMessage(pr);
+    const limit = await tryRollover(session); // an already-limited conversation cannot take the command
+    if (limit) return limit;
+    if (!active()) return { ok: false, error: 'session stopped' };
     const composer = await waitFor(() => document.querySelector(COMPOSER), 5000);
     if (!active()) return { ok: false, error: 'session stopped' };
-    if (!composer) return { ok: false, error: 'composer not found' };
+    if (!composer) return (await tryRollover(session)) || { ok: false, error: 'composer not found' };
 
     if (!conversation) {
       await sleep(NEW_CHAT_SETTLE_MS);
@@ -223,7 +207,8 @@
       }
       return { ok: true };
     }
-    return { ok: false, error: 'message was not submitted' };
+    // The send failed: the limit alert may have appeared in response; one bounded recheck.
+    return (await tryRollover(session)) || { ok: false, error: 'message was not submitted' };
   }
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -233,12 +218,12 @@
       return false;
     }
     if (message.type === 'badcat:activate') {
-      startWatching(message.session);
+      activeSession = message.session;
       sendResponse({ ok: true });
       return false;
     }
     if (message.type === 'badcat:cancel') {
-      if (activeSession === message.session) stopWatching();
+      if (activeSession === message.session) activeSession = null;
       sendResponse({ ok: true });
       return false;
     }
@@ -261,7 +246,7 @@
   try {
     chrome.runtime.sendMessage({ type: 'badcat:hello' }).then((answer) => {
       if (answer && answer.ok === true && typeof answer.session === 'string' && activeSession === null) {
-        startWatching(answer.session);
+        activeSession = answer.session;
       }
     }, () => {});
   } catch (e) { /* extension context unavailable */ }
