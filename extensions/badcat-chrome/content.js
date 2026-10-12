@@ -216,30 +216,29 @@
       return { ok: false, error: 'the selected project changed; not sent' }; // the command stays pending in the composer
     }
     const before = countUserMessages(text);
-    pressEnter(composer);
-    await waitFor(() => readComposer(composer) === '' || moved(), 3000);
-    let sent = false;
-    if (moved()) {
+    // Enter and the send button share one outcome routine: 'sent' (composer emptied in place, or the exact
+    // command appeared as a new user message), 'uncertain' (the page moved on without that proof) or 'pending'.
+    const submit = async (trigger) => {
+      trigger();
+      await waitFor(() => readComposer(composer) === '' || moved(), 3000);
+      if (!moved()) return readComposer(composer) === '' ? 'sent' : 'pending';
       // ChatGPT left the new chat and re-mounted the composer: the old node proves nothing. Only the exact
       // command appearing as a new user message (in a conversation of the expected project) confirms the send.
       const landed = () => countUserMessages(text) > before && (location.href === startUrl ||
         (isConversationUrl(location.href) && (!expectedProject || projectOf(location.href) === expectedProject)));
-      sent = Boolean(await waitFor(landed, 5000));
-      if (!sent) {
-        if (key) uncertain.add(key);
-        return UNCERTAIN; // it may have gone out: never resend automatically
-      }
-    } else {
-      sent = readComposer(composer) === '';
-    }
-    if (!sent) {
+      return (await waitFor(landed, 5000)) ? 'sent' : 'uncertain';
+    };
+    let outcome = await submit(() => pressEnter(composer));
+    if (outcome === 'pending') {
       const button = findSendButton(composer);
-      if (active() && !moved() && button && !button.disabled) {
-        button.click();
-        sent = await waitFor(() => readComposer(composer) === '', 3000);
-      }
+      // A moved page means the send may already have gone out: never click again there.
+      if (active() && !moved() && button && !button.disabled) outcome = await submit(() => button.click());
     }
-    if (sent) {
+    if (outcome === 'uncertain') {
+      if (key) uncertain.add(key);
+      return UNCERTAIN; // it may have gone out: never resend automatically
+    }
+    if (outcome === 'sent') {
       if (key) {
         submitted.add(key);
         if (submitted.size > 500) submitted.delete(submitted.values().next().value);

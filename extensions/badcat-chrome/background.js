@@ -7,6 +7,7 @@ const { HOST_NAME, normalizeRepo, isConversationUrl, isNewChatUrl, projectOf, pa
 const SESSION_KEY = 'badcat.session'; // {active, repo, tabId, error, rollover?: {project}}
 const DELIVERED_KEY = 'badcat.delivered.v2';
 const LEGACY_KEY = 'badcat.delivered';
+const UNCERTAIN_KEY = 'badcat.uncertain.v1'; // handoffs that may have been submitted but could not be confirmed
 const BASELINES_KEY = 'badcat.delivery-baselines'; // keys of handoffs already submitted
 const MAX_DELIVERED = 500;
 const RETRY_DELAYS_MS = [0, 5000, 15000]; // e.g. ChatGPT still answering when the +1 arrives
@@ -74,6 +75,7 @@ async function start(repoInput, tabId) {
     return { ok: false, error: 'Reload the ChatGPT tab, then try again.' };
   }
 
+  await chrome.storage.local.remove(UNCERTAIN_KEY); // starting again is the explicit recovery from an unconfirmed send
   let connection;
   try {
     connection = chrome.runtime.connectNative(HOST_NAME);
@@ -137,6 +139,20 @@ function onHostMessage(connection, message) {
 async function delivered() {
   const stored = await chrome.storage.local.get(DELIVERED_KEY);
   return stored[DELIVERED_KEY] || [];
+}
+
+async function uncertainKeys() {
+  const stored = await chrome.storage.local.get(UNCERTAIN_KEY);
+  return stored[UNCERTAIN_KEY] || [];
+}
+
+function rememberUncertain(key) {
+  const save = storageQueue.then(async () => {
+    const latest = await uncertainKeys();
+    await chrome.storage.local.set({ [UNCERTAIN_KEY]: [...new Set(latest.concat(key))].slice(-MAX_DELIVERED) });
+  });
+  storageQueue = save.catch(() => {});
+  return save;
 }
 
 async function reportError(connection, error) {
@@ -215,6 +231,12 @@ async function deliverEvent(connection, message) {
       return;
     }
     if (connection !== port) return;
+    if ((await uncertainKeys()).includes(key)) {
+      // A host replay or a reloaded tab must not resubmit what may already have gone out.
+      await reportError(connection, 'Delivery could not be confirmed; check ChatGPT. Not sent again.');
+      return;
+    }
+    if (connection !== port) return;
 
     let tab;
     try {
@@ -259,6 +281,7 @@ async function deliverEvent(connection, message) {
       if (result && result.ambiguous === true) {
         // It may have been submitted: never resend automatically, never ACK; leave it visible to the user.
         console.error('handoff unconfirmed:', key);
+        await rememberUncertain(key);
         await reportError(connection, 'Delivery could not be confirmed; check ChatGPT. Not sent again.');
         return;
       }

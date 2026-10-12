@@ -483,3 +483,34 @@ test('an unconfirmed submission is neither retried, acknowledged nor marked deli
   assert.match(t.session().error, /could not be confirmed/);
   assert.equal(t.session().active, true);
 });
+
+test('an unconfirmed event stays blocked after a content-script reload and a host replay; the error stays', async () => {
+  let n = 0;
+  const t = await started({ fakeTimers: true, handoff: async () => (++n === 1 ? { ok: false, ambiguous: true, error: 'unconfirmed' } : { ok: true }) });
+  t.natives[0].emit(plus1(5, HEAD1));
+  await t.settle();
+  assert.equal(t.sent.length, 1);
+  assert.equal((await t.fromContent({ type: 'badcat:hello' })).ok, true); // the reloaded tab rebinds
+  t.natives[0].emit(plus1(5, HEAD1)); // the host replays the unacknowledged event
+  await t.settle();
+  assert.equal(t.sent.length, 1);
+  assert.equal(t.natives[0].posted.filter((m) => m.type === 'ack').length, 0);
+  assert.equal(t.store['badcat.delivered.v2'], undefined);
+  assert.match(t.session().error, /could not be confirmed/);
+  assert.equal(t.session().active, true);
+  t.natives[0].emit(plus1(6, HEAD2, { review_id: 101 })); // a different event is not blocked
+  await t.settle();
+  assert.equal(t.sent.length, 2);
+  assert.equal(t.natives[0].posted.filter((m) => m.type === 'ack').length, 1);
+});
+
+test('the block survives a service-worker restart and is lifted only by an explicit new Start', async () => {
+  const t = await started({ fakeTimers: true, handoff: async () => ({ ok: false, ambiguous: true, error: 'unconfirmed' }) });
+  t.natives[0].emit(plus1(5, HEAD1));
+  await t.settle();
+  assert.deepEqual(t.store['badcat.uncertain.v1'], ['o/r#5@' + HEAD1 + ':100']);
+  await t.popup({ type: 'badcat:stop', tabId: 7 });
+  assert.deepEqual(t.store['badcat.uncertain.v1'], ['o/r#5@' + HEAD1 + ':100']); // Stop alone keeps it
+  await t.popup({ type: 'badcat:start', repo: 'o/r', tabId: 7 });
+  assert.equal(t.store['badcat.uncertain.v1'], undefined);
+});

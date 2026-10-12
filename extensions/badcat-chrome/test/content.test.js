@@ -496,3 +496,25 @@ test('a slow confirmation (within the wait) is accepted once; one that arrives t
   assert.equal((await t.send(handoffMsg({ project: SLUG }))).ambiguous, true); // the retry does not resend even though the bubble exists by now
   assert.deepEqual(t.log.submitted, [TEXT]);
 });
+
+test('send-button fallback: Enter does nothing, the click submits and the page moves: confirmed by the bubble, one send', async () => {
+  const dest = 'https://chatgpt.com/g/' + SLUG + '/c/new-id';
+  const t = await activated({ ...projectOpts({ afterSubmit: { url: dest, render: true } }), enterSubmits: false, buttonSubmits: true });
+  const res = await t.send(handoffMsg({ project: SLUG }));
+  assert.equal(res.ok, true);
+  assert.equal(t.log.clicks, 1);
+  assert.deepEqual(t.log.submitted, [TEXT]);
+  assert.equal((await t.send(handoffMsg({ project: SLUG }))).ok, true); // replay: no second send, no second click
+  assert.equal(t.log.clicks, 1);
+  assert.deepEqual(t.log.submitted, [TEXT]);
+});
+
+test('send-button fallback: the page moved but nothing confirms it: ambiguous, no ACK path, never resent or re-clicked', async () => {
+  const dest = 'https://chatgpt.com/g/' + SLUG + '/c/new-id';
+  const t = await activated({ ...projectOpts({ afterSubmit: { url: dest, render: false } }), enterSubmits: false, buttonSubmits: true });
+  const res = await t.send(handoffMsg({ project: SLUG }));
+  assert.equal(res.ambiguous, true);
+  assert.equal((await t.send(handoffMsg({ project: SLUG }))).ambiguous, true);
+  assert.equal(t.log.clicks, 1);
+  assert.deepEqual(t.log.submitted, [TEXT]);
+});

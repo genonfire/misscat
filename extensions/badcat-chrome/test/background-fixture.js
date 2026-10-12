@@ -38,6 +38,7 @@ function boot({ tabUrl = GOOD_URL, handoff = async () => ({ ok: true }), seed = 
         async set(obj) { Object.assign(store, JSON.parse(JSON.stringify(obj))); },
       },
       local: {
+        async remove(key) { delete store[key]; },
         async get(key) { return key in store ? { [key]: store[key] } : {}; },
         async set(obj) { await beforeLocalSet(obj); Object.assign(store, JSON.parse(JSON.stringify(obj))); },
       },
