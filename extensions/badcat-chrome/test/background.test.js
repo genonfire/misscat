@@ -306,3 +306,338 @@ test('host migration baseline does not suppress a fresh same-HEAD review in the 
   assert.equal(t.natives[0].posted[1].review_id, 200);
   assert.equal(t.store['badcat.delivered'].length, 0);
 });
+
+// --- conversation-limit rollover (only ever started while a +1 is being handed off) ---
+const PROJECT_URL = 'https://chatgpt.com/g/g-p-1-proj/c/old';
+const PLAIN_URL = 'https://chatgpt.com/c/old';
+const HOME = 'https://chatgpt.com/g/g-p-1-proj/project';
+const NEW_CHAT = 'https://chatgpt.com/';
+
+// A session whose first handoff attempt for E0 finds the limit alert: content announces the rollover and clicks.
+// Later attempts succeed. The retry of E0 stays asleep until `wake`.
+async function announced(opts = {}) {
+  const box = {};
+  const t = await started({ tabUrl: PROJECT_URL, fakeTimers: true, ...opts, handoff: async () => {
+    if (box.announced) return { ok: true };
+    box.announced = await box.t.fromContent({ type: 'badcat:rollover', session: box.t.natives[0].sessionId });
+    return { ok: false, rollover: true, error: 'rolling over' };
+  } });
+  box.t = t;
+  t.natives[0].emit(plus1(1, HEAD1));
+  await t.settle();
+  assert.equal(box.announced.ok, true);
+  return { t, sid: t.natives[0].sessionId };
+}
+
+test('a +1 handoff authorizes a rollover; the session survives the new-chat route and settles on the new conversation in the same project', async () => {
+  const { t } = await announced();
+  assert.equal(t.session().rollover.project, 'g-p-1-proj');
+  await t.navigate(NEW_CHAT);
+  assert.deepEqual(t.updates, []); // no forced redirect
+  assert.equal(t.session().active, true);
+  assert.equal(t.natives[0].disconnected, false);
+  assert.equal(t.session().tabId, 7);
+  await t.navigate('https://chatgpt.com/g/g-p-1-proj/c/new');
+  assert.equal(t.session().active, true);
+  assert.equal('rollover' in t.session(), false);
+  await t.navigate(NEW_CHAT); // the rollover is over: the root is no longer a valid state
+  assert.equal(t.session().active, false);
+});
+
+test('the same pending +1 is delivered after the rollover, with the project, acknowledged once and never resent', async () => {
+  const { t } = await announced();
+  assert.equal(t.natives[0].posted.filter((m) => m.type === 'ack').length, 0);
+  await t.navigate(NEW_CHAT);
+  await wake(t); // the retry of the same event
+  assert.equal(t.sent.length, 2);
+  assert.equal(t.sent[1].id, 7);
+  assert.equal(t.sent[1].message.project, 'g-p-1-proj');
+  assert.equal(t.natives[0].posted.filter((m) => m.type === 'ack').length, 1);
+  assert.equal(t.store['badcat.delivered.v2'].length, 1);
+  t.natives[0].emit(plus1(1, HEAD1)); // replay after a lost ack
+  await t.settle();
+  assert.equal(t.sent.length, 2);
+  assert.equal(t.natives[0].posted.filter((m) => m.type === 'ack').length, 2);
+});
+
+test('a plain (non-project) conversation rolls over to the bare new-chat route without a project', async () => {
+  const { t } = await announced({ tabUrl: PLAIN_URL });
+  assert.equal(t.session().rollover.project, null);
+  await t.navigate(NEW_CHAT);
+  assert.equal(t.session().active, true);
+  await wake(t);
+  assert.equal('project' in t.sent[1].message, false);
+  assert.equal(t.natives[0].posted.filter((m) => m.type === 'ack').length, 1);
+});
+
+test('a rollover cannot be announced without a pending +1, nor twice while one is in progress', async () => {
+  const t = await started({ tabUrl: PROJECT_URL, fakeTimers: true });
+  const sid = t.natives[0].sessionId;
+  assert.equal((await t.fromContent({ type: 'badcat:rollover', session: sid })).ok, false); // no event: no rollover
+  assert.equal('rollover' in t.session(), false);
+  const { t: u, sid: usid } = await announced();
+  assert.equal((await u.fromContent({ type: 'badcat:rollover', session: usid })).ok, false);
+});
+
+test('the new-chat route without an announced rollover still deactivates', async () => {
+  const t = await started();
+  await t.navigate(NEW_CHAT);
+  assert.equal(t.session().active, false);
+  assert.equal(t.natives[0].disconnected, true);
+  assert.deepEqual(t.updates, []);
+});
+
+test('during a rollover a conversation in another project, a project home or another site deactivates', async () => {
+  for (const url of ['https://chatgpt.com/g/g-p-2-other/c/new', 'https://chatgpt.com/g/g-p-1-proj-archive/c/new',
+    HOME, 'https://example.com/']) {
+    const { t } = await announced();
+    await t.navigate(NEW_CHAT);
+    await t.navigate(url);
+    assert.equal(t.session().active, false, url);
+  }
+});
+
+test('rollover is accepted only from the bound tab, top frame, live session id and a conversation URL', async () => {
+  const { t, sid } = await (async () => {
+    // keep the event pending without announcing: the handoff just fails
+    const t = await started({ tabUrl: PROJECT_URL, fakeTimers: true, handoff: async () => ({ ok: false, error: 'busy' }) });
+    t.natives[0].emit(plus1(1, HEAD1));
+    await t.settle();
+    return { t, sid: t.natives[0].sessionId };
+  })();
+  const msg = { type: 'badcat:rollover', session: sid };
+  assert.equal((await t.fromContent({ ...msg, session: 'other' })).ok, false);
+  assert.equal((await t.fromContent(msg, { tab: { id: 8 } })).ok, false);
+  assert.equal((await t.fromContent(msg, { frameId: 3 })).ok, false);
+  assert.equal((await t.fromContent(msg, { url: 'https://chatgpt.com/' })).ok, false);
+  assert.equal((await t.fromContent(msg, { id: 'other' })), undefined);
+  assert.equal((await t.fromContent({ type: 'badcat:start', repo: 'o/r', tabId: 7 })), undefined); // no control from content
+  assert.equal('rollover' in t.session(), false);
+  assert.equal((await t.fromContent(msg)).ok, true); // the same message from the right place works
+});
+
+test('rollover without an active session is refused', async () => {
+  const t = boot({ tabUrl: PROJECT_URL });
+  assert.equal((await t.fromContent({ type: 'badcat:rollover', session: 'x' })).ok, false);
+});
+
+test('hello returns the live session id only to the bound tab on the new-chat route of a rollover', async () => {
+  const { t, sid } = await announced();
+  await t.navigate(NEW_CHAT);
+  const answer = await t.fromContent({ type: 'badcat:hello' }, { url: NEW_CHAT });
+  assert.equal(answer.ok, true);
+  assert.equal(answer.session, sid);
+  assert.equal((await t.fromContent({ type: 'badcat:hello' }, { url: HOME })).ok, false);
+  assert.equal((await t.fromContent({ type: 'badcat:hello' }, { tab: { id: 8 } })).ok, false);
+  await t.popup({ type: 'badcat:stop', tabId: 7 });
+  assert.equal((await t.fromContent({ type: 'badcat:hello' }, { url: NEW_CHAT })).ok, false);
+});
+
+test('without a rollover neither "/" nor a project home is a valid hello page', async () => {
+  const t = await started();
+  assert.equal((await t.fromContent({ type: 'badcat:hello' }, { url: NEW_CHAT })).ok, false);
+  assert.equal((await t.fromContent({ type: 'badcat:hello' }, { url: HOME })).ok, false);
+});
+
+test('a +1 is not sent when the tab is already in another project\'s conversation, even before onUpdated has run', async () => {
+  const { t } = await announced();
+  t.tabs[7].url = 'https://chatgpt.com/g/g-p-2-other/c/new'; // no onUpdated delivered yet
+  await wake(t);
+  assert.equal(t.sent.length, 1); // only the attempt that announced the rollover
+  assert.equal(t.natives[0].posted.filter((m) => m.type === 'ack').length, 0);
+  assert.equal(t.session().active, false);
+});
+
+test('stopping mid-rollover deactivates; the sleeping retry never sends or acknowledges', async () => {
+  const { t } = await announced();
+  await t.popup({ type: 'badcat:stop', tabId: 7 });
+  assert.equal(t.session().active, false);
+  assert.equal(t.natives[0].disconnected, true);
+  assert.equal('rollover' in t.session(), false);
+  await wake(t);
+  assert.equal(t.sent.length, 1);
+  assert.equal(t.natives[0].posted.filter((m) => m.type === 'ack').length, 0);
+});
+
+test('closing the tab during a rollover deactivates', async () => {
+  const { t } = await announced();
+  await t.listeners['tabs.onRemoved'](7);
+  assert.equal(t.session().active, false);
+});
+
+test('Watching alone (no event) never triggers anything: no message to the tab beyond activation', async () => {
+  const t = await started({ tabUrl: PROJECT_URL });
+  await t.settle();
+  assert.equal(t.sent.length, 0);
+  assert.equal(t.controls.filter((m) => m.type !== 'badcat:ping' && m.type !== 'badcat:activate').length, 0);
+});
+
+test('an unconfirmed submission is neither retried, acknowledged nor marked delivered; the error stays visible', async () => {
+  const t = await started({ fakeTimers: true, handoff: async () => ({ ok: false, ambiguous: true, error: 'unconfirmed' }) });
+  t.natives[0].emit(plus1(5, HEAD1));
+  await t.settle();
+  assert.equal(t.sent.length, 1);
+  assert.equal(t.timers.length, 0); // no retry sleep
+  assert.equal(t.natives[0].posted.filter((m) => m.type === 'ack').length, 0);
+  assert.equal(t.store['badcat.delivered.v2'], undefined);
+  assert.match(t.session().error, /could not be confirmed/);
+  assert.equal(t.session().active, true);
+});
+
+test('an unconfirmed event stays blocked after a content-script reload and a host replay; the error stays', async () => {
+  let n = 0;
+  const t = await started({ fakeTimers: true, handoff: async () => (++n === 1 ? { ok: false, ambiguous: true, error: 'unconfirmed' } : { ok: true }) });
+  t.natives[0].emit(plus1(5, HEAD1));
+  await t.settle();
+  assert.equal(t.sent.length, 1);
+  assert.equal((await t.fromContent({ type: 'badcat:hello' })).ok, true); // the reloaded tab rebinds
+  t.natives[0].emit(plus1(5, HEAD1)); // the host replays the unacknowledged event
+  await t.settle();
+  assert.equal(t.sent.length, 1);
+  assert.equal(t.natives[0].posted.filter((m) => m.type === 'ack').length, 0);
+  assert.equal(t.store['badcat.delivered.v2'], undefined);
+  assert.match(t.session().error, /could not be confirmed/);
+  assert.equal(t.session().active, true);
+  t.natives[0].emit(plus1(6, HEAD2, { review_id: 101 })); // a different event is not blocked
+  await t.settle();
+  assert.equal(t.sent.length, 2);
+  assert.equal(t.natives[0].posted.filter((m) => m.type === 'ack').length, 1);
+});
+
+test('the block survives a service-worker restart and is lifted only by an explicit new Start', async () => {
+  const t = await started({ fakeTimers: true, handoff: async () => ({ ok: false, ambiguous: true, error: 'unconfirmed' }) });
+  t.natives[0].emit(plus1(5, HEAD1));
+  await t.settle();
+  assert.deepEqual(t.store['badcat.uncertain.v1'], ['o/r#5@' + HEAD1 + ':100']);
+  await t.popup({ type: 'badcat:stop', tabId: 7 });
+  assert.deepEqual(t.store['badcat.uncertain.v1'], ['o/r#5@' + HEAD1 + ':100']); // Stop alone keeps it
+  await t.popup({ type: 'badcat:start', repo: 'o/r', tabId: 7 });
+  assert.equal(t.store['badcat.uncertain.v1'], undefined);
+});
+
+// --- attempt marker: a broken channel after the submit must never cause a resend ---
+const KEY5 = 'o/r#5@' + HEAD1 + ':100';
+const uncertainStore = (t) => t.store['badcat.uncertain.v1'];
+const acks = (t, i = 0) => t.natives[i].posted.filter((m) => m.type === 'ack').length;
+
+// A handoff stub that records the attempt first (as the content script does right before Enter), then ends as `how`.
+function attempting(boxRef, how) {
+  return async () => {
+    const t = boxRef.t;
+    const res = await t.fromContent({ type: 'badcat:attempt', session: t.natives[t.natives.length - 1].sessionId });
+    assert.equal(res.ok, true);
+    if (how === 'throw') throw new Error('The message channel is closed before a response was received.');
+    return how === 'ok' ? { ok: true } : how === 'ambiguous' ? { ok: false, ambiguous: true, error: 'u' } : { ok: false, error: 'message was not submitted' };
+  };
+}
+const bootAttempting = async (how) => {
+  const box = {};
+  box.t = await started({ fakeTimers: true, handoff: attempting(box, how) });
+  return box.t;
+};
+
+test('the channel breaks after the attempt was recorded (page navigation right after the submit): no retry, no ACK, no resend after replay or hello', async () => {
+  const t = await bootAttempting('throw');
+  t.natives[0].emit(plus1(5, HEAD1));
+  await t.settle();
+  assert.equal(t.sent.length, 1);
+  assert.equal(t.timers.length, 0); // no retry sleep
+  assert.deepEqual(uncertainStore(t), [KEY5]);
+  assert.equal(acks(t), 0);
+  assert.equal(t.store['badcat.delivered.v2'], undefined);
+  assert.match(t.session().error, /could not be confirmed/);
+  assert.equal((await t.fromContent({ type: 'badcat:hello' })).ok, true); // the new page rebinds
+  t.natives[0].emit(plus1(5, HEAD1)); // the host replays the event
+  await t.settle();
+  assert.equal(t.sent.length, 1);
+  assert.equal(acks(t), 0);
+});
+
+test('control: a channel error before any attempt (nothing was submitted) is retried as before', async () => {
+  const t = await started({ fakeTimers: true, handoff: async () => { throw new Error('Could not establish connection. Receiving end does not exist.'); } });
+  t.natives[0].emit(plus1(5, HEAD1));
+  await t.settle();
+  assert.equal(t.timers.length, 1); // sleeping before the retry
+  assert.equal(uncertainStore(t), undefined);
+});
+
+test('a definite "not submitted" after the attempt withdraws the marker and keeps the retry policy', async () => {
+  const t = await bootAttempting('notsubmitted');
+  t.natives[0].emit(plus1(5, HEAD1));
+  await t.settle();
+  assert.equal(t.timers.length, 1);
+  assert.deepEqual(uncertainStore(t), []);
+});
+
+test('a confirmed submission after the attempt clears the marker, saves delivered and acknowledges once', async () => {
+  const t = await bootAttempting('ok');
+  t.natives[0].emit(plus1(5, HEAD1));
+  await t.settle();
+  assert.deepEqual(uncertainStore(t), []);
+  assert.deepEqual(t.store['badcat.delivered.v2'], [KEY5]);
+  assert.equal(acks(t), 1);
+});
+
+test('an attempt is accepted only for the event being sent, from the bound tab and the live session', async () => {
+  const t = await started({ fakeTimers: true, handoff: async () => ({ ok: false, error: 'busy' }) });
+  const sid = t.natives[0].sessionId;
+  assert.equal((await t.fromContent({ type: 'badcat:attempt', session: sid })).ok, false); // nothing in flight
+  assert.equal(uncertainStore(t), undefined);
+});
+
+test('late answers of an older session never touch the new session (OFF then ON while a handoff was in flight)', async () => {
+  for (const how of ['ambiguous', 'throw', 'ok', 'notsubmitted']) {
+    let release;
+    const gate = new Promise((r) => { release = r; });
+    const box = {};
+    let first = true;
+    box.t = await started({ fakeTimers: true, handoff: async () => {
+      if (first) {
+        first = false;
+        const t = box.t;
+        await t.fromContent({ type: 'badcat:attempt', session: t.natives[0].sessionId }); // A had recorded an attempt
+        await gate;
+        if (how === 'throw') throw new Error('closed');
+        return how === 'ok' ? { ok: true } : how === 'ambiguous' ? { ok: false, ambiguous: true } : { ok: false, error: 'x' };
+      }
+      return { ok: true };
+    } });
+    const t = box.t;
+    t.natives[0].emit(plus1(5, HEAD1));
+    await t.settle();
+    await OFF_ON(t); // session B; its start clears the stale marker of A
+    assert.equal(t.store['badcat.uncertain.v1'], undefined, how);
+    release();
+    await t.settle();
+    if (how !== 'ok') assert.equal(t.store['badcat.uncertain.v1'], undefined, how); // A's late answer left no trace
+    assert.equal(t.session().error, null, how);
+    assert.equal(t.session().active, true, how);
+    assert.equal(acks(t, 1), 0, how);
+    t.natives[1].emit(plus1(5, HEAD1, { review_id: 100 })); // the same event in B is handled normally
+    await t.settle();
+    assert.equal(acks(t, 1) >= 1, true, how);
+  }
+});
+
+test('a pending write of an old session\'s uncertain key cannot outlive the Start of the next session', async () => {
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  let hold = false;
+  const t = await started({ fakeTimers: true, handoff: async () => ({ ok: false, ambiguous: true }),
+    beforeLocalSet: async (obj) => { if (hold && 'badcat.uncertain.v1' in obj) await gate; } });
+  hold = true;
+  t.natives[0].emit(plus1(5, HEAD1));
+  await t.settle(); // A's uncertain write is now waiting inside the storage queue
+  await t.popup({ type: 'badcat:stop', tabId: 7 });
+  const started2 = t.popup({ type: 'badcat:start', repo: 'o/r', tabId: 7 }); // B
+  await t.settle();
+  release();
+  assert.equal((await started2).ok, true);
+  await t.settle();
+  hold = false;
+  assert.equal(t.store['badcat.uncertain.v1'], undefined); // A's stale key was dropped, not resurrected
+  assert.equal(t.session().error, null);
+  t.natives[1].emit(plus1(5, HEAD1)); // the same event in B is handled, not blocked
+  await t.settle();
+  assert.equal(t.sent.length, 2);
+});

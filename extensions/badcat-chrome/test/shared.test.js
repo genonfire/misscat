@@ -64,3 +64,14 @@ test('eventKey separates PR and HEAD', () => {
   assert.notEqual(S.eventKey(a), S.eventKey({ ...a, pr: 2 }));
   assert.equal(S.eventKey(a), S.eventKey({ ...a, repo: 'O/R' }));
 });
+
+test('isNewChatUrl accepts only the chatgpt.com root; projectOf reads the project slug', () => {
+  assert.ok(S.isNewChatUrl('https://chatgpt.com/'));
+  for (const bad of ['https://chatgpt.com/c/1', 'https://chatgpt.com/g/p/c/1', 'http://chatgpt.com/', 'https://evil.com/',
+    'https://chatgpt.com.evil.com/', 'nope', undefined]) {
+    assert.equal(S.isNewChatUrl(bad), false, String(bad));
+  }
+  assert.equal(S.projectOf('https://chatgpt.com/g/g-p-123-proj/c/68a1'), 'g-p-123-proj');
+  assert.equal(S.projectOf('https://chatgpt.com/c/68a1'), null);
+  assert.equal(S.projectOf('nope'), null);
+});

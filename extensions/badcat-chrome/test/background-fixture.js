@@ -38,6 +38,7 @@ function boot({ tabUrl = GOOD_URL, handoff = async () => ({ ok: true }), seed = 
         async set(obj) { Object.assign(store, JSON.parse(JSON.stringify(obj))); },
       },
       local: {
+        async remove(key) { delete store[key]; },
         async get(key) { return key in store ? { [key]: store[key] } : {}; },
         async set(obj) { await beforeLocalSet(obj); Object.assign(store, JSON.parse(JSON.stringify(obj))); },
       },
@@ -45,6 +46,8 @@ function boot({ tabUrl = GOOD_URL, handoff = async () => ({ ok: true }), seed = 
     tabs: {
       onRemoved: hook('tabs.onRemoved'),
       onUpdated: hook('tabs.onUpdated'),
+      updates: [],
+      async update(id, props) { tabs[id].url = props.url; this.updates.push(props.url); },
       async get(id) { if (!tabs[id]) throw new Error('No tab'); return tabs[id]; },
       async sendMessage(id, message) {
         if (message.type !== 'badcat:handoff') { controls.push(message); return control(message); }
@@ -66,9 +69,16 @@ function boot({ tabUrl = GOOD_URL, handoff = async () => ({ ok: true }), seed = 
     const keep = listeners['runtime.onMessage'](message, { id: 'me' }, resolve);
     assert.equal(keep, true);
   });
+  // A message from the content script of `tabId` (default: the bound tab), as chrome would deliver it.
+  const fromContent = (message, sender = {}) => new Promise((resolve) => {
+    const full = { id: 'me', tab: { id: 7 }, frameId: 0, url: tabs[7].url, ...sender };
+    const keep = listeners['runtime.onMessage'](message, full, resolve);
+    if (!keep) resolve(undefined);
+  });
+  const navigate = async (url, id = 7) => { tabs[id].url = url; await listeners['tabs.onUpdated'](id, { url }); };
   const session = () => store['badcat.session'];
   const settle = () => new Promise((r) => setImmediate(r));
-  return { popup, session, store, tabs, sent, controls, listeners, natives, settle, timers };
+  return { popup, fromContent, updates: chrome.tabs.updates, navigate, session, store, tabs, sent, controls, listeners, natives, settle, timers };
 }
 
 module.exports = { bootBackground: boot };

@@ -32,6 +32,27 @@
       CONVERSATION_PATH_RE.test(parsed.pathname);
   }
 
+  // The new-chat landing route ChatGPT shows after "새 대화 시작": a valid state only mid-rollover.
+  function isNewChatUrl(url) {
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch (e) {
+      return false;
+    }
+    return parsed.protocol === 'https:' && parsed.hostname === 'chatgpt.com' && parsed.pathname === '/';
+  }
+
+  // The project slug of /g/<slug>/c/<id>, or null for a plain /c/<id> conversation.
+  function projectOf(url) {
+    try {
+      const m = new URL(url).pathname.match(/^\/g\/([A-Za-z0-9_-]+)\/c\//);
+      return m ? m[1] : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
   // The only host message that triggers a handoff: a "+1" for the watched repo.
   // Returns the validated event contract for forwarding and re-validation by content.js.
   // Normalization preserves status and IDs; errors, +2, malformed/other-repo events return null.
@@ -71,6 +92,8 @@
     HOST_NAME: HOST_NAME,
     normalizeRepo: normalizeRepo,
     isConversationUrl: isConversationUrl,
+    isNewChatUrl: isNewChatUrl,
+    projectOf: projectOf,
     parseEvent: parseEvent,
     eventKey: eventKey,
     reviewMessage: reviewMessage,

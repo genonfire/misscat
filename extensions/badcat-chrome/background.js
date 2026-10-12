@@ -2,11 +2,12 @@
 // The popup only asks it to start/stop; closing the popup changes nothing here.
 importScripts('shared.js');
 
-const { HOST_NAME, normalizeRepo, isConversationUrl, parseEvent, eventKey } = self.BadCatShared;
+const { HOST_NAME, normalizeRepo, isConversationUrl, isNewChatUrl, projectOf, parseEvent, eventKey } = self.BadCatShared;
 
-const SESSION_KEY = 'badcat.session'; // {active, repo, tabId, error}
+const SESSION_KEY = 'badcat.session'; // {active, repo, tabId, error, rollover?: {project}}
 const DELIVERED_KEY = 'badcat.delivered.v2';
 const LEGACY_KEY = 'badcat.delivered';
+const UNCERTAIN_KEY = 'badcat.uncertain.v1'; // handoffs that may have been submitted but could not be confirmed
 const BASELINES_KEY = 'badcat.delivery-baselines'; // keys of handoffs already submitted
 const MAX_DELIVERED = 500;
 const RETRY_DELAYS_MS = [0, 5000, 15000]; // e.g. ChatGPT still answering when the +1 arrives
@@ -74,6 +75,7 @@ async function start(repoInput, tabId) {
     return { ok: false, error: 'Reload the ChatGPT tab, then try again.' };
   }
 
+  await clearUncertain(); // starting again is the explicit recovery from an unconfirmed send
   let connection;
   try {
     connection = chrome.runtime.connectNative(HOST_NAME);
@@ -139,6 +141,40 @@ async function delivered() {
   return stored[DELIVERED_KEY] || [];
 }
 
+async function uncertainKeys() {
+  const stored = await chrome.storage.local.get(UNCERTAIN_KEY);
+  return stored[UNCERTAIN_KEY] || [];
+}
+
+// Every write of the uncertain list goes through storageQueue, in order with Start's reset. A write on behalf
+// of a connection that is no longer the live one is dropped when its turn comes. Returns whether it was saved.
+function rememberUncertain(key, connection) {
+  let saved = false;
+  const save = storageQueue.then(async () => {
+    if (connection !== port) return;
+    const latest = await uncertainKeys();
+    await chrome.storage.local.set({ [UNCERTAIN_KEY]: [...new Set(latest.concat(key))].slice(-MAX_DELIVERED) });
+    saved = true;
+  });
+  storageQueue = save.catch(() => {});
+  return save.then(() => saved);
+}
+
+function clearUncertain() {
+  const clear = storageQueue.then(() => chrome.storage.local.remove(UNCERTAIN_KEY));
+  storageQueue = clear.catch(() => {});
+  return clear;
+}
+
+function forgetUncertain(key) {
+  const save = storageQueue.then(async () => {
+    const latest = await uncertainKeys();
+    await chrome.storage.local.set({ [UNCERTAIN_KEY]: latest.filter((k) => k !== key) });
+  });
+  storageQueue = save.catch(() => {});
+  return save;
+}
+
 async function reportError(connection, error) {
   const session = await getSession();
   if (connection === port && session.active) {
@@ -183,7 +219,19 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // Every handoff belongs to the connection that received the event; once that connection is no longer
 // the live one, the handoff is abandoned, even if repo and tab are unchanged in a newer session.
+let inFlight = null; // {connection, key}: the handoff currently being sent to the tab (one at a time)
+let pendingEvents = 0; // validated +1 handoffs in progress; a rollover is only ever authorized by one of them
+
 async function handleEvent(connection, message) {
+  pendingEvents += 1;
+  try {
+    await deliverEvent(connection, message);
+  } finally {
+    pendingEvents -= 1;
+  }
+}
+
+async function deliverEvent(connection, message) {
   if (connection !== port) return;
   const session = await getSession();
   if (connection !== port || !session.active) return;
@@ -204,6 +252,12 @@ async function handleEvent(connection, message) {
       return;
     }
     if (connection !== port) return;
+    if ((await uncertainKeys()).includes(key)) {
+      // A host replay or a reloaded tab must not resubmit what may already have gone out.
+      await reportError(connection, 'Delivery could not be confirmed; check ChatGPT. Not sent again.');
+      return;
+    }
+    if (connection !== port) return;
 
     let tab;
     try {
@@ -213,16 +267,24 @@ async function handleEvent(connection, message) {
       return;
     }
     if (connection !== port) return;
-    if (!isConversationUrl(tab.url)) {
+    // Mid-rollover the tab legitimately sits on the new-chat route until the first message is sent.
+    const newChat = rolloverPage(current, tab.url);
+    // Before the onUpdated handler has run, a conversation of another project must still not get a message.
+    if (current.rollover && current.rollover.project && isConversationUrl(tab.url) &&
+        projectOf(tab.url) !== current.rollover.project) {
+      await deactivate('The new conversation is not in the original project.');
+      return;
+    }
+    if (!isConversationUrl(tab.url) && !newChat) {
       await deactivate('The tab is no longer a ChatGPT conversation.');
       return;
     }
 
+    inFlight = { connection: connection, key: key };
     try {
-      const result = await chrome.tabs.sendMessage(current.tabId, {
-        type: 'badcat:handoff',
-        pr: event.pr, event: event, session: connection.sessionId,
-      });
+      const request = { type: 'badcat:handoff', pr: event.pr, event: event, session: connection.sessionId };
+      if (current.rollover && current.rollover.project) request.project = current.rollover.project;
+      const result = await chrome.tabs.sendMessage(current.tabId, request);
       if (result && result.ok === true) {
         // Save even if Stop raced with the response: the submission really happened.
         // ACK is still restricted to the original live connection.
@@ -234,13 +296,34 @@ async function handleEvent(connection, message) {
         });
         storageQueue = save.catch(() => {});
         await save;
+        await forgetUncertain(key); // it was confirmed after all
         await clearError(connection);
         acknowledge(connection, event);
         return;
       }
+      // From here on a late answer of an older session must not touch the live one.
+      if (connection !== port) return;
+      if (result && result.ambiguous === true) {
+        // It may have been submitted: never resend automatically, never ACK; leave it visible to the user.
+        console.error('handoff unconfirmed:', key);
+        await rememberUncertain(key, connection);
+        await reportError(connection, 'Delivery could not be confirmed; check ChatGPT. Not sent again.');
+        return;
+      }
+      // Definitely not submitted: the attempt marker (if any) is withdrawn and the retry policy applies.
       console.error('handoff not delivered:', result && result.error);
+      await forgetUncertain(key);
     } catch (e) {
       console.error('handoff not delivered:', e && e.message);
+      if (connection !== port) return;
+      // The channel broke (e.g. a full page navigation right after the submit): if the content script had
+      // already recorded the attempt, the message may be out there. Never resend it automatically.
+      if ((await uncertainKeys()).includes(key)) {
+        await reportError(connection, 'Delivery could not be confirmed; check ChatGPT. Not sent again.');
+        return;
+      }
+    } finally {
+      if (inFlight && inFlight.connection === connection) inFlight = null;
     }
   }
   console.error('giving up on', key, '- not marked delivered');
@@ -248,9 +331,21 @@ async function handleEvent(connection, message) {
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (sender.id !== chrome.runtime.id || !message || typeof message !== 'object') return false;
+  // A content script may only rebind itself to, or announce a rollover of, the session's own tab.
+  if (sender.tab) {
+    if (message.type !== 'badcat:hello' && message.type !== 'badcat:rollover' && message.type !== 'badcat:attempt') return false;
+    const handle = async () => {
+      await ready;
+      if (message.type === 'badcat:hello') return hello(sender);
+      return message.type === 'badcat:attempt' ? attempt(message, sender) : rollover(message, sender);
+    };
+    const action = controlQueue.then(handle);
+    controlQueue = action.catch(() => {});
+    action.then(sendResponse, () => sendResponse({ ok: false }));
+    return true;
+  }
   // Only the extension's own pages (the popup) may control the session, never a content script.
-  if (sender.id !== chrome.runtime.id || sender.tab) return false;
-  if (!message || typeof message !== 'object') return false;
   const run = async () => {
     await ready;
     if (message.type === 'badcat:status') return { ok: true, session: await getSession() };
@@ -264,6 +359,44 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return true;
 });
 
+// The exact top-level frame of the bound tab, on a page the session may legitimately use.
+// Mid-rollover, the plain new-chat route is a valid page (the content script verifies the project).
+const rolloverPage = (session, url) => Boolean(session.rollover) && isNewChatUrl(url);
+
+async function boundSender(sender, allowNewChat) {
+  const session = await getSession();
+  if (!session.active || port === null || sender.frameId !== 0 || !sender.tab || sender.tab.id !== session.tabId) return null;
+  const url = sender.url;
+  if (isConversationUrl(url) || (allowNewChat && rolloverPage(session, url))) return session;
+  return null;
+}
+
+// The content script is about to press Enter / click send: persist "this event may now be submitted" first, so
+// that a broken messaging channel afterwards can never lead to an automatic resubmission.
+async function attempt(message, sender) {
+  const session = await boundSender(sender, true);
+  if (session === null || port === null || message.session !== port.sessionId) return { ok: false };
+  if (inFlight === null || inFlight.connection !== port) return { ok: false };
+  return { ok: await rememberUncertain(inFlight.key, inFlight.connection) };
+}
+
+// A freshly loaded content script (e.g. after a full-page rollover navigation) asks for its session id.
+async function hello(sender) {
+  const session = await boundSender(sender, true);
+  return session === null ? { ok: false } : { ok: true, session: port.sessionId };
+}
+
+// The content script saw the conversation-limit alert and is about to click "new chat". Record it
+// first so the resulting navigation to the new-chat route is not mistaken for leaving the conversation.
+async function rollover(message, sender) {
+  const session = await boundSender(sender, false);
+  if (session === null || port === null || message.session !== port.sessionId) return { ok: false };
+  // Only while a +1 is being handed off, and only one rollover at a time (until its new conversation exists).
+  if (pendingEvents === 0 || session.rollover) return { ok: false };
+  await setSession({ ...session, rollover: { project: projectOf(sender.url) } });
+  return { ok: true };
+}
+
 chrome.tabs.onRemoved.addListener(async (tabId) => {
   await ready;
   const session = await getSession();
@@ -276,7 +409,17 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
   if (!changeInfo.url) return;
   await ready;
   const session = await getSession();
-  if (session.active && session.tabId === tabId && !isConversationUrl(changeInfo.url)) {
-    await deactivate('The tab is no longer a ChatGPT conversation.');
+  if (!session.active || session.tabId !== tabId) return;
+  if (isConversationUrl(changeInfo.url)) {
+    if (!session.rollover) return;
+    const { rollover: { project }, ...rest } = session; // rollover finished: the new conversation exists
+    if (project && projectOf(changeInfo.url) !== project) {
+      await deactivate('The new conversation is not in the original project.');
+      return;
+    }
+    await setSession(rest);
+    return;
   }
+  if (rolloverPage(session, changeInfo.url)) return;
+  await deactivate('The tab is no longer a ChatGPT conversation.');
 });
