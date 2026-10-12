@@ -238,8 +238,8 @@ test('new chat after rollover: unrelated or other-PR drafts are kept and nothing
   }
 });
 
-const SLUG = 'g-p-6a1b2c-code-review';
-const MENU = [{ text: 'Other', value: 'g-p-999-other' }, { text: 'Code Review', value: 'g-p-6a1b2c' }];
+const SLUG = 'g-p-6acc5689a7f48191b27144cee2289958-code-review';
+const MENU = [{ text: 'Other', value: 'g-p-999-other' }, { text: 'Code Review', value: 'g-p-6acc5689a7f48191b27144cee2289958' }];
 const projectOpts = (extra = {}) => ({ url: 'https://chatgpt.com/', selector: 'Code Review', menu: MENU, ...extra });
 
 test('project rollover: the selected project is verified by ID, then the restored command is sent exactly once', async () => {
@@ -266,6 +266,7 @@ test('project rollover: a same-named project with another ID, a duplicate name, 
     'name not in the menu': projectOpts({ selector: 'Code Review Archive' }),
     'plain chat (no selector)': { url: 'https://chatgpt.com/' },
     'empty menu': projectOpts({ menu: [] }),
+    'archive prefix is no match': projectOpts({ selector: 'Archive Code Review', menu: [{ text: 'Code Review', value: 'g-p-6acc5689a7f48191b27144cee2289958' }] }),
     'no selected name': projectOpts({ selector: '' }),
   };
   for (const [name, opts] of Object.entries(cases)) {

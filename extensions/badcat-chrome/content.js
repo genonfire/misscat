@@ -17,7 +17,7 @@
   const NEW_CHAT_SETTLE_MS = 800; // ChatGPT restores the unsent draft shortly after the composer appears
   // The new chat's project selector (semantic attribute only) and the menu items it lists.
   const PROJECT_BUTTON = '[data-composer-navigation-target="workspace-project"]';
-  const MENUS = '[role="menu"], [role="listbox"]';
+  const MENUS = '[role="dialog"]'; // the project picker opens as a dialog of div[data-value] entries
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
   async function waitFor(check, timeoutMs) {
@@ -30,10 +30,15 @@
     }
   }
 
+  // What the selector currently shows: its aria-label ("<localized prefix>: <project name>"), else its text.
   const projectLabel = () => {
     const button = document.querySelector(PROJECT_BUTTON);
-    return button ? (button.textContent || '').trim() : '';
+    return button ? (button.getAttribute('aria-label') || button.textContent || '').trim() : '';
   };
+
+  // True when `label` is exactly the entry's name or ends with it right after a colon (the localized prefix
+  // is never hardcoded; a longer name such as "Archive Code Review" does not match "Code Review").
+  const labelNames = (label, name) => name !== '' && (label === name || new RegExp(':\\s*' + name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$').test(label));
 
   const menuItems = () => {
     const items = [];
@@ -46,15 +51,15 @@
   // name is missing, listed twice, or maps to another ID. The menu is opened, read and closed again.
   async function verifyProject(slug) {
     const button = document.querySelector(PROJECT_BUTTON);
-    const name = projectLabel();
-    if (!button || !name) return null;
+    const label = projectLabel();
+    if (!button || !label) return null;
     button.click();
     const items = await waitFor(() => { const found = menuItems(); return found.length ? found : null; }, 2000);
     let verified = null;
     if (items) {
-      const same = items.filter((item) => (item.textContent || '').trim() === name);
+      const same = items.filter((item) => labelNames(label, (item.textContent || '').trim()));
       const id = same.length === 1 ? same[0].getAttribute('data-value') : null;
-      if (id && (id === slug || slug.startsWith(id + '-'))) verified = name;
+      if (id && (id === slug || slug.startsWith(id + '-'))) verified = label;
     }
     if (button.getAttribute('aria-expanded') === 'true') button.click();
     await waitFor(() => menuItems().length === 0, 1000);

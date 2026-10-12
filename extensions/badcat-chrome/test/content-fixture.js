@@ -87,7 +87,7 @@ function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubm
   let projectMenu = null;
   const selectorButton = selector === null ? null : node('button', { type: 'button', 'data-composer-navigation-target': 'workspace-project', 'aria-expanded': 'false' });
   if (selectorButton) {
-    selectorButton.textContent = selector;
+    selectorButton.attrs['aria-label'] = selector === '' ? '' : '프로젝트 변경: ' + selector; // the real button carries its name only in the label
     selectorButton.clicks = 0;
     selectorButton.click = () => {
       selectorButton.clicks += 1;
@@ -97,7 +97,7 @@ function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubm
         selectorButton.attrs['aria-expanded'] = 'false';
       } else {
         const items = menu.map((m) => { const i = node('div', { 'data-value': m.value }); i.textContent = m.text; return i; });
-        projectMenu = node('div', { role: 'menu' }, items);
+        projectMenu = node('div', { role: 'dialog' }, items);
         projectMenu.parentElement = page;
         page.children.push(projectMenu);
         selectorButton.attrs['aria-expanded'] = 'true';
@@ -115,7 +115,7 @@ function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubm
       assert.equal(cmd, 'insertText');
       editor.textContent = editor.collapsed ? editor.textContent + value : value; // collapsed to the end = append
       log.fills.push(value);
-      if (renameOnFill !== null && selectorButton) selectorButton.textContent = renameOnFill;
+      if (renameOnFill !== null && selectorButton) selectorButton.attrs['aria-label'] = '프로젝트 변경: ' + renameOnFill;
       return true;
     },
   };
