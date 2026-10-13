@@ -8,7 +8,8 @@
   const NAME_RE = /^[A-Za-z0-9_.-]+$/;
   const HEAD_RE = /^[0-9a-f]{40}$/;
   // A ChatGPT conversation: /c/<id>, also under a project or GPT prefix (/g/<slug>/c/<id>).
-  const CONVERSATION_PATH_RE = /\/c\/[A-Za-z0-9-]+\/?$/;
+  // ChatGPT briefly uses a temporary id with other characters (e.g. WEB:<uuid>) before the real one appears.
+  const CONVERSATION_PATH_RE = /\/c\/[A-Za-z0-9:_-]+\/?$/;
 
   // "owner/repo" or null. Mirrors badcat-host's validation; the host validates again.
   function normalizeRepo(value) {
@@ -69,6 +70,17 @@
     }
   }
 
+  const BARE_PROJECT_RE = /^g-p-[0-9a-f]{32}$/;
+  // Whether a conversation URL belongs to the expected project. ChatGPT may show the project as the bare ID
+  // (g-p-<32 hex>) or as <id>-<name-slug>; they match when equal or when the bare ID leads the slugged one.
+  function inProject(url, expected) {
+    const actual = projectOf(url);
+    if (actual === null || !expected) return false;
+    if (actual === expected) return true;
+    const [bare, slugged] = actual.length < expected.length ? [actual, expected] : [expected, actual];
+    return BARE_PROJECT_RE.test(bare) && slugged.startsWith(bare + '-');
+  }
+
   // The only host message that triggers a handoff: a "+1" for the watched repo.
   // Returns the validated event contract for forwarding and re-validation by content.js.
   // Normalization preserves status and IDs; errors, +2, malformed/other-repo events return null.
@@ -111,6 +123,7 @@
     isNewChatUrl: isNewChatUrl,
     urlShape: urlShape,
     projectOf: projectOf,
+    inProject: inProject,
     parseEvent: parseEvent,
     eventKey: eventKey,
     reviewMessage: reviewMessage,
