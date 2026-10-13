@@ -290,4 +290,19 @@ HEAD: <40-hex sha of the PR's current HEAD>
 <review evidence>
 ```
 
-The first line is `+1`, `+2` or `-1`. A later valid `-1` blocks; a new `+1` starts a fresh sequence. Before merging, BadCat re-reads GitHub and requires passing CI (including at least one succeeded GitHub Actions check) and a clean mergeable state, and merges only if the HEAD is unchanged. Use branch protection for required checks, and disable other auto-mergers. Run one BadCat process per repository.
+## What MissCat does
+
+- Watches all open PRs in a repository
+- Discovers PRs created after MissCat starts
+- Detects changes by PR HEAD SHA
+- Reviews every new PR HEAD once per profile
+- Avoids duplicate reviews
+- Remembers reviewed commits across restarts
+- Uses an isolated persistent review workspace
+- Supports multiple reviewer backends
+
+MissCat does **not** modify code, push commits, or merge PRs.
+
+It watches. It catches. It reviews.
+
+(BadCat is the separate, opt-in merge operator described above.)
