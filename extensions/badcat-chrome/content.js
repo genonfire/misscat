@@ -305,7 +305,7 @@
       // command appearing as a new user message (in a conversation of the expected project) confirms the send.
       const landed = () => countUserMessages(text) > before && (location.href === startUrl ||
         (isConversationUrl(location.href) && (!expectedProject || projectOf(location.href) === expectedProject)));
-      return (await waitFor(landed, 5000)) ? 'sent' : 'uncertain';
+      return (await waitFor(landed, 10000)) ? 'sent' : 'uncertain';
     };
     let outcome = await submit(button ? () => button.click() : () => pressEnter(composer));
     // The button was accepted but nothing happened: Enter as the fallback, never after the page moved on.

@@ -490,6 +490,8 @@ test('a slow confirmation (within the wait) is accepted once; one that arrives t
   const dest = 'https://chatgpt.com/g/' + SLUG + '/c/new-id';
   let t = await activated(projectOpts({ afterSubmit: { url: dest, render: true, delayMs: 2500 } }));
   assert.equal((await t.send(handoffMsg({ project: SLUG }))).ok, true);
+  t = await activated(projectOpts({ afterSubmit: { url: dest, render: true, delayMs: 8000 } })); // beyond the old 5 s, within 10 s
+  assert.equal((await t.send(handoffMsg({ project: SLUG }))).ok, true);
   assert.deepEqual(t.log.submitted, [TEXT]);
   t = await activated(projectOpts({ afterSubmit: { url: dest, render: true, delayMs: 60000 } }));
   const res = await t.send(handoffMsg({ project: SLUG }));
