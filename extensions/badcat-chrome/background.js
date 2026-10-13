@@ -67,7 +67,9 @@ async function start(repoInput, tabId) {
   } catch (e) {
     return { ok: false, error: 'Open a ChatGPT conversation tab first.' };
   }
-  if (!isConversationUrl(tab.url)) {
+  // A new chat is accepted too, for the ON test only: it may hold a restored, still unsent MissCat command.
+  const newChat = isNewChatUrl(tab.url);
+  if (!isConversationUrl(tab.url) && !newChat) {
     return { ok: false, error: 'Open a ChatGPT conversation tab first.' };
   }
   const ping = async () => {
@@ -100,7 +102,10 @@ async function start(repoInput, tabId) {
   connection.onMessage.addListener((message) => onHostMessage(connection, message));
   connection.onDisconnect.addListener(() => onHostDisconnect(connection));
   // Watching ON arms exactly one explicit rollover/submit test; it needs no +1 event (see explicitProbe).
-  await setSession({ active: true, repo: repo, tabId: tabId, error: null, explicit: 'armed' });
+  const fresh = { active: true, repo: repo, tabId: tabId, error: null };
+  // In a conversation the test is armed for a limit alert; in a new chat it is already past the rollover.
+  await setSession(newChat ? { ...fresh, explicit: 'running', rollover: { project: '', explicit: true } }
+    : { ...fresh, explicit: 'armed' });
   if (connection !== port) return { ok: false, error: 'badcat-host disconnected.' };
   try {
     const activated = await chrome.tabs.sendMessage(tabId, { type: 'badcat:activate', session: connection.sessionId });

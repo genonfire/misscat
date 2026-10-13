@@ -385,6 +385,12 @@
   async function startExplicit(session) {
     if (explicitRunning) return;
     explicitRunning = true;
+    if (isNewChatUrl(location.href)) {
+      // Started on a new chat that may already hold the restored, unsent command. Its original conversation (and
+      // project ID) is unknown, so at least a selected project must be visible.
+      if (projectLabel() === '') return reportExplicit(session, { ok: false, message: 'restore: no project is selected in this new chat; nothing sent' });
+      return continueExplicit(session, '');
+    }
     if (!isConversationUrl(location.href)) return reportExplicit(session, { none: true });
     const button = findLimitButton();
     if (!button || button.disabled) return reportExplicit(session, { none: true });

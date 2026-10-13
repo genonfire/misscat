@@ -871,3 +871,37 @@ test('if the paste inserts nothing either, nothing is sent and the failure is re
   assert.match(res.error, /could not fill the composer/);
   assert.deepEqual(t.log.submitted, []);
 });
+
+// --- ON pressed on a new chat that already holds the restored, unsent command ---
+const newChatBoot = (options = {}) => boot({ url: NEW_CHAT, buttonSubmits: true, enterSubmits: false, initial: RESTORED,
+  selector: 'Code Review', menu: [{ value: 'g-p-1-proj', text: 'Code Review' }], ...options });
+
+test('ON on a new chat submits the restored command with the real send button', async () => {
+  const t = newChatBoot();
+  await t.send({ type: 'badcat:activate', session: SESSION });
+  await probe(t);
+  const result = await explicitDone(t);
+  assert.equal(result.ok, true, result.message);
+  assert.deepEqual(t.log.submitted, [RESTORED]);
+  assert.equal(t.log.clicks, 1);
+  assert.deepEqual(t.log.keys, []);
+  assert.deepEqual(t.log.fills, []);
+  assert.equal(announced(t).length, 0); // no limit alert is involved
+});
+
+for (const [name, options, expected] of [
+  ['a different draft', { initial: 'something I typed' }, /something other than one MissCat command/],
+  ['an empty composer', { initial: '' }, /restored no command/],
+  ['no project selected', { selector: null }, /no project is selected/],
+]) {
+  test('ON on a new chat with ' + name + ' sends nothing', async () => {
+    const t = newChatBoot(options);
+    await t.send({ type: 'badcat:activate', session: SESSION });
+    await probe(t);
+    const result = await explicitDone(t);
+    assert.equal(result.ok, false);
+    assert.match(result.message, expected);
+    assert.deepEqual(t.log.submitted, []);
+    assert.deepEqual(t.log.fills, []);
+  });
+}
