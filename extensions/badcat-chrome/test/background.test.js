@@ -776,3 +776,20 @@ test('ON still asks for a reload when injection fails', async () => {
   assert.match(res.error, /Reload the ChatGPT tab/);
   assert.equal(t.natives.length, 0);
 });
+
+test('after the ON test ends (failure or success) its temporary rollover exception is gone: the project boundary stays', async () => {
+  for (const result of [{ ok: false, message: 'restore: nothing' }, { ok: true, message: 'done' }]) {
+    const t = await started({ tabUrl: PROJECT_URL });
+    await t.fromContent({ type: 'badcat:rollover', session: sid(t), explicit: true });
+    await t.navigate('https://chatgpt.com/');
+    await t.fromContent({ type: 'badcat:explicit-result', session: sid(t), ...result });
+    assert.equal(t.session().rollover.explicit, undefined);
+    assert.equal(t.session().rollover.project, 'g-p-1-proj'); // an ordinary rollover: same project checks as for a +1
+    assert.equal((await t.fromContent({ type: 'badcat:attempt', session: sid(t), explicit: true })).ok, false);
+    assert.equal((await t.fromContent({ type: 'badcat:hello' })).explicit, undefined);
+    // a +1 now goes to the tab carrying the project, so the content script verifies it; never a bare send
+    t.natives[0].emit(plus1(9, HEAD1));
+    await t.settle();
+    assert.equal(t.sent[0].message.project, 'g-p-1-proj');
+  }
+});

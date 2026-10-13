@@ -428,6 +428,9 @@ async function explicitResult(message, sender) {
   const session = await boundSender(sender, true);
   if (session === null || port === null || message.session !== port.sessionId) return { ok: false };
   const { explicit, ...rest } = session;
+  // The test's own exception ends with its result (success, failure or no alert): what remains of a started
+  // rollover is the ordinary one a +1 would have made, with the same project checks.
+  if (rest.rollover && rest.rollover.explicit) rest.rollover = { project: rest.rollover.project };
   if (message.none === true) {
     if (explicit === 'armed') await setSession(rest);
     return { ok: true };

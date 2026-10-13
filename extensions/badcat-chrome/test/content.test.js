@@ -982,3 +982,53 @@ test('ON test raises Medium to High and says so in the result', async () => {
   assert.equal(t.effortLevel(), 'High');
   assert.deepEqual(t.log.submitted, [RESTORED]);
 });
+
+// --- the ON test runs once per ON (session), not once per tab ---
+const resultCount = (t) => results(t).length;
+const waitResults = async (t, n) => { for (let i = 0; i < 300 && resultCount(t) < n; i += 1) await t.settle(); };
+
+test('ON test: no alert, then Stop/Start with an alert shown later in the same tab, runs the test', async () => {
+  const t = boot({ url: 'https://chatgpt.com/g/g-p-1-proj/c/old', buttonSubmits: true, enterSubmits: false,
+    selector: 'Code Review', menu: [{ value: 'g-p-1-proj', text: 'Code Review' }] });
+  await t.send({ type: 'badcat:activate', session: 's1' });
+  await t.send({ type: 'badcat:explicit', session: 's1' });
+  await waitResults(t, 1);
+  assert.equal(results(t)[0].none, true);
+  await t.send({ type: 'badcat:cancel', session: 's1' }); // Stop
+  const alert = t.limitAlert(LIMIT, ['새 채팅에서 계속하기']);
+  alert.buttons[0].click = () => { alert.buttons[0].clicks += 1; t.setUrl(NEW_CHAT); t.editor.textContent = RESTORED; };
+  await t.send({ type: 'badcat:activate', session: 's2' }); // Start again
+  await t.send({ type: 'badcat:explicit', session: 's2' });
+  await waitResults(t, 2);
+  assert.equal(results(t)[1].ok, true, results(t)[1].message);
+  assert.deepEqual(clicks(alert), [1]);
+  assert.deepEqual(t.log.submitted, [RESTORED]);
+});
+
+test('ON test: a failed test, then Stop/Start in the same tab, tries again', async () => {
+  const { t, alert } = await limited({}, { draft: '' }); // nothing restored: the first test fails at "restore"
+  await probe(t);
+  await waitResults(t, 1);
+  assert.equal(results(t)[0].ok, false);
+  t.setUrl('https://chatgpt.com/g/g-p-1-proj/c/old'); // back in the limited conversation
+  t.editor.textContent = '';
+  alert.buttons[0].click = () => { alert.buttons[0].clicks += 1; t.setUrl(NEW_CHAT); t.editor.textContent = RESTORED; };
+  await t.send({ type: 'badcat:cancel', session: SESSION });
+  await t.send({ type: 'badcat:activate', session: 's2' });
+  await t.send({ type: 'badcat:explicit', session: 's2' });
+  await waitResults(t, 2);
+  assert.equal(results(t)[1].ok, true, results(t)[1].message);
+  assert.deepEqual(clicks(alert), [2]); // the same button, clicked once per test
+  assert.deepEqual(t.log.submitted, [RESTORED]);
+});
+
+test('ON test: a duplicate probe of the same session runs once', async () => {
+  const { t, alert } = await limited();
+  await probe(t);
+  await probe(t);
+  await waitResults(t, 1);
+  for (let i = 0; i < 20; i += 1) await t.settle();
+  assert.equal(resultCount(t), 1);
+  assert.deepEqual(clicks(alert), [1]);
+  assert.equal(t.log.submitted.length, 1);
+});

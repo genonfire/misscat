@@ -428,7 +428,7 @@
 
   // --- Watching ON test: one explicit rollover and submit, authorized by the user's click, without a +1. ---
   const RESTORED_RE = /^현재 작업 끝났으면 PR #([1-9][0-9]*) 리뷰해\.$/; // the exact MissCat command, nothing else
-  let explicitRunning = false;
+  let explicitSession = null; // the session id the ON test was started for: once per ON (session), never per tab
   const reportExplicit = (session, result) =>
     chrome.runtime.sendMessage({ type: 'badcat:explicit-result', session: session, ...result }).catch(() => {});
 
@@ -457,8 +457,8 @@
 
   // Stage 1: the limit alert of the current conversation, clicked at most once.
   async function startExplicit(session) {
-    if (explicitRunning) return;
-    explicitRunning = true;
+    if (explicitSession === session) return; // a duplicate probe of the same session
+    explicitSession = session;
     if (!isConversationUrl(location.href)) return reportExplicit(session, { none: true });
     const button = findLimitButton();
     if (!button || button.disabled) return reportExplicit(session, { none: true });
@@ -493,6 +493,7 @@
     }
     if (message.type === 'badcat:cancel') {
       if (activeSession === message.session) activeSession = null;
+      if (explicitSession === message.session) explicitSession = null;
       sendResponse({ ok: true });
       return false;
     }
@@ -517,8 +518,8 @@
       if (answer && answer.ok === true && typeof answer.session === 'string' && activeSession === null) {
         activeSession = answer.session;
         // The page was reloaded by the ON test's own rollover: carry on with the submit step.
-        if (answer.explicit && typeof answer.explicit.project === 'string' && !explicitRunning) {
-          explicitRunning = true;
+        if (answer.explicit && typeof answer.explicit.project === 'string' && explicitSession !== answer.session) {
+          explicitSession = answer.session;
           continueExplicit(answer.session, answer.explicit.project);
         }
       }
