@@ -88,6 +88,9 @@
     return '현재 작업 끝났으면 PR #' + pr + ' 리뷰해.';
   }
 
+  // True for the exact text reviewMessage() generates, for any PR (a leftover of an earlier handoff).
+  const isReviewMessage = (value) => /^현재 작업 끝났으면 PR #[1-9]\d* 리뷰해\.$/.test(value);
+
   const api = {
     HOST_NAME: HOST_NAME,
     normalizeRepo: normalizeRepo,
@@ -97,6 +100,7 @@
     parseEvent: parseEvent,
     eventKey: eventKey,
     reviewMessage: reviewMessage,
+    isReviewMessage: isReviewMessage,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.BadCatShared = api;

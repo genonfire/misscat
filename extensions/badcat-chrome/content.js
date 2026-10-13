@@ -3,7 +3,7 @@
 // submitted (e.g. ChatGPT still answering) is left in the composer; the next handoff is appended to it.
 (function () {
   'use strict';
-  const { isConversationUrl, isNewChatUrl, projectOf, reviewMessage, parseEvent, eventKey } = self.BadCatShared;
+  const { isConversationUrl, isNewChatUrl, projectOf, reviewMessage, isReviewMessage, parseEvent, eventKey } = self.BadCatShared;
 
   // ChatGPT's composer is a ProseMirror contenteditable. Match on semantic attributes only (no class
   // names or localized aria-labels); the send button is the submit button in the composer's own form (it sits outside [data-composer-input]).
@@ -198,7 +198,10 @@
     let existing = readComposer(composer);
     // A restored draft in a new chat is only ever this very command (whitespace aside); anything else
     // belongs to the user and is left untouched.
-    const ownDraft = (value) => value === '' || normalize(value) === text;
+    // A leftover command for another PR (an earlier handoff that was filled but never sent) is also ours: it
+    // would otherwise block every later handoff in this new chat. It is replaced; its event is not marked
+    // delivered, so the host retries it.
+    const ownDraft = (value) => value === '' || normalize(value) === text || isReviewMessage(normalize(value));
     if (!conversation && !ownDraft(existing)) {
       return { ok: false, error: 'the composer holds an unrelated draft' };
     }
@@ -231,8 +234,9 @@
     }
     if (moved()) return changed;
     if (!containsCommand(normalize(existing), text)) {
-      const full = existing ? existing + ' ' + text : text;
-      appendToComposer(composer, existing, text);
+      const base = !conversation && isReviewMessage(normalize(existing)) ? '' : existing; // '' replaces a stale command
+      const full = base ? base + ' ' + text : text;
+      appendToComposer(composer, base, text);
       // ProseMirror applies the insertion asynchronously and may re-wrap it: wait for the composer to settle
       // on what was typed. Text that never shows up and text that shows up with something else are different.
       await waitFor(() => normalize(readComposer(composer)) === normalize(full), 1500);

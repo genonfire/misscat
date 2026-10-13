@@ -274,8 +274,14 @@ test('new chat after rollover: an empty composer is filled and submitted', async
   assert.deepEqual(t.log.submitted, [TEXT]);
 });
 
-test('new chat after rollover: unrelated or other-PR drafts are kept and nothing is sent', async () => {
-  for (const initial of ['내 메모', '현재 작업 끝났으면 PR #586 리뷰해.']) {
+test('new chat after rollover: a leftover command for another PR is replaced and sent', async () => {
+  const t = await activated({ url: 'https://chatgpt.com/', initial: '현재 작업 끝났으면 PR #586 리뷰해.' });
+  assert.equal((await t.send(handoffMsg())).ok, true);
+  assert.deepEqual(t.log.submitted, [TEXT]);
+});
+
+test('new chat after rollover: unrelated drafts are kept and nothing is sent', async () => {
+  for (const initial of ['내 메모']) {
     const t = await activated({ url: 'https://chatgpt.com/', initial });
     const res = await t.send(handoffMsg());
     assert.equal(res.ok, false);
@@ -571,7 +577,7 @@ test('#64: the exact command as an unsent draft (even re-wrapped) is reused, not
 });
 
 test('#64: user drafts, other PR commands, partial or doubled text are never overwritten or sent', async () => {
-  const drafts = ['내 메모', '현재 작업 끝났으면 PR #124 리뷰해.', '현재 작업 끝났으면 PR #123', TEXT + ' ' + TEXT, TEXT + ' 그리고'];
+  const drafts = ['내 메모', '현재 작업 끝났으면 PR #123', TEXT + ' ' + TEXT, TEXT + ' 그리고'];
   for (const initial of drafts) {
     const t = await activated({ ...projectOpts({ initial }), buttonSubmits: true });
     const res = await t.send(handoffMsg({ project: SLUG }));
