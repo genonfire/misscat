@@ -2,7 +2,7 @@
 // The popup only asks it to start/stop; closing the popup changes nothing here.
 importScripts('shared.js');
 
-const { HOST_NAME, normalizeRepo, isConversationUrl, isNewChatUrl, projectOf, parseEvent, eventKey } = self.BadCatShared;
+const { HOST_NAME, normalizeRepo, isConversationUrl, isNewChatUrl, urlShape, projectOf, parseEvent, eventKey } = self.BadCatShared;
 
 const SESSION_KEY = 'badcat.session'; // {active, repo, tabId, error, rollover?: {project}, explicit?: 'armed'|'running'|'used', test?: {ok, message}}
 const DELIVERED_KEY = 'badcat.delivered.v2';
@@ -17,13 +17,36 @@ const EXPLICIT_WAIT_MS = 1000; // a +1 never overlaps a running ON test: it wait
 const MAX_EXPLICIT_WAITS = 90;
 const PENDING_KEY = 'badcat.pending.v1'; // {eventKey: {repo, pr}}: handoffs that were started but never confirmed delivered
 const MAX_PENDING = 50;
+const DEBUG_KEY = 'badcat.debuglog.v1'; // ring buffer of what the worker saw; URL shapes only, never ids or queries
+const MAX_DEBUG = 300;
 
 let storageQueue = Promise.resolve();
+let debugQueue = Promise.resolve();
 let controlQueue = Promise.resolve();
 let port = null; // the live badcat-host connection, if any
 let queue = Promise.resolve(); // events of the live connection are handled one at a time; reset per connection
 
 const INACTIVE = { active: false, repo: null, tabId: null, error: null };
+
+// Best-effort diagnostics for "why did it stop?": a failure to log must never change behavior.
+function debugLog(event, fields) {
+  const entry = { at: new Date().toISOString(), event: event, ...fields };
+  debugQueue = debugQueue.then(async () => {
+    const stored = await chrome.storage.local.get(DEBUG_KEY);
+    const list = Array.isArray(stored[DEBUG_KEY]) ? stored[DEBUG_KEY] : [];
+    list.push(entry);
+    await chrome.storage.local.set({ [DEBUG_KEY]: list.slice(-MAX_DEBUG) });
+  }).catch(() => {});
+  return debugQueue;
+}
+
+async function tabShapeNow(tabId) {
+  try {
+    return urlShape((await chrome.tabs.get(tabId)).url);
+  } catch (e) {
+    return '(tab gone)';
+  }
+}
 
 async function getSession() {
   const stored = await chrome.storage.session.get(SESSION_KEY);
@@ -39,6 +62,7 @@ function setSession(session) {
 const ready = (async () => {
   const session = await getSession();
   if (session.active && port === null) {
+    debugLog('worker-restart-interrupted', { tabId: session.tabId });
     await setSession({ ...INACTIVE, error: 'Monitoring was interrupted. Start again.' });
   }
 })();
@@ -46,6 +70,7 @@ const ready = (async () => {
 async function deactivate(error) {
   const current = port;
   port = null; // invalidate before the first asynchronous operation
+  debugLog('deactivate', { error: error || null, hadConnection: current !== null });
   const session = await getSession();
   if (current && session.tabId !== null) {
     chrome.tabs.sendMessage(session.tabId, { type: 'badcat:cancel', session: current.sessionId }).catch(() => {});
@@ -60,6 +85,7 @@ async function deactivate(error) {
 
 async function start(repoInput, tabId) {
   const session = await getSession();
+  debugLog('start', { tabId: tabId });
   if (session.active) return { ok: false, error: 'Already watching.' };
   const repo = normalizeRepo(repoInput);
   if (repo === null) return { ok: false, error: 'Enter the repository as owner/repo.' };
@@ -126,6 +152,7 @@ async function stop(tabId) {
   if (session.active && session.tabId !== tabId) {
     return { ok: false, error: 'Watching in another tab.' };
   }
+  debugLog('stop-requested', { tabId: tabId });
   await deactivate(null);
   return { ok: true };
 }
@@ -134,6 +161,7 @@ function onHostDisconnect(connection) {
   if (connection !== port) return; // a connection we already closed
   const reason = chrome.runtime.lastError && chrome.runtime.lastError.message;
   console.warn('badcat-host disconnected', reason || '');
+  debugLog('host-disconnect', { hasReason: Boolean(reason) });
   deactivate(reason ? 'badcat-host: ' + reason.slice(0, 200) : 'badcat-host disconnected.');
 }
 
@@ -146,6 +174,7 @@ function onHostMessage(connection, message) {
   if (message && typeof message === 'object' && typeof message.error === 'string') {
     // The host rejected the request or stopped monitoring: nothing more will arrive.
     console.warn('badcat-host error:', message.error);
+    debugLog('host-error', {});
     deactivate('badcat-host: ' + message.error.slice(0, 200)); // not queued: retries may be sleeping
     return;
   }
@@ -374,6 +403,7 @@ async function deliverEvent(connection, message) {
     if (connection !== port) return;
     // Mid-rollover the tab legitimately sits on the new-chat route until the first message is sent.
     const newChat = rolloverPage(current, tab.url);
+    debugLog('delivery-check', { attempt: attemptNo, tab: urlShape(tab.url), rollover: Boolean(current.rollover), newChat: newChat, explicit: current.explicit || null });
     // Before the onUpdated handler has run, a conversation of another project must still not get a message.
     if (current.rollover && current.rollover.project && isConversationUrl(tab.url) &&
         projectOf(tab.url) !== current.rollover.project) {
@@ -381,7 +411,7 @@ async function deliverEvent(connection, message) {
       return;
     }
     if (!isConversationUrl(tab.url) && !newChat) {
-      await deactivate('The tab is no longer a ChatGPT conversation.');
+      await deactivate('The tab is no longer a ChatGPT conversation. [delivery: ' + urlShape(tab.url) + ']');
       return;
     }
 
@@ -403,6 +433,7 @@ async function deliverEvent(connection, message) {
       const request = { type: 'badcat:handoff', pr: event.pr, event: event, session: connection.sessionId };
       if (current.rollover && current.rollover.project) request.project = current.rollover.project;
       const result = await chrome.tabs.sendMessage(current.tabId, request);
+      debugLog('handoff-result', { attempt: attemptNo, ok: Boolean(result && result.ok), ambiguous: Boolean(result && result.ambiguous), rollover: Boolean(result && result.rollover), draft: Boolean(result && result.draft), error: result && typeof result.error === 'string' ? result.error.slice(0, 120) : null });
       if (result && result.ok === true) {
         // Save even if Stop raced with the response: the submission really happened.
         // ACK is still restricted to the original live connection.
@@ -442,6 +473,7 @@ async function deliverEvent(connection, message) {
       }
     } catch (e) {
       console.error('handoff not delivered:', e && e.message);
+      debugLog('handoff-exception', { attempt: attemptNo, message: String(e && e.message).slice(0, 120) });
       if (connection !== port) return;
       // The channel broke (e.g. a full page navigation right after the submit): if the content script had
       // already recorded the attempt, the message may be out there. Never resend it automatically.
@@ -479,6 +511,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const run = async () => {
     await ready;
     if (message.type === 'badcat:status') return { ok: true, session: await getSession() };
+    if (message.type === 'badcat:debug-log') {
+      await debugQueue;
+      const stored = await chrome.storage.local.get(DEBUG_KEY);
+      return { ok: true, log: Array.isArray(stored[DEBUG_KEY]) ? stored[DEBUG_KEY] : [] };
+    }
     if (message.type === 'badcat:start') return start(message.repo, message.tabId);
     if (message.type === 'badcat:stop') return stop(message.tabId);
     return { ok: false, error: 'unknown message' };
@@ -574,15 +611,24 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
   await ready;
   const session = await getSession();
   if (session.active && session.tabId === tabId) {
+    debugLog('tab-removed', { tabId: tabId });
     await deactivate('The ChatGPT tab was closed.');
   }
 });
 
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
-  if (!changeInfo.url) return;
+  const interesting = changeInfo.url || changeInfo.status || changeInfo.discarded !== undefined;
+  if (!interesting) return;
   await ready;
   const session = await getSession();
   if (!session.active || session.tabId !== tabId) return;
+  debugLog('tab-updated', {
+    url: changeInfo.url ? urlShape(changeInfo.url) : null,
+    status: changeInfo.status || null,
+    discarded: changeInfo.discarded === undefined ? null : changeInfo.discarded,
+    rollover: Boolean(session.rollover),
+  });
+  if (!changeInfo.url) return;
   if (isConversationUrl(changeInfo.url)) {
     if (!session.rollover) return;
     const { rollover: { project }, ...rest } = session; // rollover finished: the new conversation exists
@@ -594,5 +640,6 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
     return;
   }
   if (rolloverPage(session, changeInfo.url)) return;
-  await deactivate('The tab is no longer a ChatGPT conversation.');
+  debugLog('update-not-conversation', { fromEvent: urlShape(changeInfo.url), tabNow: await tabShapeNow(tabId) });
+  await deactivate('The tab is no longer a ChatGPT conversation. [update: ' + urlShape(changeInfo.url) + ']');
 });

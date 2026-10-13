@@ -32,6 +32,22 @@
       CONVERSATION_PATH_RE.test(parsed.pathname);
   }
 
+  // A diagnostic-only description of a URL for error messages: scheme, host and a path whose long segments are
+  // reduced to their length and whether they look like a plain id. No query, fragment or conversation id.
+  function urlShape(url) {
+    if (typeof url !== 'string' || url === '') return '(empty)';
+    try {
+      const parsed = new URL(url);
+      const path = parsed.pathname.split('/').map(function (seg) {
+        if (seg.length <= 4) return seg;
+        return '<' + seg.length + (/^[A-Za-z0-9-]+$/.test(seg) ? ':id' : ':special') + '>';
+      }).join('/');
+      return parsed.protocol + '//' + parsed.hostname + path;
+    } catch (e) {
+      return '(unparsable)';
+    }
+  }
+
   // The new-chat landing route ChatGPT shows after "새 대화 시작": a valid state only mid-rollover.
   function isNewChatUrl(url) {
     let parsed;
@@ -93,6 +109,7 @@
     normalizeRepo: normalizeRepo,
     isConversationUrl: isConversationUrl,
     isNewChatUrl: isNewChatUrl,
+    urlShape: urlShape,
     projectOf: projectOf,
     parseEvent: parseEvent,
     eventKey: eventKey,
