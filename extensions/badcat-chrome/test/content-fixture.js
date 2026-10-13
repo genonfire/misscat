@@ -134,7 +134,7 @@ function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubm
         page.children.push(projectMenu);
         selectorButton.attrs['aria-expanded'] = 'true';
         if (navigateOnMenuOpen !== null) ctx.url = navigateOnMenuOpen; // the user moves on while the picker is open
-        if (restoreOnMenuOpen !== null) editor.textContent = restoreOnMenuOpen; // ChatGPT restores a draft late
+        if (restoreOnMenuOpen !== null) { editor.textContent = restoreOnMenuOpen; restoreOnMenuOpen = null; } // ChatGPT restores a draft late, once
       }
     };
     form.children.push(selectorButton);

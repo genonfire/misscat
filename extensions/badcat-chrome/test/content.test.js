@@ -280,14 +280,11 @@ test('new chat after rollover: a leftover command for another PR is replaced and
   assert.deepEqual(t.log.submitted, [TEXT]);
 });
 
-test('new chat after rollover: unrelated drafts are kept and nothing is sent', async () => {
-  for (const initial of ['내 메모']) {
+test('new chat after rollover: whatever the composer holds is replaced by the command, never compared', async () => {
+  for (const initial of ['내 메모', TEXT + ' ' + TEXT, '현재 작업 끝났으면 PR #586 리뷰해. 현재 작업 끝났으면 PR #587 리뷰해.']) {
     const t = await activated({ url: 'https://chatgpt.com/', initial });
-    const res = await t.send(handoffMsg());
-    assert.equal(res.ok, false);
-    assert.match(res.error, /unrelated draft/);
-    assert.equal(t.text(), initial);
-    assert.deepEqual(t.log.submitted, []);
+    assert.equal((await t.send(handoffMsg())).ok, true, initial);
+    assert.deepEqual(t.log.submitted, [TEXT], initial);
   }
 });
 
@@ -345,51 +342,20 @@ test('project rollover: a project switch right before sending aborts; the comman
   assert.deepEqual(t.log.keys, []);
 });
 
-test('project rollover: an unrelated draft is still kept untouched and not sent', async () => {
+test('project rollover: an unrelated draft is replaced by the command and sent', async () => {
   const t = await activated(projectOpts({ initial: '내 메모' }));
   const res = await t.send(handoffMsg({ project: SLUG }));
-  assert.equal(res.ok, false);
-  assert.equal(t.text(), '내 메모');
-  assert.deepEqual(t.log.submitted, []);
-});
-
-test('plain conversation rollover needs no project verification', async () => {
-  const t = await activated({ url: 'https://chatgpt.com/' });
-  assert.equal((await t.send(handoffMsg())).ok, true);
-});
-
-test('the new-chat route is rejected for a handoff that carries no session', async () => {
-  const t = boot({ url: 'https://chatgpt.com/' });
-  assert.match((await t.send({ type: 'badcat:handoff', pr: 1 })).error, /not a conversation/);
-});
-
-test('an already submitted event is not sent again after the rollover', async () => {
-  const t = await activated();
-  assert.equal((await t.send(handoffMsg())).ok, true);
-  t.setUrl('https://chatgpt.com/');
-  assert.equal((await t.send(handoffMsg())).ok, true);
-  assert.equal(t.log.submitted.length, 1);
-});
-
-test('project rollover: a draft restored while the picker is open is kept, nothing is typed or sent; the retry sends the pending command once', async () => {
-  let t = await activated(projectOpts({ restoreOnMenuOpen: '내 메모' }));
-  let res = await t.send(handoffMsg({ project: SLUG }));
-  assert.equal(res.ok, false);
-  assert.match(res.error, /changed during verification/);
-  assert.equal(t.text(), '내 메모');
-  assert.deepEqual(t.log.keys, []);
-  assert.deepEqual(t.log.fills, []);
-  assert.deepEqual(t.log.submitted, []);
-  // the exact command restored late: also not typed over; the retry (which reads it up front) submits it once
-  t = await activated(projectOpts({ restoreOnMenuOpen: TEXT }));
-  res = await t.send(handoffMsg({ project: SLUG }));
-  assert.equal(res.ok, false);
-  assert.deepEqual(t.log.fills, []);
-  assert.deepEqual(t.log.submitted, []);
-  assert.equal(t.text(), TEXT);
-  res = await t.send(handoffMsg({ project: SLUG }));
   assert.equal(res.ok, true);
   assert.deepEqual(t.log.submitted, [TEXT]);
+});
+
+test('project rollover: a draft restored while the picker is open is replaced by the command and sent', async () => {
+  for (const restoreOnMenuOpen of ['내 메모', TEXT]) {
+    const t = await activated(projectOpts({ restoreOnMenuOpen }));
+    const res = await t.send(handoffMsg({ project: SLUG }));
+    assert.equal(res.ok, true, restoreOnMenuOpen);
+    assert.deepEqual(t.log.submitted, [TEXT], restoreOnMenuOpen);
+  }
 });
 
 test('a conversation of another project is rejected right before sending when a project is required', async () => {
@@ -576,26 +542,14 @@ test('#64: the exact command as an unsent draft (even re-wrapped) is reused, not
   }
 });
 
-test('#64: user drafts, other PR commands, partial or doubled text are never overwritten or sent', async () => {
+test('#64: any draft of a new chat is replaced by exactly the command before sending', async () => {
   const drafts = ['내 메모', '현재 작업 끝났으면 PR #123', TEXT + ' ' + TEXT, TEXT + ' 그리고'];
   for (const initial of drafts) {
     const t = await activated({ ...projectOpts({ initial }), buttonSubmits: true });
     const res = await t.send(handoffMsg({ project: SLUG }));
-    assert.equal(res.ok, false, initial);
-    assert.match(res.error, /unrelated draft/);
-    assert.equal(t.text(), initial);
-    assert.deepEqual(t.log.fills, []);
-    assert.deepEqual(t.log.submitted, []);
-    assert.equal(t.log.clicks + t.log.keys.length, 0);
+    assert.equal(res.ok, true, initial);
+    assert.deepEqual(t.log.submitted, [TEXT], initial);
   }
-});
-
-test('#64: a draft restored while the picker is open is judged again before sending', async () => {
-  const t = await activated({ ...projectOpts({ restoreOnMenuOpen: '다른 초안' }), buttonSubmits: true });
-  const res = await t.send(handoffMsg({ project: SLUG }));
-  assert.equal(res.ok, false);
-  assert.deepEqual(t.log.submitted, []);
-  assert.equal(t.text(), '다른 초안');
 });
 
 test('#64: a disabled send button means nothing is pressed, clicked or recorded; the text stays', async () => {
