@@ -37,7 +37,7 @@ class ManifestTests(unittest.TestCase):
 
     def test_requests_only_the_needed_permissions(self):
         m = self.manifest
-        self.assertEqual(sorted(m["permissions"]), ["nativeMessaging", "storage"])
+        self.assertEqual(sorted(m["permissions"]), ["nativeMessaging", "scripting", "storage"])
         self.assertEqual(m["host_permissions"], ["https://chatgpt.com/*"])
         self.assertEqual([c["matches"] for c in m["content_scripts"]], [["https://chatgpt.com/*"]])
         self.assertNotIn("optional_permissions", m)

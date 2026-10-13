@@ -4,7 +4,7 @@ importScripts('shared.js');
 
 const { HOST_NAME, normalizeRepo, isConversationUrl, isNewChatUrl, projectOf, parseEvent, eventKey } = self.BadCatShared;
 
-const SESSION_KEY = 'badcat.session'; // {active, repo, tabId, error, rollover?: {project}}
+const SESSION_KEY = 'badcat.session'; // {active, repo, tabId, error, rollover?: {project}, explicit?: 'armed'|'running'|'used', test?: {ok, message}}
 const DELIVERED_KEY = 'badcat.delivered.v2';
 const LEGACY_KEY = 'badcat.delivered';
 const UNCERTAIN_KEY = 'badcat.uncertain.v1'; // handoffs that may have been submitted but could not be confirmed
@@ -13,6 +13,10 @@ const MAX_DELIVERED = 500;
 const RETRY_DELAYS_MS = [0, 5000, 15000]; // e.g. ChatGPT still answering when the +1 arrives
 const ROLLOVER_WAIT_MS = 3000; // a started rollover is progress, not a failed attempt: look again shortly
 const MAX_ROLLOVER_WAITS = 10;
+const EXPLICIT_WAIT_MS = 1000; // a +1 never overlaps a running ON test: it waits for the test's result (bounded)
+const MAX_EXPLICIT_WAITS = 90;
+const PENDING_KEY = 'badcat.pending.v1'; // {eventKey: {repo, pr}}: handoffs that were started but never confirmed delivered
+const MAX_PENDING = 50;
 
 let storageQueue = Promise.resolve();
 let controlQueue = Promise.resolve();
@@ -70,11 +74,21 @@ async function start(repoInput, tabId) {
   if (!isConversationUrl(tab.url)) {
     return { ok: false, error: 'Open a ChatGPT conversation tab first.' };
   }
-  try {
+  const ping = async () => {
     const pong = await chrome.tabs.sendMessage(tabId, { type: 'badcat:ping' });
     if (!pong || pong.ok !== true) throw new Error('no pong');
+  };
+  try {
+    await ping();
   } catch (e) {
-    return { ok: false, error: 'Reload the ChatGPT tab, then try again.' };
+    // No live content script (e.g. the extension was reloaded after the tab opened). Inject it instead of asking
+    // for a page reload: a reload would make a conversation-limit alert disappear.
+    try {
+      await chrome.scripting.executeScript({ target: { tabId: tabId }, files: ['shared.js', 'content.js'] });
+      await ping();
+    } catch (e2) {
+      return { ok: false, error: 'Reload the ChatGPT tab, then try again.' };
+    }
   }
 
   await clearUncertain(); // starting again is the explicit recovery from an unconfirmed send
@@ -89,13 +103,16 @@ async function start(repoInput, tabId) {
   queue = Promise.resolve();
   connection.onMessage.addListener((message) => onHostMessage(connection, message));
   connection.onDisconnect.addListener(() => onHostDisconnect(connection));
-  await setSession({ active: true, repo: repo, tabId: tabId, error: null });
+  // Watching ON arms exactly one explicit rollover/submit test; it needs no +1 event (see explicitProbe).
+  await setSession({ active: true, repo: repo, tabId: tabId, error: null, explicit: 'armed' });
   if (connection !== port) return { ok: false, error: 'badcat-host disconnected.' };
   try {
     const activated = await chrome.tabs.sendMessage(tabId, { type: 'badcat:activate', session: connection.sessionId });
     if (!activated || activated.ok !== true) throw new Error('activation failed');
     if (connection !== port) return { ok: false, error: 'badcat-host disconnected.' };
     connection.postMessage({ type: 'start', repo: repo });
+    // One bounded look for the real limit alert; the content script reports every outcome back.
+    chrome.tabs.sendMessage(tabId, { type: 'badcat:explicit', session: connection.sessionId }).catch(() => disarmExplicit(connection));
   } catch (e) {
     if (connection === port) await deactivate('Cannot start the ChatGPT handoff session.');
     return { ok: false, error: 'Cannot start the ChatGPT handoff session.' };
@@ -132,6 +149,8 @@ function onHostMessage(connection, message) {
     deactivate('badcat-host: ' + message.error.slice(0, 200)); // not queued: retries may be sleeping
     return;
   }
+  const arrived = receivedKey(message);
+  if (arrived !== null) received.set(arrived.key, { repo: arrived.repo, pr: arrived.pr });
   queue = queue.then(() => handleEvent(connection, message)).catch(async (e) => {
     console.error('handoff failed', e);
     await reportError(connection, 'Handoff failed; delivery remains retryable.');
@@ -162,6 +181,61 @@ function rememberUncertain(key, connection) {
   return save.then(() => saved);
 }
 
+// The ON test submits a restored command that no event is attached to. The only event it can be tied to is one whose
+// handoff this extension started for that PR and never confirmed: that exact event becomes "uncertain" (never sent
+// again, never ACKed, cleared only by the user's next Start), with no timeout. Every other event, including a new
+// HEAD or review of the same PR, is independent and goes out at once.
+const validPr = (pr) => Number.isSafeInteger(pr) && pr >= 1;
+
+function updatePending(change) {
+  const save = storageQueue.then(async () => {
+    const stored = await chrome.storage.local.get(PENDING_KEY);
+    const map = { ...(stored[PENDING_KEY] || {}) };
+    change(map);
+    await chrome.storage.local.set({ [PENDING_KEY]: Object.fromEntries(Object.entries(map).slice(-MAX_PENDING)) });
+  });
+  storageQueue = save.catch(() => {});
+  return save;
+}
+
+const markPending = (key, event) => updatePending((map) => { delete map[key]; map[key] = { repo: event.repo, pr: event.pr }; });
+const unmarkPending = (key) => updatePending((map) => { delete map[key]; });
+
+// At the ON test's attempt: events whose handoff verifiably left this very command in a composer (pending), and the
+// events received from the host and still unfinished during the test for the same PR, whose independence cannot be shown (they overlap it in time),
+// are tied to the command. Every other event is independent.
+async function linkTestedEvents(repo, pr, connection) {
+  const pending = [];
+  await updatePending((map) => {
+    for (const [key, value] of Object.entries(map)) {
+      if (value.repo === repo.toLowerCase() && value.pr === pr) { pending.push(key); delete map[key]; }
+    }
+  });
+  for (const key of pending) await rememberUncertain(key, connection);
+  return { pending: pending, held: await linkHeldEvents(repo, pr, connection) };
+}
+
+async function linkHeldEvents(repo, pr, connection) {
+  const held = [];
+  for (const [key, value] of received) {
+    if (value.repo === repo.toLowerCase() && value.pr === pr) {
+      await rememberUncertain(key, connection);
+      held.push(key);
+    }
+  }
+  return held;
+}
+
+// The test definitely submitted nothing: the command is still waiting, so the tied events are retryable again.
+async function unlinkTestedEvents(linked) {
+  for (const key of linked.pending || []) {
+    await forgetUncertain(key);
+    const [repo, rest] = key.split('#');
+    await updatePending((map) => { map[key] = { repo: repo, pr: Number(rest.split('@')[0]) }; });
+  }
+  for (const key of linked.held || []) await forgetUncertain(key);
+}
+
 function clearUncertain() {
   const clear = storageQueue.then(() => chrome.storage.local.remove(UNCERTAIN_KEY));
   storageQueue = clear.catch(() => {});
@@ -181,6 +255,14 @@ async function reportError(connection, error) {
   const session = await getSession();
   if (connection === port && session.active) {
     await setSession({ ...session, error: String(error || 'Handoff failed').slice(0, 200) });
+  }
+}
+
+async function disarmExplicit(connection) {
+  const session = await getSession();
+  if (connection === port && session.active && session.explicit === 'armed') {
+    const { explicit, ...rest } = session;
+    await setSession(rest);
   }
 }
 
@@ -222,6 +304,15 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 // Every handoff belongs to the connection that received the event; once that connection is no longer
 // the live one, the handoff is abandoned, even if repo and tab are unchanged in a newer session.
 let inFlight = null; // {connection, key}: the handoff currently being sent to the tab (one at a time)
+// Events received from the host and not finished yet (queued behind another one, waiting for the ON test, or retrying).
+// Registered on arrival: the connection handles events one at a time, so a queued one has not started yet.
+const received = new Map(); // eventKey -> {repo, pr}
+function receivedKey(message) {
+  if (message === null || typeof message !== 'object' || message.status !== '+1' || typeof message.repo !== 'string' ||
+      !Number.isSafeInteger(message.pr) || typeof message.head !== 'string' || !Number.isSafeInteger(message.review_id)) return null;
+  return { key: eventKey({ repo: message.repo, pr: message.pr, head: message.head, review_id: message.review_id }),
+    repo: message.repo.toLowerCase(), pr: message.pr };
+}
 let pendingEvents = 0; // validated +1 handoffs in progress; a rollover is only ever authorized by one of them
 
 async function handleEvent(connection, message) {
@@ -230,6 +321,8 @@ async function handleEvent(connection, message) {
     await deliverEvent(connection, message);
   } finally {
     pendingEvents -= 1;
+    const done = receivedKey(message);
+    if (done !== null) received.delete(done.key);
   }
 }
 
@@ -243,6 +336,7 @@ async function deliverEvent(connection, message) {
 
   let attemptNo = 0;
   let rolloverWaits = 0;
+  let explicitWaits = 0;
   let pause = 0;
   while (attemptNo < RETRY_DELAYS_MS.length) {
     const delay = pause || RETRY_DELAYS_MS[attemptNo];
@@ -251,6 +345,11 @@ async function deliverEvent(connection, message) {
     if (connection !== port) return;
     const current = await getSession();
     if (connection !== port || !current.active || current.repo !== session.repo || current.tabId !== session.tabId) return;
+    if (current.explicit === 'running' && explicitWaits < MAX_EXPLICIT_WAITS) {
+      explicitWaits += 1; // the ON test owns the tab until it reports; waiting is not a failed attempt
+      pause = EXPLICIT_WAIT_MS;
+      continue;
+    }
     const sent = await delivered();
     if (connection !== port) return;
     if (sent.includes(key) || await legacyDelivered(event)) {
@@ -265,7 +364,6 @@ async function deliverEvent(connection, message) {
       return;
     }
     if (connection !== port) return;
-
     let tab;
     try {
       tab = await chrome.tabs.get(current.tabId);
@@ -287,6 +385,19 @@ async function deliverEvent(connection, message) {
       return;
     }
 
+    // The ON test may have started while the checks above ran: look again right before the tab is asked.
+    const fresh = await getSession();
+    if (connection !== port || !fresh.active) return;
+    if (fresh.explicit === 'running' && explicitWaits < MAX_EXPLICIT_WAITS) {
+      explicitWaits += 1;
+      pause = EXPLICIT_WAIT_MS;
+      continue;
+    }
+    if ((await uncertainKeys()).includes(key)) {
+      await reportError(connection, 'Delivery could not be confirmed; check ChatGPT. Not sent again.');
+      return;
+    }
+    if (connection !== port) return;
     inFlight = { connection: connection, key: key };
     try {
       const request = { type: 'badcat:handoff', pr: event.pr, event: event, session: connection.sessionId };
@@ -304,6 +415,7 @@ async function deliverEvent(connection, message) {
         storageQueue = save.catch(() => {});
         await save;
         await forgetUncertain(key); // it was confirmed after all
+        await unmarkPending(key);
         await clearError(connection);
         acknowledge(connection, event);
         return;
@@ -320,6 +432,8 @@ async function deliverEvent(connection, message) {
       // Definitely not submitted: the attempt marker (if any) is withdrawn and the retry policy applies.
       console.error('handoff not delivered:', result && result.error);
       await forgetUncertain(key);
+      // Only a draft that verifiably holds this command can later be restored and submitted by the ON test.
+      if (result && result.draft === true) await markPending(key, event);
       if (result && result.rollover === true && rolloverWaits < MAX_ROLLOVER_WAITS) {
         // The tab is moving to the new chat: that is not a failed submission, so it keeps its attempts.
         rolloverWaits += 1;
@@ -348,10 +462,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (sender.id !== chrome.runtime.id || !message || typeof message !== 'object') return false;
   // A content script may only rebind itself to, or announce a rollover of, the session's own tab.
   if (sender.tab) {
-    if (message.type !== 'badcat:hello' && message.type !== 'badcat:rollover' && message.type !== 'badcat:attempt') return false;
+    const types = ['badcat:hello', 'badcat:rollover', 'badcat:attempt', 'badcat:explicit-result'];
+    if (!types.includes(message.type)) return false;
     const handle = async () => {
       await ready;
       if (message.type === 'badcat:hello') return hello(sender);
+      if (message.type === 'badcat:explicit-result') return explicitResult(message, sender);
       return message.type === 'badcat:attempt' ? attempt(message, sender) : rollover(message, sender);
     };
     const action = controlQueue.then(handle);
@@ -390,14 +506,50 @@ async function boundSender(sender, allowNewChat) {
 async function attempt(message, sender) {
   const session = await boundSender(sender, true);
   if (session === null || port === null || message.session !== port.sessionId) return { ok: false };
+  if (message.explicit === true) {
+    // The ON test submits the restored command once. It has no event: no delivered/uncertain record, no ACK.
+    // 'running' lasts until the RESULT is in: the attempt only marks the single send, real +1s keep waiting meanwhile.
+    if (session.explicit !== 'running' || session.attempted === true || !session.rollover || !session.rollover.explicit || !validPr(message.pr)) return { ok: false };
+    // Before the send: a broken channel afterwards must not allow a resend of the events this command belongs to.
+    const linked = await linkTestedEvents(session.repo, message.pr, port);
+    await setSession({ ...session, attempted: true, linked: linked, testPr: message.pr }); // single use, persisted before the send
+    return { ok: true };
+  }
   if (inFlight === null || inFlight.connection !== port) return { ok: false };
   return { ok: await rememberUncertain(inFlight.key, inFlight.connection) };
+}
+
+// Outcome of the ON test, shown in the popup. It is a test result only: never a delivery or a review result.
+async function explicitResult(message, sender) {
+  const session = await boundSender(sender, true);
+  if (session === null || port === null || message.session !== port.sessionId) return { ok: false };
+  const { explicit, linked, testPr, attempted, ...rest } = session;
+  // The test's own exception ends with its result (success, failure or no alert): what remains of a started
+  // rollover is the ordinary one a +1 would have made, with the same project checks.
+  if (rest.rollover && rest.rollover.explicit) rest.rollover = { project: rest.rollover.project };
+  if (message.none === true) {
+    if (explicit === 'armed') await setSession(rest);
+    return { ok: true };
+  }
+  if (explicit !== 'running' && explicit !== 'used') return { ok: false };
+  // Definitely not submitted: the command is still waiting, so the events tied to it are retryable again.
+  if (message.submitted !== true && linked) await unlinkTestedEvents(linked);
+  // Events that arrived at the host while the command was going out are tied to it as well.
+  if (message.submitted === true && validPr(testPr)) await linkHeldEvents(rest.repo, testPr, port);
+  const text = String(message.message || '').slice(0, 200);
+  await setSession({ ...rest, explicit: 'used', test: { ok: message.ok === true, message: text },
+    error: message.ok === true ? rest.error : 'ON test: ' + text });
+  return { ok: true };
 }
 
 // A freshly loaded content script (e.g. after a full-page rollover navigation) asks for its session id.
 async function hello(sender) {
   const session = await boundSender(sender, true);
-  return session === null ? { ok: false } : { ok: true, session: port.sessionId };
+  if (session === null) return { ok: false };
+  // A reloaded page continues a running ON test (its rollover was announced, its single attempt is unused).
+  const resume = session.explicit === 'running' && session.attempted !== true && session.rollover && session.rollover.explicit;
+  return resume ? { ok: true, session: port.sessionId, explicit: { project: session.rollover.project || '' } }
+    : { ok: true, session: port.sessionId };
 }
 
 // The content script saw the conversation-limit alert and is about to click "new chat". Record it
@@ -405,8 +557,15 @@ async function hello(sender) {
 async function rollover(message, sender) {
   const session = await boundSender(sender, false);
   if (session === null || port === null || message.session !== port.sessionId) return { ok: false };
-  // Only while a +1 is being handed off, and only one rollover at a time (until its new conversation exists).
-  if (pendingEvents === 0 || session.rollover) return { ok: false };
+  if (session.rollover) return { ok: false }; // one rollover at a time (until its new conversation exists)
+  if (message.explicit === true) {
+    // Authorized once by the user's Watching ON, without a +1.
+    if (session.explicit !== 'armed') return { ok: false };
+    await setSession({ ...session, explicit: 'running', rollover: { project: projectOf(sender.url), explicit: true } });
+    return { ok: true };
+  }
+  // Otherwise only while a +1 is being handed off.
+  if (pendingEvents === 0) return { ok: false };
   await setSession({ ...session, rollover: { project: projectOf(sender.url) } });
   return { ok: true };
 }
