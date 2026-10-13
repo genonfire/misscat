@@ -623,3 +623,423 @@ test('#64 review: the project switches after a click that had no effect: the Ent
   assert.deepEqual(t.log.keys, []);
   assert.deepEqual(t.log.submitted, []);
 });
+
+// --- Watching ON test: the background probes once; the content script clicks the real limit button, waits for
+// the restored command in the new chat and submits it with the real send button (never a synthetic Enter) ---
+const NEW_CHAT = 'https://chatgpt.com/';
+const RESTORED = '현재 작업 끝났으면 PR #616 리뷰해.';
+const results = (t) => t.runtimeCalls.filter((m) => m.type === 'badcat:explicit-result');
+const explicitDone = async (t) => {
+  for (let i = 0; i < 300 && results(t).length === 0; i += 1) await t.settle();
+  return results(t)[0];
+};
+// A limited conversation whose "새 채팅에서 계속하기" button moves the tab to the new chat with `draft` restored.
+async function limited(options = {}, { draft = RESTORED, labels = ['새 채팅에서 계속하기'] } = {}) {
+  const t = boot({ url: 'https://chatgpt.com/g/g-p-1-proj/c/old', buttonSubmits: true, enterSubmits: false,
+    selector: 'Code Review', menu: [{ value: 'g-p-1-proj', text: 'Code Review' }], ...options });
+  await t.send({ type: 'badcat:activate', session: SESSION });
+  const alert = t.limitAlert(LIMIT, labels);
+  alert.buttons[0].click = () => {
+    alert.buttons[0].clicks += 1;
+    t.setUrl(NEW_CHAT);
+    t.editor.textContent = draft; // ChatGPT restores the unsent command
+  };
+  return { t, alert };
+}
+const probe = (t) => t.send({ type: 'badcat:explicit', session: SESSION });
+
+test('ON test: clicks the real "새 채팅에서 계속하기" once, then submits the restored command with the send button', async () => {
+  const { t, alert } = await limited();
+  assert.equal((await probe(t)).ok, true);
+  const result = await explicitDone(t);
+  assert.equal(result.ok, true, result.message);
+  assert.deepEqual(clicks(alert), [1]);
+  assert.equal(JSON.stringify(announced(t)), JSON.stringify([{ type: 'badcat:rollover', session: SESSION, explicit: true }]));
+  assert.deepEqual(t.log.submitted, [RESTORED]);
+  assert.equal(t.log.clicks, 1); // the real send button
+  assert.deepEqual(t.log.keys, []); // no synthetic key events
+  assert.deepEqual(t.log.fills, []); // nothing typed: only the restored command is submitted
+  const attempts = t.runtimeCalls.filter((m) => m.type === 'badcat:attempt');
+  assert.equal(attempts.length, 1);
+  assert.equal(attempts[0].explicit, true);
+  assert.equal(attempts[0].pr, 616); // the background records it so a real +1 for this PR is not sent again
+  assert.equal(result.submitted, true);
+  assert.equal(result.pr, 616);
+});
+
+test('ON test: no limit alert means nothing is clicked, typed or sent', async () => {
+  const t = boot({ url: 'https://chatgpt.com/c/abc-123', initial: 'my own draft' });
+  await t.send({ type: 'badcat:activate', session: SESSION });
+  await probe(t);
+  const result = await explicitDone(t);
+  assert.equal(result.none, true);
+  assert.equal(announced(t).length, 0);
+  assert.deepEqual(t.log.fills, []);
+  assert.deepEqual(t.log.submitted, []);
+  assert.equal(t.text(), 'my own draft');
+});
+
+test('ON test: a probe for another session is ignored', async () => {
+  const { t, alert } = await limited();
+  assert.equal((await t.send({ type: 'badcat:explicit', session: 'other' })).ok, false);
+  await t.settle();
+  assert.deepEqual(clicks(alert), [0]);
+  assert.equal(announced(t).length, 0);
+});
+
+test('ON test: a refused rollover leaves the alert alone', async () => {
+  const { t, alert } = await limited({ rollover: { ok: false } });
+  await probe(t);
+  const result = await explicitDone(t);
+  assert.equal(result.ok, false);
+  assert.match(result.message, /not authorized/);
+  assert.deepEqual(clicks(alert), [0]);
+});
+
+test('ON test: the old "새 대화 시작" wording is still recognized', async () => {
+  const { t, alert } = await limited({}, { labels: ['새 대화 시작'] });
+  await probe(t);
+  assert.equal((await explicitDone(t)).ok, true);
+  assert.deepEqual(clicks(alert), [1]);
+});
+
+test('ON test: a duplicate probe never clicks or submits twice', async () => {
+  const { t, alert } = await limited();
+  await probe(t);
+  await probe(t);
+  await explicitDone(t);
+  assert.deepEqual(clicks(alert), [1]);
+  assert.equal(t.log.submitted.length, 1);
+});
+
+for (const [name, draft, expected] of [
+  ['an empty restored draft', '', /restored no command/],
+  ['a user draft', 'please summarize this', /something other than one MissCat command/],
+  ['two commands', RESTORED + ' ' + RESTORED, /something other than one MissCat command/],
+  ['the command plus other text', RESTORED + ' and also delete everything', /something other than one MissCat command/],
+  ['a command with a made-up PR number', '현재 작업 끝났으면 PR #0 리뷰해.', /something other than one MissCat command/],
+]) {
+  test('ON test: ' + name + ' is never submitted and the reason is reported', async () => {
+    const { t } = await limited({}, { draft });
+    await probe(t);
+    const result = await explicitDone(t);
+    assert.equal(result.ok, false);
+    assert.match(result.message, expected);
+    assert.deepEqual(t.log.submitted, []);
+    assert.deepEqual(t.log.fills, []); // an empty composer is not filled with an invented PR number either
+    assert.equal(t.runtimeCalls.filter((m) => m.type === 'badcat:attempt').length, 0);
+  });
+}
+
+test('ON test: a disabled send button sends nothing', async () => {
+  const { t } = await limited({ buttonDisabled: true });
+  await probe(t);
+  const result = await explicitDone(t);
+  assert.equal(result.ok, false);
+  assert.match(result.message, /disabled/);
+  assert.deepEqual(t.log.submitted, []);
+  assert.deepEqual(t.log.keys, []);
+});
+
+test('ON test: no send button means failure, not a synthetic Enter', async () => {
+  const { t } = await limited({ sendButton: false, enterSubmits: true });
+  await probe(t);
+  const result = await explicitDone(t);
+  assert.equal(result.ok, false);
+  assert.match(result.message, /send button not found/);
+  assert.deepEqual(t.log.submitted, []);
+  assert.deepEqual(t.log.keys, []);
+});
+
+test('ON test: a send button click that does nothing is a failure; the fake Enter is not used to pass it', async () => {
+  const { t } = await limited({ buttonSubmits: false, enterSubmits: true });
+  await probe(t);
+  const result = await explicitDone(t);
+  assert.equal(result.ok, false);
+  assert.match(result.message, /click had no effect/);
+  assert.equal(t.log.clicks, 1);
+  assert.deepEqual(t.log.keys, []);
+  assert.deepEqual(t.log.submitted, []);
+});
+
+test('ON test: a new chat in another project is never submitted', async () => {
+  const { t } = await limited({ selector: 'Other', menu: [{ value: 'g-p-9-other', text: 'Other' }] });
+  await probe(t);
+  const result = await explicitDone(t);
+  assert.equal(result.ok, false);
+  assert.match(result.message, /not in the original project/);
+  assert.deepEqual(t.log.submitted, []);
+  assert.equal(t.log.clicks, 0);
+});
+
+test('ON test: an unverifiable project (no selector) is never submitted', async () => {
+  const { t } = await limited({ selector: null });
+  await probe(t);
+  const result = await explicitDone(t);
+  assert.equal(result.ok, false);
+  assert.match(result.message, /cannot verify/);
+  assert.deepEqual(t.log.submitted, []);
+});
+
+test('ON test: if the tab never reaches a new chat the stage is reported', async () => {
+  const t = boot({ url: 'https://chatgpt.com/c/abc-123' });
+  await t.send({ type: 'badcat:activate', session: SESSION });
+  const alert = t.limitAlert(LIMIT, ['새 채팅에서 계속하기']);
+  await probe(t);
+  const result = await explicitDone(t);
+  assert.equal(result.ok, false);
+  assert.match(result.message, /^navigation:/);
+  assert.deepEqual(clicks(alert), [1]);
+  assert.deepEqual(t.log.submitted, []);
+});
+
+test('ON test: after a full page reload the new content script continues from the hello answer', async () => {
+  const t = boot({ url: NEW_CHAT, buttonSubmits: true, enterSubmits: false, initial: RESTORED,
+    hello: { ok: true, session: SESSION, explicit: { project: '' } } });
+  const result = await explicitDone(t);
+  assert.equal(result.ok, true, result.message);
+  assert.deepEqual(t.log.submitted, [RESTORED]);
+  assert.equal(t.log.clicks, 1);
+});
+
+// --- an unfocused window: execCommand inserts nothing, the paste fallback must still fill and send ---
+test('unfocused window: when insertText inserts nothing, the text is pasted and sent with the send button', async () => {
+  const t = boot({ buttonSubmits: true, enterSubmits: false, execFails: true });
+  const res = await t.send({ type: 'badcat:handoff', pr: 123 });
+  assert.equal(res.ok, true);
+  assert.deepEqual(t.log.pastes, [TEXT]);
+  assert.deepEqual(t.log.submitted, [TEXT]);
+  assert.equal(t.log.clicks, 1);
+});
+
+test('the paste fallback is not used when insertText worked', async () => {
+  const t = boot({ buttonSubmits: true, enterSubmits: false });
+  assert.equal((await t.send({ type: 'badcat:handoff', pr: 123 })).ok, true);
+  assert.deepEqual(t.log.pastes, []);
+});
+
+test('the paste fallback never touches a composer that already holds a draft', async () => {
+  const t = boot({ execFails: true, initial: 'my draft' });
+  const res = await t.send({ type: 'badcat:handoff', pr: 123 });
+  assert.equal(res.ok, false);
+  assert.deepEqual(t.log.pastes, []);
+  assert.deepEqual(t.log.submitted, []);
+  assert.equal(t.text(), 'my draft');
+});
+
+test('if the paste inserts nothing either, nothing is sent and the failure is reported', async () => {
+  const t = boot({ execFails: true, pasteFails: true });
+  const res = await t.send({ type: 'badcat:handoff', pr: 123 });
+  assert.equal(res.ok, false);
+  assert.match(res.error, /could not fill the composer/);
+  assert.deepEqual(t.log.submitted, []);
+});
+
+// --- the picker lists the bare project ID while the URL carries "<id>-<name>" ---
+test('project check: the picker ID may be the leading part of the URL slug', async () => {
+  const { t } = await limited({ menu: [{ value: 'g-p-1', text: 'Code Review' }] });
+  await probe(t);
+  const result = await explicitDone(t);
+  assert.equal(result.ok, true, result.message);
+  assert.deepEqual(t.log.submitted, [RESTORED]);
+});
+
+test('project check: a longer or different ID is still a mismatch and the IDs are reported', async () => {
+  for (const value of ['g-p-10', 'g-p-2', 'g-p-']) {
+    const { t } = await limited({ menu: [{ value, text: 'Code Review' }] });
+    await probe(t);
+    const result = await explicitDone(t);
+    assert.equal(result.ok, false, value);
+    assert.match(result.message, /not in the original project; not sent \(picker ID /);
+    assert.deepEqual(t.log.submitted, []);
+  }
+});
+
+// --- ChatGPT keeps a hidden composer of an earlier chat first in the DOM; only the rendered one is used ---
+test('a hidden composer in the DOM is ignored: the visible one is filled and its send button clicked', async () => {
+  const t = boot({ buttonSubmits: true, enterSubmits: false, ghostComposer: true });
+  const res = await t.send({ type: 'badcat:handoff', pr: 123 });
+  assert.equal(res.ok, true, res.error);
+  assert.deepEqual(t.log.submitted, [TEXT]);
+  assert.equal(t.log.clicks, 1);
+  assert.equal(t.log.ghostClicks, 0);
+  assert.equal(t.log.ghostEvents, 0);
+  assert.equal(t.ghost.textContent, 'ghost draft');
+});
+
+test('ON test ignores the hidden composer too', async () => {
+  const { t } = await limited({ ghostComposer: true });
+  await probe(t);
+  const result = await explicitDone(t);
+  assert.equal(result.ok, true, result.message);
+  assert.deepEqual(t.log.submitted, [RESTORED]);
+  assert.equal(t.log.ghostClicks, 0);
+});
+
+// --- reasoning effort: Medium is raised to High before the send (never blocks it) ---
+const effortBoot = (options = {}) => boot({ buttonSubmits: true, enterSubmits: false, effort: 'Medium', ...options });
+
+test('reasoning Medium is raised to High with one ArrowRight on the menu row, then the command is sent', async () => {
+  const t = effortBoot();
+  const res = await t.send({ type: 'badcat:handoff', pr: 123 });
+  assert.equal(res.ok, true, res.error);
+  assert.equal(t.effortLevel(), 'High');
+  assert.equal(res.note, 'reasoning set to High');
+  assert.equal(t.log.effortEvents.filter((e) => e === 'row:keydown:ArrowRight').length, 1);
+  assert.deepEqual(t.log.effortEvents.filter((e) => e.startsWith('decoy:')), []); // never the model-list row
+  assert.ok(t.log.effortEvents.includes('pointerdown')); // opened the way such menus open
+  assert.equal(t.log.effortClicks, 0);
+  assert.deepEqual(t.log.submitted, [TEXT]);
+  assert.equal(t.log.clicks, 1);
+  assert.equal(t.log.decoyClicks, 0);
+});
+
+test('reasoning already High, or another level, is left alone', async () => {
+  for (const effort of ['High', 'Low']) {
+    const t = effortBoot({ effort });
+    const res = await t.send({ type: 'badcat:handoff', pr: 123 });
+    assert.equal(res.ok, true);
+    assert.equal(t.effortLevel(), effort);
+    assert.deepEqual(t.log.effortEvents, [], effort);
+  }
+});
+
+test('a menu that only opens on click is still opened', async () => {
+  const t = effortBoot({ effortOpensOn: 'click' });
+  const res = await t.send({ type: 'badcat:handoff', pr: 123 });
+  assert.equal(res.ok, true);
+  assert.equal(t.effortLevel(), 'High');
+  assert.equal(t.log.effortClicks, 1);
+});
+
+test('if High cannot be set the command is still sent and the note says so', async () => {
+  const t = effortBoot({ arrowRaises: false });
+  const res = await t.send({ type: 'badcat:handoff', pr: 123 });
+  assert.equal(res.ok, true);
+  assert.match(res.note, /could not raise/);
+  assert.equal(t.effortLevel(), 'Medium');
+  assert.deepEqual(t.log.submitted, [TEXT]);
+});
+
+test('if the menu never opens the command is still sent', async () => {
+  const t = effortBoot({ effortOpensOn: 'never' });
+  const res = await t.send({ type: 'badcat:handoff', pr: 123 });
+  assert.equal(res.ok, true);
+  assert.match(res.note, /could not open/);
+  assert.deepEqual(t.log.submitted, [TEXT]);
+});
+
+test('no reasoning selector: nothing is touched and there is no note', async () => {
+  const t = boot({ buttonSubmits: true, enterSubmits: false });
+  const res = await t.send({ type: 'badcat:handoff', pr: 123 });
+  assert.equal(res.ok, true);
+  assert.equal(res.note, undefined);
+});
+
+test('ON test raises Medium to High and says so in the result', async () => {
+  const { t } = await limited({ effort: 'Medium' });
+  await probe(t);
+  const result = await explicitDone(t);
+  assert.equal(result.ok, true, result.message);
+  assert.match(result.message, /reasoning set to High/);
+  assert.equal(t.effortLevel(), 'High');
+  assert.deepEqual(t.log.submitted, [RESTORED]);
+});
+
+// --- the ON test runs once per ON (session), not once per tab ---
+const resultCount = (t) => results(t).length;
+const waitResults = async (t, n) => { for (let i = 0; i < 300 && resultCount(t) < n; i += 1) await t.settle(); };
+
+test('ON test: no alert, then Stop/Start with an alert shown later in the same tab, runs the test', async () => {
+  const t = boot({ url: 'https://chatgpt.com/g/g-p-1-proj/c/old', buttonSubmits: true, enterSubmits: false,
+    selector: 'Code Review', menu: [{ value: 'g-p-1-proj', text: 'Code Review' }] });
+  await t.send({ type: 'badcat:activate', session: 's1' });
+  await t.send({ type: 'badcat:explicit', session: 's1' });
+  await waitResults(t, 1);
+  assert.equal(results(t)[0].none, true);
+  await t.send({ type: 'badcat:cancel', session: 's1' }); // Stop
+  const alert = t.limitAlert(LIMIT, ['새 채팅에서 계속하기']);
+  alert.buttons[0].click = () => { alert.buttons[0].clicks += 1; t.setUrl(NEW_CHAT); t.editor.textContent = RESTORED; };
+  await t.send({ type: 'badcat:activate', session: 's2' }); // Start again
+  await t.send({ type: 'badcat:explicit', session: 's2' });
+  await waitResults(t, 2);
+  assert.equal(results(t)[1].ok, true, results(t)[1].message);
+  assert.deepEqual(clicks(alert), [1]);
+  assert.deepEqual(t.log.submitted, [RESTORED]);
+});
+
+test('ON test: a failed test, then Stop/Start in the same tab, tries again', async () => {
+  const { t, alert } = await limited({}, { draft: '' }); // nothing restored: the first test fails at "restore"
+  await probe(t);
+  await waitResults(t, 1);
+  assert.equal(results(t)[0].ok, false);
+  t.setUrl('https://chatgpt.com/g/g-p-1-proj/c/old'); // back in the limited conversation
+  t.editor.textContent = '';
+  alert.buttons[0].click = () => { alert.buttons[0].clicks += 1; t.setUrl(NEW_CHAT); t.editor.textContent = RESTORED; };
+  await t.send({ type: 'badcat:cancel', session: SESSION });
+  await t.send({ type: 'badcat:activate', session: 's2' });
+  await t.send({ type: 'badcat:explicit', session: 's2' });
+  await waitResults(t, 2);
+  assert.equal(results(t)[1].ok, true, results(t)[1].message);
+  assert.deepEqual(clicks(alert), [2]); // the same button, clicked once per test
+  assert.deepEqual(t.log.submitted, [RESTORED]);
+});
+
+test('ON test: a duplicate probe of the same session runs once', async () => {
+  const { t, alert } = await limited();
+  await probe(t);
+  await probe(t);
+  await waitResults(t, 1);
+  for (let i = 0; i < 20; i += 1) await t.settle();
+  assert.equal(resultCount(t), 1);
+  assert.deepEqual(clicks(alert), [1]);
+  assert.equal(t.log.submitted.length, 1);
+});
+
+// --- a limit alert of an earlier chat that ChatGPT keeps in the DOM, hidden, is never clicked ---
+test('ON test: a hidden limit alert in the DOM is ignored (nothing clicked, nothing announced)', async () => {
+  const t = boot({ url: 'https://chatgpt.com/c/abc-123', initial: 'my own draft' });
+  await t.send({ type: 'badcat:activate', session: SESSION });
+  const alert = t.limitAlert(LIMIT, ['새 채팅에서 계속하기'], true);
+  await probe(t);
+  const result = await explicitDone(t);
+  assert.equal(result.none, true);
+  assert.deepEqual(clicks(alert), [0]);
+  assert.equal(announced(t).length, 0);
+  assert.equal(t.text(), 'my own draft');
+});
+
+test('+1 handoff: a hidden limit alert does not start a rollover; the command is sent normally', async () => {
+  const t = await activated();
+  const alert = t.limitAlert(LIMIT, ['새 대화 시작'], true);
+  const res = await pending(t);
+  assert.equal(res.rollover, undefined);
+  assert.deepEqual(clicks(alert), [0]);
+  assert.equal(announced(t).length, 0);
+});
+
+// --- a failed handoff says whether a draft holding its command was left behind (the background ties events to it) ---
+test('a failure after the composer holds the command reports draft: true', async () => {
+  const t = boot({ buttonDisabled: true });
+  const res = await t.send({ type: 'badcat:handoff', pr: 123 });
+  assert.equal(res.ok, false);
+  assert.equal(res.draft, true);
+});
+
+test('a failure with nothing typed (composer missing, text never arrived) reports no draft', async () => {
+  let t = boot({ composer: false });
+  let res = await t.send({ type: 'badcat:handoff', pr: 123 });
+  assert.equal(res.ok, false);
+  assert.equal(res.draft, undefined);
+  t = boot({ execFails: true, pasteFails: true });
+  res = await t.send({ type: 'badcat:handoff', pr: 123 });
+  assert.equal(res.ok, false);
+  assert.equal(res.draft, undefined);
+});
+
+test('a command already pending in the composer counts as a draft when the send fails', async () => {
+  const t = boot({ initial: TEXT, buttonDisabled: true });
+  const res = await t.send({ type: 'badcat:handoff', pr: 123 });
+  assert.equal(res.ok, false);
+  assert.equal(res.draft, true);
+});

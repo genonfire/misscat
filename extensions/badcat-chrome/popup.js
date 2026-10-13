@@ -9,6 +9,7 @@
   const toggle = document.getElementById('toggle');
   const statusText = document.getElementById('status-text');
   const errorEl = document.getElementById('error');
+  const noteEl = document.getElementById('note');
   let active = false;
   let session = null;
   let tabId = null; // the tab this popup was opened on
@@ -32,6 +33,9 @@
     repoInput.readOnly = active;
     if (active) repoInput.value = session.repo;
     if (session && session.error) showError(session.error);
+    // The ON test result stays visible (a later retry error must not hide why the test failed).
+    noteEl.textContent = session && session.test ? (session.test.ok ? '' : 'ON test failed: ') + session.test.message : '';
+    noteEl.hidden = !noteEl.textContent;
     updateToggle();
   }
 

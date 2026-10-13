@@ -13,12 +13,20 @@
   // The conversation-limit alert (observed wording; matched on text, never on generated classes).
   const LIMIT_ALERT = 'aside[role="alert"]';
   const LIMIT_TEXT_RE = /최대\s*(길이|깊이)|maximum\s+(conversation\s+)?(length|depth)/i;
-  const NEW_CHAT_LABELS = ['새 대화 시작', '새 채팅 시작', 'Start new chat', 'Start a new chat'];
+  const NEW_CHAT_LABELS = ['새 채팅에서 계속하기', '새 대화 시작', '새 채팅 시작', 'Start new chat', 'Start a new chat'];
   const NEW_CHAT_SETTLE_MS = 800; // ChatGPT restores the unsent draft shortly after the composer appears
   // The new chat's project selector (semantic attribute only) and the menu items it lists.
   const PROJECT_BUTTON = '[data-composer-navigation-target="workspace-project"]';
   const MENUS = '[role="dialog"]'; // the project picker opens as a dialog of div[data-value] entries
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  // ChatGPT keeps hidden composers of earlier chats in the DOM (with their own, disabled send button): only the
+  // one that is actually rendered may be filled or submitted. Without layout information it counts as visible.
+  const isVisible = (el) => el.offsetWidth === undefined || Boolean(el.offsetWidth || el.offsetHeight);
+  function findComposer() {
+    for (const el of document.querySelectorAll(COMPOSER)) if (isVisible(el)) return el;
+    return null;
+  }
 
   async function waitFor(check, timeoutMs) {
     const deadline = Date.now() + timeoutMs;
@@ -50,6 +58,10 @@
   // value between /g/ and /c/ in its URL, compared exactly). One look: {name} when verified, {mismatch} when the
   // name is listed twice or maps to another ID (never retried, never sent), {notReady} when the selector or its
   // menu has not rendered yet. The menu is opened, read and closed again.
+  // The URL segment may be "<id>-<name-slug>" while the picker lists just "<id>": equal, or the picker's ID
+  // is the slug's leading part followed by a dash (never a mere prefix of a longer ID).
+  const idMatchesSlug = (value, slug) => value !== '' && (value === slug || slug.startsWith(value + '-'));
+
   async function verifyProjectOnce(slug) {
     const button = document.querySelector(PROJECT_BUTTON);
     const label = projectLabel();
@@ -60,7 +72,10 @@
     if (items) {
       const same = items.filter((item) => labelNames(label, (item.textContent || '').trim()));
       if (same.length > 1) result = { mismatch: true };
-      else if (same.length === 1) result = same[0].getAttribute('data-value') === slug ? { name: label } : { mismatch: true };
+      else if (same.length === 1) {
+        const value = same[0].getAttribute('data-value') || '';
+        result = idMatchesSlug(value, slug) ? { name: label } : { mismatch: true, found: value };
+      }
     }
     if (button.getAttribute('aria-expanded') === 'true') button.click();
     await waitFor(() => menuItems().length === 0, 1000);
@@ -103,6 +118,62 @@
     return existing + insert;
   }
 
+  // execCommand('insertText') needs the document to be focused; with the ChatGPT window in the background nothing
+  // is inserted. A paste event carrying the text works without focus (ProseMirror reads event.clipboardData).
+  function pasteInto(el, text) {
+    const data = new DataTransfer();
+    data.setData('text/plain', text);
+    el.dispatchEvent(new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true }));
+  }
+
+  // The reasoning-effort selector of the composer (observed: a visible button with aria-haspopup="menu" whose text
+  // ends with the current level, e.g. "추론 수준Medium"). Its menu holds a slider row
+  // (data-reasoning-slider, aria-keyshortcuts="ArrowLeft ArrowRight", levels 0..2) next to an unrelated row that
+  // only shows the level and opens the model list: keys go to the slider row, never to that one.
+  const EFFORT_TRIGGER = 'button[aria-haspopup="menu"]';
+  const EFFORT_SLIDER = '[data-reasoning-slider="true"]';
+  const LEVEL_RE = /(Low|Medium|High)\s*$/i;
+  const keyEvent = (type, key, code, keyCode) =>
+    new KeyboardEvent(type, { key: key, code: code, keyCode: keyCode, which: keyCode, bubbles: true, cancelable: true });
+
+  // Medium -> High before the send; High stays, anything else is left alone. Never blocks the send: the result is
+  // only a note. Returns the note ('' when there is no such selector).
+  async function raiseEffort(composer) {
+    const form = composer.closest(COMPOSER_FORM);
+    const trigger = form && [...form.querySelectorAll(EFFORT_TRIGGER)].find((b) => isVisible(b) && LEVEL_RE.test((b.textContent || '').trim()));
+    if (!trigger) return '';
+    const level = () => { const m = LEVEL_RE.exec((trigger.textContent || '').trim()); return m ? m[1].toLowerCase() : ''; };
+    if (level() === 'high') return 'reasoning already High';
+    if (level() !== 'medium') return 'reasoning is ' + level() + '; left unchanged';
+    const row = () => [...document.querySelectorAll(EFFORT_SLIDER)].find(isVisible);
+    const atMax = () => {
+      const slider = row() && row().querySelector('[role="slider"]');
+      return Boolean(slider) && slider.getAttribute('aria-valuenow') === slider.getAttribute('aria-valuemax');
+    };
+    const close = async () => {
+      const open = row();
+      if (open) open.dispatchEvent(keyEvent('keydown', 'Escape', 'Escape', 27));
+      await waitFor(() => !row(), 1000);
+    };
+    // Menus of this kind open on pointerdown, not on a plain click.
+    const press = (type) => trigger.dispatchEvent(new PointerEvent(type, { bubbles: true, cancelable: true, button: 0, ctrlKey: false, pointerType: 'mouse' }));
+    press('pointerdown');
+    press('pointerup');
+    let item = await waitFor(row, 1500);
+    if (!item) {
+      trigger.click();
+      item = await waitFor(row, 1500);
+    }
+    if (!item) return 'could not open the reasoning menu; left at Medium';
+    if (typeof item.focus === 'function') item.focus();
+    item.dispatchEvent(keyEvent('keydown', 'ArrowRight', 'ArrowRight', 39));
+    item.dispatchEvent(keyEvent('keyup', 'ArrowRight', 'ArrowRight', 39));
+    const raised = await waitFor(() => atMax() || level() === 'high', 2000);
+    await close();
+    if (!raised) return 'could not raise the reasoning to High; left at Medium';
+    return await waitFor(() => level() === 'high', 1500) ? 'reasoning set to High' : 'reasoning change to High not confirmed';
+  }
+
   function findSendButton(composer) {
     const form = composer.closest(COMPOSER_FORM);
     return form ? form.querySelector(SEND_BUTTON) : null;
@@ -119,12 +190,13 @@
   const UNCERTAIN = { ok: false, ambiguous: true, error: 'submission could not be confirmed; not sent again' };
   const ROLLOVER_COOLDOWN_MS = 30000;
   let rolloverClickedAt = null;
-  // The "new chat" button of the real limit alert, or null. Duplicated buttons: the first match wins.
+  // The "new chat" button of the real limit alert, or null. Duplicated buttons: the first match wins. Alerts of
+  // earlier chats may stay in the DOM hidden: only a rendered alert and button count.
   function findLimitButton() {
     for (const alert of document.querySelectorAll(LIMIT_ALERT)) {
-      if (!LIMIT_TEXT_RE.test(alert.textContent || '')) continue; // some other alert
+      if (!isVisible(alert) || !LIMIT_TEXT_RE.test(alert.textContent || '')) continue; // hidden, or some other alert
       for (const button of alert.querySelectorAll('button')) {
-        if (NEW_CHAT_LABELS.includes((button.textContent || '').trim())) return button;
+        if (isVisible(button) && NEW_CHAT_LABELS.includes((button.textContent || '').trim())) return button;
       }
     }
     return null;
@@ -161,7 +233,17 @@
   };
 
   const submitted = new Set(); // survives service-worker restart while this tab stays open
-  async function handoff(pr, session, event, expectedProject) {
+  // `explicit`: the one-time test started by Watching ON. The command is whatever MissCat command ChatGPT restored
+  // in the new chat (the caller has already matched it exactly); nothing is typed and no limit alert is clicked.
+  async function handoff(pr, session, event, expectedProject, explicit) {
+    // `draft` on a failed result: the composer verifiably held this very command at some point of the attempt, so a
+    // restored draft of it may exist later. No such proof (composer missing, nothing typed) means no draft.
+    const state = { draft: false };
+    const result = await handoffRun(state, pr, session, event, expectedProject, explicit);
+    return state.draft && result && result.ok !== true ? { ...result, draft: true } : result;
+  }
+
+  async function handoffRun(state, pr, session, event, expectedProject, explicit) {
     // A freshly reloaded page may still be rebinding to its session.
     if (session !== undefined && activeSession === null) await waitFor(() => activeSession !== null, 3000);
     const active = () => session === undefined || session === activeSession;
@@ -176,15 +258,16 @@
     const startUrl = location.href;
     const changed = { ok: false, error: 'the page changed during the handoff; not sent' };
     const text = reviewMessage(pr);
-    const limit = await tryRollover(session); // an already-limited conversation cannot take the command
+    const rolloverOnce = explicit ? async () => null : tryRollover;
+    const limit = await rolloverOnce(session); // an already-limited conversation cannot take the command
     if (limit) return limit;
     if (!active()) return { ok: false, error: 'session stopped' };
-    let composer = await waitFor(() => document.querySelector(COMPOSER), 5000);
+    let composer = await waitFor(() => findComposer(), 5000);
     if (!active()) return { ok: false, error: 'session stopped' };
-    if (!composer) return (await tryRollover(session)) || { ok: false, error: 'composer not found' };
+    if (!composer) return (await rolloverOnce(session)) || { ok: false, error: 'composer not found' };
     // Every asynchronous step below may let the user (or ChatGPT) move to another chat: the decision to
     // type or send is never based on what was true at the start, only on the live page and composer.
-    const moved = () => location.href !== startUrl || document.querySelector(COMPOSER) !== composer;
+    const moved = () => location.href !== startUrl || findComposer() !== composer;
     if (moved()) return changed;
 
     if (!conversation) {
@@ -206,18 +289,24 @@
     if (!conversation && expectedProject) {
       const verified = await verifyProject(expectedProject);
       if (!active()) return { ok: false, error: 'session stopped' };
-      if (verified.mismatch) return { ok: false, error: 'the new chat is not in the original project; not sent' };
+      if (verified.mismatch) {
+        const seen = verified.found ? ' (picker ID ' + verified.found + ', conversation ' + expectedProject + ')' : ' (duplicate project name)';
+        return { ok: false, error: 'the new chat is not in the original project; not sent' + seen };
+      }
       if (!verified.name) return { ok: false, error: 'cannot verify the new chat is in the original project' };
       verifiedName = verified.name;
       if (location.href !== startUrl) return changed;
       // The picker took a while: ChatGPT may have re-mounted the composer; the live node of the same new chat is used.
-      const live = document.querySelector(COMPOSER);
+      const live = findComposer();
       if (!live) return changed;
       composer = live;
       existing = readComposer(live);
     }
     if (moved()) return changed;
-    if (conversation ? !containsCommand(normalize(existing), text) : normalize(existing) !== text) {
+    if (explicit && normalize(existing) !== text) return { ok: false, error: 'the restored command is no longer in the composer; not sent' };
+    const pending = conversation ? containsCommand(normalize(existing), text) : normalize(existing) === text;
+    if (pending) state.draft = true; // already pending in the composer
+    if (!pending) {
       const base = conversation ? existing : ''; // '' replaces whatever a new chat holds
       const full = base ? base + ' ' + text : text;
       appendToComposer(composer, base, text);
@@ -226,12 +315,29 @@
       await waitFor(() => normalize(readComposer(composer)) === normalize(full), 1500);
       if (!active()) return { ok: false, error: 'session stopped' };
       if (moved()) return changed;
+      // Nothing arrived at all in an empty composer (e.g. the window has no focus): insert by paste instead.
+      // Never with existing text: the paste position would not be ours to choose.
+      if (existing === '' && normalize(readComposer(composer)) === '') {
+        pasteInto(composer, text);
+        await waitFor(() => normalize(readComposer(composer)) === normalize(full), 1500);
+        if (!active()) return { ok: false, error: 'session stopped' };
+        if (moved()) return changed;
+      }
       const now = normalize(readComposer(composer));
       if (now !== normalize(full)) {
         return { ok: false, error: now.includes(text) ? 'the composer changed while filling; not sent' : 'could not fill the composer' };
       }
+      state.draft = true; // the composer now holds the command
     }
 
+    if (!active()) return { ok: false, error: 'session stopped' };
+    if (moved()) return changed;
+    let note = '';
+    try {
+      note = await raiseEffort(composer);
+    } catch (e) {
+      note = 'could not change the reasoning level';
+    }
     if (!active()) return { ok: false, error: 'session stopped' };
     if (moved()) return changed;
     if (expectedProject && conversation && projectOf(location.href) !== expectedProject) {
@@ -266,14 +372,16 @@
       button = await waitFor(() => { const b = findSendButton(composer); return isEnabled(b) ? b : null; }, 2000);
       if (!active()) return { ok: false, error: 'session stopped' };
       if (moved()) return changed;
-      if (!button) return (await tryRollover(session)) || { ok: false, error: 'the send button is disabled; not sent' };
+      if (!button) return (await rolloverOnce(session)) || { ok: false, error: 'the send button is disabled; not sent' };
     }
+    // The ON test must prove the real UI path: no send button means no synthetic-Enter substitute.
+    if (explicit && !button) return { ok: false, error: 'send button not found; not sent' };
     if (session !== undefined) {
       // Durable "may be submitted" marker first: a channel broken by the navigation after sending must not
       // lead to an automatic resend. No marker, no send.
       let marked = null;
       try {
-        marked = await chrome.runtime.sendMessage({ type: 'badcat:attempt', session: session });
+        marked = await chrome.runtime.sendMessage({ type: 'badcat:attempt', session: session, explicit: explicit === true, pr: explicit ? pr : undefined });
       } catch (e) { /* background unavailable */ }
       if (!marked || marked.ok !== true) return { ok: false, error: 'could not record the attempt; not sent' };
       if (!active()) return { ok: false, error: 'session stopped' };
@@ -297,6 +405,7 @@
     };
     let outcome = await submit(button ? () => button.click() : () => pressEnter(composer));
     // The button was accepted but nothing happened: Enter as the fallback, never after the page moved on.
+    if (explicit && outcome === 'pending') return { ok: false, error: 'the send button click had no effect; the command is still in the composer' };
     if (outcome === 'pending' && button && active() && !moved()) {
       const recheck = await projectStillRight();
       if (recheck) return recheck;
@@ -311,10 +420,60 @@
         submitted.add(key);
         if (submitted.size > 500) submitted.delete(submitted.values().next().value);
       }
-      return { ok: true };
+      return note ? { ok: true, note: note } : { ok: true };
     }
     // The send failed: the limit alert may have appeared in response; one bounded recheck.
-    return (await tryRollover(session)) || { ok: false, error: 'message was not submitted' };
+    return (await rolloverOnce(session)) || { ok: false, error: 'message was not submitted' };
+  }
+
+  // --- Watching ON test: one explicit rollover and submit, authorized by the user's click, without a +1. ---
+  const RESTORED_RE = /^현재 작업 끝났으면 PR #([1-9][0-9]*) 리뷰해\.$/; // the exact MissCat command, nothing else
+  let explicitSession = null; // the session id the ON test was started for: once per ON (session), never per tab
+  const reportExplicit = (session, result) =>
+    chrome.runtime.sendMessage({ type: 'badcat:explicit-result', session: session, ...result }).catch(() => {});
+
+  // Stage 2: in the new chat, submit the restored command with the real send button.
+  async function continueExplicit(session, project) {
+    const fail = (stage, error) => reportExplicit(session, { ok: false, message: stage + ': ' + error });
+    const reachedNewChat = await waitFor(() => isNewChatUrl(location.href) && findComposer(), 15000);
+    if (!reachedNewChat) return fail('navigation', 'did not reach a new chat');
+    await sleep(NEW_CHAT_SETTLE_MS);
+    const draftOf = () => { const c = findComposer(); return c ? normalize(readComposer(c)) : ''; };
+    const draft = await waitFor(() => RESTORED_RE.test(draftOf()) ? draftOf() : null, 8000);
+    if (!draft) {
+      return fail('restore', draftOf() === '' ? 'ChatGPT restored no command; nothing sent'
+        : 'the composer holds something other than one MissCat command; nothing sent');
+    }
+    const pr = Number(RESTORED_RE.exec(draft)[1]);
+    if (!Number.isSafeInteger(pr)) return fail('restore', 'invalid PR number; nothing sent');
+    const task = queue.then(() => handoff(pr, session, null, project, true));
+    queue = task.catch(() => {});
+    const result = await task.catch((e) => ({ ok: false, error: String(e && e.message) }));
+    if (result.ok) {
+      return reportExplicit(session, { ok: true, submitted: true, pr: pr,
+        message: 'Submitted the restored command for PR #' + pr + ' (test only, not a delivery).' + (result.note ? ' ' + result.note + '.' : '') });
+    }
+    // `submitted`: the command may be out there (unconfirmed), so a real +1 for this PR must not send it again.
+    return reportExplicit(session, { ok: false, submitted: result.ambiguous === true, pr: pr, message: 'submit: ' + (result.error || 'not submitted') });
+  }
+
+  // Stage 1: the limit alert of the current conversation, clicked at most once.
+  async function startExplicit(session) {
+    if (explicitSession === session) return; // a duplicate probe of the same session
+    explicitSession = session;
+    if (!isConversationUrl(location.href)) return reportExplicit(session, { none: true });
+    const button = findLimitButton();
+    if (!button || button.disabled) return reportExplicit(session, { none: true });
+    const project = projectOf(location.href) || '';
+    let answer = null;
+    try {
+      answer = await chrome.runtime.sendMessage({ type: 'badcat:rollover', session: session, explicit: true });
+    } catch (e) { /* background unavailable: leave the alert alone */ }
+    if (!answer || answer.ok !== true || session !== activeSession) {
+      return reportExplicit(session, { ok: false, message: 'rollover: not authorized; the alert was left alone' });
+    }
+    button.click();
+    await continueExplicit(session, project);
   }
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -328,8 +487,15 @@
       sendResponse({ ok: true });
       return false;
     }
+    if (message.type === 'badcat:explicit') {
+      const ok = message.session === activeSession;
+      sendResponse({ ok: ok });
+      if (ok) startExplicit(message.session);
+      return false;
+    }
     if (message.type === 'badcat:cancel') {
       if (activeSession === message.session) activeSession = null;
+      if (explicitSession === message.session) explicitSession = null;
       sendResponse({ ok: true });
       return false;
     }
@@ -353,6 +519,11 @@
     chrome.runtime.sendMessage({ type: 'badcat:hello' }).then((answer) => {
       if (answer && answer.ok === true && typeof answer.session === 'string' && activeSession === null) {
         activeSession = answer.session;
+        // The page was reloaded by the ON test's own rollover: carry on with the submit step.
+        if (answer.explicit && typeof answer.explicit.project === 'string' && explicitSession !== answer.session) {
+          explicitSession = answer.session;
+          continueExplicit(answer.session, answer.explicit.project);
+        }
       }
     }, () => {});
   } catch (e) { /* extension context unavailable */ }
