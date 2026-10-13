@@ -721,7 +721,8 @@ test('the explicit attempt is single-use and leaves no delivered/uncertain recor
   await t.navigate('https://chatgpt.com/');
   assert.equal((await t.fromContent({ type: 'badcat:attempt', session: sid(t), explicit: true, pr: 9 })).ok, true);
   assert.equal((await t.fromContent({ type: 'badcat:attempt', session: sid(t), explicit: true, pr: 9 })).ok, false);
-  assert.equal(t.session().explicit, 'used');
+  assert.equal(t.session().explicit, 'running'); // 'used' only once the result is in
+  assert.equal(t.session().attempted, true);
   assert.equal(t.store['badcat.uncertain.v1'], undefined);
   assert.equal(t.store['badcat.delivered.v2'], undefined);
   assert.equal(t.natives[0].posted.filter((m) => m.type === 'ack').length, 0);
@@ -946,4 +947,57 @@ test('dedupe: an explicit attempt without a valid PR number is refused', async (
   assert.equal((await t.fromContent({ type: 'badcat:attempt', session: sid(t), explicit: true })).ok, false);
   assert.equal((await t.fromContent({ type: 'badcat:attempt', session: sid(t), explicit: true, pr: 0 })).ok, false);
   assert.equal(uncertainList(t).length, 0);
+});
+
+// --- the window between the ON test's send marker and its result: real +1s keep waiting ---
+test('dedupe: a +1 that arrives AFTER the send marker but BEFORE the result waits, and the same PR is blocked once the result is in', async () => {
+  const { t } = await pendingThenTest();
+  assert.equal((await attemptTest(t)).ok, true); // marker written, the click and its confirmation still pending
+  const before = sentFor(t, 9);
+  t.natives[0].emit(plus1(9, HEAD1)); // the host's ordinary replay right after ON
+  t.natives[0].emit(plus1(9, HEAD2, { review_id: 101 }));
+  t.natives[0].emit(plus1(10, HEAD2));
+  await t.settle(); await t.settle(); await drain(t);
+  assert.equal(sentFor(t, 9), before); // nothing went to the tab while the test owns it
+  assert.equal(sentFor(t, 10), 0);
+  assert.equal(ackCount(t), 0);
+  await resultOf(t);
+  await drain(t);
+  assert.equal(sentFor(t, 9), before); // never a second copy of the submitted command
+  assert.equal(sentFor(t, 10), 1);
+  assert.equal(ackCount(t), 1);
+  assert.equal(uncertainList(t).length, 2);
+  assert.equal(t.session().explicit, 'used');
+  assert.equal(t.session().attempted, undefined);
+});
+
+test('dedupe: a late blocked event is not unblocked by a failing handoff of its own', async () => {
+  const { t, mode } = await pendingThenTest();
+  await attemptTest(t);
+  t.natives[0].emit(plus1(9, HEAD2, { review_id: 101 }));
+  await t.settle(); await t.settle();
+  mode.ok = false; // any handoff that would start now fails definitely
+  await resultOf(t);
+  await drain(t);
+  assert.equal(sentFor(t, 9, HEAD2), 0);
+  assert.ok(uncertainList(t).includes('o/r#9@' + HEAD2 + ':101'));
+});
+
+test('dedupe: if the result says nothing was submitted, everything held is released and delivered', async () => {
+  const { t } = await pendingThenTest();
+  await attemptTest(t);
+  t.natives[0].emit(plus1(9, HEAD2, { review_id: 101 }));
+  await t.settle(); await t.settle();
+  await resultOf(t, { ok: false, submitted: false, message: 'submit: not sent' });
+  await drain(t);
+  assert.equal(sentFor(t, 9, HEAD2), 1);
+  assert.equal(uncertainList(t).length, 0);
+});
+
+test('the explicit send marker is single-use and the state stays running until the result', async () => {
+  const { t } = await pendingThenTest();
+  assert.equal((await attemptTest(t)).ok, true);
+  assert.equal((await attemptTest(t)).ok, false);
+  assert.equal(t.session().explicit, 'running');
+  assert.equal((await t.fromContent({ type: 'badcat:hello' })).explicit, undefined); // a reload must not resubmit
 });

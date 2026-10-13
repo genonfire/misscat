@@ -385,6 +385,19 @@ async function deliverEvent(connection, message) {
       return;
     }
 
+    // The ON test may have started while the checks above ran: look again right before the tab is asked.
+    const fresh = await getSession();
+    if (connection !== port || !fresh.active) return;
+    if (fresh.explicit === 'running' && explicitWaits < MAX_EXPLICIT_WAITS) {
+      explicitWaits += 1;
+      pause = EXPLICIT_WAIT_MS;
+      continue;
+    }
+    if ((await uncertainKeys()).includes(key)) {
+      await reportError(connection, 'Delivery could not be confirmed; check ChatGPT. Not sent again.');
+      return;
+    }
+    if (connection !== port) return;
     inFlight = { connection: connection, key: key };
     try {
       const request = { type: 'badcat:handoff', pr: event.pr, event: event, session: connection.sessionId };
@@ -495,10 +508,11 @@ async function attempt(message, sender) {
   if (session === null || port === null || message.session !== port.sessionId) return { ok: false };
   if (message.explicit === true) {
     // The ON test submits the restored command once. It has no event: no delivered/uncertain record, no ACK.
-    if (session.explicit !== 'running' || !session.rollover || !session.rollover.explicit || !validPr(message.pr)) return { ok: false };
+    // 'running' lasts until the RESULT is in: the attempt only marks the single send, real +1s keep waiting meanwhile.
+    if (session.explicit !== 'running' || session.attempted === true || !session.rollover || !session.rollover.explicit || !validPr(message.pr)) return { ok: false };
     // Before the send: a broken channel afterwards must not allow a resend of the events this command belongs to.
     const linked = await linkTestedEvents(session.repo, message.pr, port);
-    await setSession({ ...session, explicit: 'used', linked: linked, testPr: message.pr }); // single use, persisted before the send
+    await setSession({ ...session, attempted: true, linked: linked, testPr: message.pr }); // single use, persisted before the send
     return { ok: true };
   }
   if (inFlight === null || inFlight.connection !== port) return { ok: false };
@@ -509,7 +523,7 @@ async function attempt(message, sender) {
 async function explicitResult(message, sender) {
   const session = await boundSender(sender, true);
   if (session === null || port === null || message.session !== port.sessionId) return { ok: false };
-  const { explicit, linked, testPr, ...rest } = session;
+  const { explicit, linked, testPr, attempted, ...rest } = session;
   // The test's own exception ends with its result (success, failure or no alert): what remains of a started
   // rollover is the ordinary one a +1 would have made, with the same project checks.
   if (rest.rollover && rest.rollover.explicit) rest.rollover = { project: rest.rollover.project };
@@ -533,7 +547,7 @@ async function hello(sender) {
   const session = await boundSender(sender, true);
   if (session === null) return { ok: false };
   // A reloaded page continues a running ON test (its rollover was announced, its single attempt is unused).
-  const resume = session.explicit === 'running' && session.rollover && session.rollover.explicit;
+  const resume = session.explicit === 'running' && session.attempted !== true && session.rollover && session.rollover.explicit;
   return resume ? { ok: true, session: port.sessionId, explicit: { project: session.rollover.project || '' } }
     : { ok: true, session: port.sessionId };
 }
