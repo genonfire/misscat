@@ -120,7 +120,8 @@
 
   // execCommand('insertText') needs the document to be focused; with the ChatGPT window in the background nothing
   // is inserted. A paste event carrying the text works without focus (ProseMirror reads event.clipboardData).
-  function pasteInto(el, text) {
+  function pasteInto(el, text, replace) {
+    if (replace) window.getSelection().selectAllChildren(el); // the paste then replaces the whole composer
     const data = new DataTransfer();
     data.setData('text/plain', text);
     el.dispatchEvent(new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true }));
@@ -316,9 +317,11 @@
       if (!active()) return { ok: false, error: 'session stopped' };
       if (moved()) return changed;
       // Nothing arrived at all in an empty composer (e.g. the window has no focus): insert by paste instead.
-      // Never with existing text: the paste position would not be ours to choose.
-      if (existing === '' && normalize(readComposer(composer)) === '') {
-        pasteInto(composer, text);
+      // With existing text only in a new chat, where the paste replaces everything and nothing arrived (the composer
+      // is exactly as before); in a conversation the paste position would not be ours to choose.
+      const untouched = normalize(readComposer(composer)) === normalize(existing);
+      if (untouched && (existing === '' || !conversation)) {
+        pasteInto(composer, text, base === '' && existing !== '');
         await waitFor(() => normalize(readComposer(composer)) === normalize(full), 1500);
         if (!active()) return { ok: false, error: 'session stopped' };
         if (moved()) return changed;

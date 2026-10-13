@@ -1043,3 +1043,30 @@ test('a command already pending in the composer counts as a draft when the send 
   assert.equal(res.ok, false);
   assert.equal(res.draft, true);
 });
+
+// --- a nonempty restored draft in a new chat plus an unfocused window: the paste replaces it ---
+test('unfocused window, new chat: a restored old command is replaced by the paste and sent once', async () => {
+  const old = '현재 작업 끝났으면 PR #586 리뷰해.';
+  for (const opts of [{ url: 'https://chatgpt.com/' }, projectOpts()]) {
+    const t = await activated({ ...opts, initial: old, execFails: true, buttonSubmits: true });
+    const res = await t.send(handoffMsg(opts.selector ? { project: SLUG } : {}));
+    assert.equal(res.ok, true);
+    assert.deepEqual(t.log.pastes, [TEXT]);
+    assert.deepEqual(t.log.submitted, [TEXT]); // exactly the command, no old or doubled text
+  }
+});
+
+test('unfocused window, new chat: if the replacing paste fails too, nothing is sent', async () => {
+  const t = await activated({ ...projectOpts({ initial: '현재 작업 끝났으면 PR #586 리뷰해.' }), execFails: true, pasteFails: true, buttonSubmits: true });
+  const res = await t.send(handoffMsg({ project: SLUG }));
+  assert.equal(res.ok, false);
+  assert.deepEqual(t.log.submitted, []);
+});
+
+test('unfocused window, project mismatch: the old command is neither replaced nor sent', async () => {
+  const t = await activated({ ...projectOpts({ initial: '현재 작업 끝났으면 PR #586 리뷰해.', menu: [{ text: 'Code Review', value: 'g-p-other' }] }), execFails: true, buttonSubmits: true });
+  const res = await t.send(handoffMsg({ project: SLUG }));
+  assert.equal(res.ok, false);
+  assert.deepEqual(t.log.pastes, []);
+  assert.deepEqual(t.log.submitted, []);
+});
