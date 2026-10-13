@@ -249,261 +249,46 @@ The `args` field under `reviewer` is passed to the selected reviewer CLI unchang
 
 Reviewed state is stored per repository and keyed by PR, HEAD SHA, and profile. The same HEAD can therefore be reviewed again with a different profile.
 
-### Author replies to a blocking `-1`
-
-A PR can stay stuck at `-1` after the author supplies evidence. MissCat therefore also notices when the conversation advances on an **unchanged HEAD**, and calls the reviewer again; it never judges the reply. For an already-reviewed current HEAD (same eligibility rules: drafts, `no-review`, `urgent`, `--cat`), a review is triggered when:
-
-- the latest valid marker review of that HEAD (a submitted `COMMENTED` review with a `-1`/`+1`/`+2` header, matching `HEAD:` and `commit_id`, and evidence; the format BadCat uses) is a `-1`. A later `+1`/`+2` or newer `-1` supersedes earlier ones, and reviews of other HEADs never count;
-- the PR author then adds a new **top-level conversation comment** after that review. Author and reviewer may share one GitHub account: only conversation comments trigger, never submitted reviews or inline review comments. Comments by others, comments before the `-1`, and comments on an old HEAD are ignored. No special text or command is needed; a mere progress comment may cause one harmless extra review;
-- that `-1` was submitted by one of this profile's own runs, so another stage's (or a manual) `-1` is never re-opened, even from the same GitHub account. Each run gets a random run id, and the prompt tells the reviewer to end its review body with the line `MissCat-Run: <id>`; the review ids carrying that line are stored in the state file. A review recorded without ids (made before this feature, or whose reviewer omitted the line) is never guessed at and never triggers: such a PR needs one new review (a new HEAD, or remove the record in `misscat state`) first.
-
-The reviewer prompt names the author's comment(s) and tells the reviewer to read its earlier `-1`, the comments after it and the latest evidence, answer the argument and explain a maintained or changed judgment in a new submitted PR Review (per the repository's `REVIEW.md`). The reviewer should answer through that review rather than a conversation comment, or it would count as another author reply when it shares the author's account.
-
-The run counts as done only if, afterwards, GitHub shows a **new valid verdict review** (submitted `COMMENTED`, header and evidence for exactly that HEAD) that carries **this run's id line**, and the PR's HEAD is unchanged; a zero exit alone, or any other review (even from the same account), is not enough. Only then are the triggering comment ids stored (in an optional `replies` list of the existing state file, keyed by PR, HEAD, profile and comment id; older v2 files load unchanged and no review history is lost). Every attempt is written to the state file (`pending`) before it starts and settled against GitHub afterwards, also after a crash or restart: a normal review or re-review whose valid review was really submitted counts even if its CLI died afterwards or GitHub could not be checked at that moment; a GitHub error leaves the attempt pending (the HEAD is not rerun meanwhile) until it can be checked; an attempt that submitted nothing is dropped and retried like a failed review. For a normal first review the same check applies: it is recorded as reviewed only when a submitted review of that HEAD carries the run id line, so a reviewer that omits it is reported as failed and retried. A normal run also requires a valid `COMMENTED` verdict with HEAD and evidence. A submitted valid review is recovered after a CLI crash; completion is persisted before pending removal so interruption between these writes cannot cause another invocation. Each comment is handled at most once; a later author comment after a new `-1` can trigger again, and a new HEAD follows the normal review path.
-
-To stay cheap, the PR listing also fetches `author` and `updatedAt`; reviews (and then comments, only if the HEAD is blocked) are read only for a reviewed PR whose `updatedAt` changed.
-
 ### Gemini (Antigravity CLI)
 
-Gemini reviews use the Antigravity CLI (`agy`). Configure authentication and permissions before running MissCat.
-
-For headless reviews, configure the Antigravity CLI settings file:
-
-`~/.gemini/antigravity-cli/settings.json`
+Allow `gh` and `git` in `~/.gemini/antigravity-cli/settings.json` (keep your other settings):
 
 ```json
 {
   "toolPermission": "proceed-in-sandbox",
   "enableTerminalSandbox": true,
-  "permissions": {
-    "allow": [
-      "command(gh)",
-      "command(git)"
-    ]
-  }
+  "permissions": { "allow": ["command(gh)", "command(git)"] }
 }
 ```
-
-Preserve any existing settings when adding these fields. Ensure the repository workspace is trusted as appropriate.
-
-Example reviewer profile (`~/.config/misscat/gemini.yml`):
 
 ```yaml
 reviewer:
   provider: gemini
   model: gemini-3.8-flash-low
-  args:
-    - --print-timeout
-    - 30m
+  args: [--print-timeout, 30m]
 ```
 
-**Important:** In headless mode, commands requiring interactive permission approval may be automatically denied. Antigravity can still exit successfully without posting a GitHub review.
+In headless mode a denied permission can end the run without posting a review; use `--loud` to inspect.
 
-If a review finishes without appearing on GitHub, run MissCat with `--loud` to inspect reviewer activity and permission errors.
+## BadCat
 
-Avoid `--dangerously-skip-permissions` for routine unattended operation, as it broadly bypasses tool approval checks.
-
-## Review workspace
-
-MissCat keeps one persistent **control clone** per repository and one persistent Git worktree per cat:
-
-```text
-~/.cache/misscat/repos/<owner>/<repo>/        control clone (default branch HEAD, never reviewed in)
-~/.cache/misscat/cats/<owner>/<repo>/cat-1/   review worktrees: cat-1, cat-2, ...
-```
-
-The repository is cloned on first use and reused. At startup and before each batch MissCat fetches the control clone, leaves it clean on the default branch, and creates any missing `cat-N` worktrees. Existing cats are reused across runs; a later run with a smaller `--cat` leaves the extra cats on disk, unused. Before each review, MissCat cleans a cat's worktree and detaches it at the exact PR HEAD. The reviewer CLI runs with that cat worktree as its working directory.
-
-Your normal development checkout is never touched.
-
-## Requirements and limits
-
-- **Authentication expectations**:
-  - Git must be able to authenticate to the target repository for clone and fetch. Existing SSH keys or Git credentials work seamlessly. If using HTTPS with GitHub CLI, configure Git helper via `gh auth setup-git`. MissCat never stores Git credentials.
-  - GitHub CLI (`gh`) must be authenticated (`gh auth login`) with permissions to query pull requests.
-  - Reviewer CLIs (`claude`, `codex`, `agy`) must be logged in and configured with their respective provider accounts or API keys. MissCat uses their existing credentials.
-- **Trusted repository and PR warning**:
-  - Reviewer CLIs execute within a MissCat-managed checkout of PR-controlled files.
-  - MissCat should only be used with repositories and pull requests whose code and contributors you trust.
-- **One process per repository**:
-  - Run at most one MissCat process per repository at any given time.
-  - Multiple MissCat instances or profiles pointing to the same repository would share and conflict over the same persistent workspace (`~/.cache/misscat/repos/<owner>/<repo>/` and `~/.cache/misscat/cats/<owner>/<repo>/`).
-
-## Reviewer backends
-
-MissCat is not tied to a specific AI reviewer.
-
-Initial backends:
-
-- Claude Code CLI
-- Codex CLI
-- Gemini via agy(Google Antigravity CLI)
-
-MissCat runs the selected reviewer CLI from the root of the prepared PR checkout. The CLI can therefore discover and apply its own repository instructions, such as `CLAUDE.md` or `AGENTS.md`, while `REVIEW.md` defines the review behavior requested by MissCat.
-
-MissCat does not parse or translate those instruction files.
-
-MissCat uses the authentication already configured in the reviewer CLI.
-The `args` field under `reviewer` can be used for CLI-specific execution options such as tool permissions, sandbox settings, or network access.
-
-GitHub repository and pull request access is handled through the authenticated GitHub CLI (`gh`).
-
-MissCat does not manage GitHub tokens, Git credentials, or AI API keys itself.
-
-## Adaptive polling
-
-When there are no open PRs, MissCat gradually becomes lazy:
-
-```text
-1m → 2m → 3m → 4m → 5m → 5m ...
-```
-
-After review work is complete, MissCat gives the author some time to make changes, then gets increasingly impatient:
-
-```text
-5m → 4m → 3m → 2m → 1m → 1m ...
-```
-
-By default MissCat runs one review at a time.
-
-When a review finishes successfully, it immediately checks the repository again before sleeping. If another PR or new HEAD is waiting, it reviews that next.
-
-If a review or workspace preparation fails, that HEAD is not marked reviewed. When every review of the batch failed (with the default single review, that one), MissCat waits 5 minutes before checking again; if at least one review succeeded, it re-lists PRs immediately (see `--cat` below).
-
-### Backlog bursts: `--cat=N`
+`pipx install misscat` also installs `badcat`, a deterministic watcher of submitted PR reviews (no AI). By default it only reports; it merges (squash) only with `--merge`.
 
 ```bash
-misscat . luna --cat=3
+badcat owner/repo                          # report only, no GitHub writes
+badcat . --merge                           # merge after +1 then +2 (batch-labeled PRs at +1)
+badcat . --merge=1                         # merge after +1
+badcat . --merge --trusted-reviewer luna   # trust reviews by this login (default: your gh user)
 ```
 
-When several reviews pile up, MissCat can briefly call the neighbor cats for help. `--cat=N` is the maximum number of reviews in one **batch**, not a permanently busy worker pool; `--cat=1` (the default) is the single-review behavior described above.
-
-On each fresh PR listing MissCat takes up to N waiting PR HEADs (same eligibility and oldest-first order), prepares one worktree per PR, runs the reviewers concurrently and **waits for the whole batch to finish**. A cat that finishes early does not pick up another PR. Successful reviews are then recorded in the state file by the main process, and PRs are listed again immediately. PRs labeled exactly `urgent` are selected first (then normal PRs fill the remaining slots). PRs labeled exactly `no-review` are never selected (even when also `urgent`), do not use a cat slot, and are not recorded in the state file; removing the label makes the current HEAD eligible again. Labels are case-sensitive, read from the same PR listing, and only affect the next batch selection, never a batch already running. Within urgent and normal PRs alike, the order is oldest-first with previously failed HEADs last. A failed review never discards the successes of its batch; failed HEADs stay eligible and go last in the next batch. If every review of a batch fails, MissCat waits 5 minutes.
-
-With `--cat` above 1, log lines carry the cat name (`cat-1`, ...). Each cat runs a full reviewer, so tokens and rate limits are used in parallel.
-
-## BadCat: review-state watcher and opt-in merge
-
-`pipx install misscat` also installs **BadCat**, a second CLI from the same package and version. BadCat is not an AI reviewer: it deterministically watches *submitted GitHub PR reviews*, reports state transitions, and squash-merges only when started with `--merge`.
-
-```bash
-misscat owner/repo luna     # AI review (unchanged)
-badcat owner/repo           # DEFAULT: monitor and report only; NO GitHub writes
-badcat owner/repo --merge   # +1 then +2; batch-labeled PRs merge at +1
-badcat . --merge=1          # merge after valid +1 (all PRs)
-badcat . --merge=2          # same as --merge; batch PRs merge at +1
-badcat . --merge --trusted-reviewer luna
-```
-
-- `.` resolves to the current repository's `origin` exactly as in MissCat.
-- Omitting `--merge` always means **notify only**, with no GitHub writes.
-  A bare `--merge` is an alias for `--merge=2`.
-  `--merge=1` authorizes any eligible PR at a valid `+1`.
-  `--merge=2` normally requires `+1` then `+2`, but an exactly `batch`-labeled
-  PR may merge at `+1` (`urgent` takes precedence if both labels are present).
-  Labels are checked again immediately before the merge. Only `1` and `2`
-  are accepted. This changes the review threshold,
-  **not** the required CI/mergeability checks or final HEAD protection.
-- All **open** PRs are watched, Draft or Ready alike. BadCat never reads, changes or decides from Draft status; if GitHub rejects a merge of a Draft PR, the rejection is reported and BadCat keeps watching.
-- No AI calls, no checkout, no clone. It uses your existing `gh` login (`gh auth login`); no tokens are stored. `--merge` needs a `gh` account with permission to merge.
-- Output reports transitions only, not repeated snapshots: new PR, new HEAD, each newly submitted review, CI/merge waits and readiness, merged or closed, and API errors. Each new review is announced as one line carrying its **literal first line**, whatever it says (`PR #290: +1`, `PR #292: ## 1차 리뷰 — 변경 요청`); no `INVALID` label or explanation is added to a nonconforming review. What is printed is separate from the strict validation below. When BadCat sees a PR for the first time it records the existing reviews silently and announces only later ones. Polling is every 60 seconds, backing off to 5 minutes on errors.
-
-```text
-10:00:00 INFO Watching owner/repo (notify only; trusted reviewers: luna)
-10:01:12 INFO PR #290: +1
-10:03:25 INFO PR #290: -1
-10:10:42 INFO PR #290: new HEAD (e4f5678)
-10:15:08 INFO PR #290: +2
-10:15:09 INFO PR #290: ready to merge (notify only)
-```
-
-### Review header
-
-Only a **submitted review** (GitHub state `COMMENTED`; not issue comments, inline-only comments or APPROVE) counts, and only if its raw body starts with exactly:
+A review counts only if it is a submitted `COMMENTED` review by a trusted login whose body starts with:
 
 ```text
 +1
-HEAD: <40 lowercase hex characters>
+HEAD: <40-hex sha of the PR's current HEAD>
 
 <review evidence>
 ```
-
-The first line is exactly `+1`, `+2` or `-1`: no leading blank or whitespace, decoration or explanation (`-1 : FAIL (blocker found)` is printed as-is but never authorizes). The second line is `HEAD: <sha>` immediately after. Evidence must follow. The header SHA, the review's `commit_id` and the PR's current HEAD must all match, so reviews of an old HEAD never carry forward.
-
-BadCat reduces submitted, trusted reviews chronologically (review ID breaks timestamp ties). A valid `-1` blocks and resets the approval sequence. A later valid `+1` clears the older blocker and starts a fresh Stage 1 pass; it also resets any earlier Stage 2 authorization. A valid `+2` authorizes Stage 2 only after an effective `+1` in this sequence. Thus `+1 → +2 → -1 → +1` is only `+1`, while `-1 → +1 → +2` is `READY`. Older verdicts remain in GitHub's audit history but no longer authorize or veto the current sequence.
-
-With `--merge` / `--merge=2`, the effective two-stage sequence is required except for `batch` PRs (effective `+1` suffices unless also labeled `urgent`); `--merge=1` accepts effective `+1` or `READY`. A latest trusted malformed/contradictory marker or non-pass review holds the HEAD until a new valid `+1` starts a clean sequence. `+2` alone never authorizes. `APPROVED`, `DISMISSED` and unsubmitted reviews neither pass nor hold; non-`COMMENTED` states never authorize. Reviews on an old HEAD do not carry forward.
-
-### Trust
-
-Only reviews by trusted logins count (fail closed). Use `--trusted-reviewer LOGIN` (repeatable); the default is the authenticated `gh` user. Stage 1 and Stage 2 may share one account.
-
-### Merge gate (`--merge`, `--merge=1` or `--merge=2` only)
-
-Immediately before the only write, BadCat re-reads the PR HEAD and all reviews, re-evaluates the chosen `+1`/`+2` threshold and blocks any new `-1` or malformed review, then requires:
-
-- CI, discovered automatically from GitHub for the exact HEAD, with no check name to configure: every reported check run, workflow run and commit status must be complete and passing (pending, failed, cancelled, timed out, action-required, stale or unreadable CI fails closed), and at least one check run created by **GitHub Actions** must have *succeeded*. Check names are repository-defined and never matched (`Validate and test Typewriter`, `unittest (3.12)`...). Skipped runs, other apps' checks and plain commit statuses are not evidence that tests ran, so a HEAD with no CI, only skipped CI, or only an unrelated green check is never merged. A successful workflow that deliberately skips work (for example a documentation-only change) counts as normal success. CI is re-read immediately before the merge, and a re-run on the same HEAD is picked up on the next poll.
-  - *Limitation:* the API cannot tell which checks a repository *requires*, so BadCat cannot notice a required check that never started if other Actions checks passed. Enable branch protection or rulesets for required checks: GitHub then reports the PR as not mergeable (`mergeable_state` other than clean) and rejects the merge, both of which BadCat honors,
-- GitHub to report the PR mergeable with a clean `mergeable_state` (so branch protection is honored).
-
-It then sends a **squash** merge with the expected HEAD SHA, so GitHub rejects it if the HEAD moved. There is no fallback to an unguarded merge. A rejection is logged once and not repeated until the PR's state changes; already merged or closed PRs are handled quietly. Disable any other automatic merger for the repository when using `--merge`.
-
-### State and process safety
-
-BadCat keeps its own notification-dedupe state in `~/.config/badcat/` and its own lock in `~/.cache/badcat/locks/`, separate from MissCat's. State never authorizes a merge (GitHub is always re-read), and unreadable state is ignored. One BadCat process per repository; MissCat and BadCat can run on the same repository at the same time.
-
-## badcat-host: Chrome Native Messaging host
-
-`pipx install misscat` also installs **`badcat-host`**, a small local host that applies BadCat's strict review protocol (its own program and poll loop, separate from the `badcat` CLI) and tells a local client (first: a future BadCat Chrome extension) when a PR HEAD reaches a valid `+1`. It is **read-only**: it never merges, reviews, or changes anything on GitHub, and it only uses your existing `gh` login (no tokens are read, sent or stored). The Chrome extension itself is not part of this package.
-
-Register it once for your user (macOS, no `sudo`), passing the extension's ID from `chrome://extensions`:
-
-```bash
-badcat-host install --extension-id <32-character-extension-id>
-```
-
-This writes `~/Library/Application Support/Google/Chrome/NativeMessagingHosts/com.genonfire.badcat_host.json`, allowing only `chrome-extension://<id>/` to start the host. Chrome launches `badcat-host` itself; it speaks Chrome's length-prefixed JSON on stdin/stdout (stdout carries protocol frames only, logs go to stderr) and exits when the connection closes.
-
-Protocol (the whole of it):
-
-```text
-client -> host  {"type": "start", "repo": "owner/repo"}   monitor one repo (replaces the previous one)
-client -> host  {"type": "stop"}
-host -> client  {"repo":"owner/repo","pr":123,"head":"<40-char SHA>","status":"+1","review_id":456,"delivery_id":"<32 hex>"}
-client -> host  {"type":"ack","repo":"owner/repo","pr":123,"head":"<40-char SHA>","review_id":456,"delivery_id":"<same nonce>"}
-host -> client  {"error": "<message>"}                     rejected request or failed start
-host -> client  {"warning": "<message>"}                   invalid ACK or delivery-state write failure
-```
-
-- An event identifies the **effective Stage 1 +1 review ID**, for the exact current HEAD and authenticated trusted user. `READY`, blocked, invalid, draft and closed PRs produce no handoff. A new effective `+1` after `-1` on the same HEAD is a new event. Shared BadCat protocol computes both the verdict and Stage 1 review ID.
-- `~/.config/badcat-host/` version-2 state records **acknowledged** `(repo, PR, HEAD, review ID)` deliveries, never mere stdout writes. An ACK must match an outstanding event and its connection-specific `delivery_id`; previous connections cannot acknowledge a new frame. Unacknowledged frames are retried after 60, 120, then at most once per 300 seconds, always after re-fetching effective GitHub state. Reconnecting can retry immediately. Superseded/closed/changed-HEAD events are discarded. Failed durable writes remain retryable.
-- Version-1 emitted HEADs are preserved and migrated once by suppressing only the **initial trusted, valid +1 review ID** for that HEAD. Later valid approvals, including `+1 → -1 → +1` already present at the first upgrade poll, stay eligible regardless of the state file's timestamp or unrelated PR activity. Events for migrated HEADs include this optional `legacy_review_id` so the extension's old HEAD key does not suppress the new approval. Version 1 did not store review IDs, so exact delivery recovery is impossible: a history with multiple approvals may cause a one-time extra handoff of a later approval that was already delivered. This favors delivering a new approval over permanently losing it, while avoiding replay of ordinary single-approval HEADs. Unreadable state is preserved and monitoring fails closed with a diagnostic.
-- `badcat-host` has its own poll loop, independent of BadCat's watcher: it polls every 60 seconds and backs off to 5 minutes on errors. It reuses only BadCat's `gh` client and review protocol. Any GitHub error fails closed: no event is sent until the next successful poll shows `+1`. Logs on stderr never include `gh`'s error text (only the HTTP status), since it could echo credentials.
-- Repository names and exact-event ACKs are validated strictly; only start, stop and acknowledgement requests are accepted from the client and no command is ever executed on its behalf.
-
-### MissCat Chrome extension (+1 → ChatGPT handoff)
-
-`extensions/badcat-chrome/` is a tiny local Chrome extension named **MissCat** in Chrome (the directory keeps its `badcat` name because it works with `badcat-host`) (plain Manifest V3, no npm, no build step) that talks to `badcat-host` and, when a PR reaches a valid `+1`, types `현재 작업 끝났으면 PR #<number> 리뷰해.` into your **current** ChatGPT conversation tab and submits it with the composer's send button (Enter only as a fallback). It is open source in this repository but is **not** part of the Python wheel and is not published to the Chrome Web Store.
-
-1. `chrome://extensions` → enable *Developer mode* → *Load unpacked* → pick `extensions/badcat-chrome/`.
-2. Register the native host for this extension (its ID is fixed by the `key` in `manifest.json`):
-
-```bash
-badcat-host install --extension-id iiaiioncejjhjmglaiionpmgpjminnkb
-```
-
-3. Open a ChatGPT conversation (`https://chatgpt.com/c/...`), click the MissCat icon, enter `owner/repo` and press **Catch 'em all, Meow!**. Press **Nap time, Meow!** to stop.
-
-- The popup is only a remote control: the MV3 service worker keeps the Native Messaging connection, so closing the popup does not stop monitoring. The session is bound to the tab you started it from; if that tab is closed or leaves the conversation, monitoring stops (it never switches to another tab). Only that tab can stop it: in any other tab's popup the button is disabled while a session is running, and the service worker refuses Start/Stop from other tabs. The extension finds ChatGPT's composer by its `contenteditable` + `data-composer-markdown` attributes and the send button as the `type="submit"` button in the composer's form. Reload an already-open ChatGPT tab once after installing the extension so its content script is present.
-- **Debug log:** when monitoring stops unexpectedly, the popup header's small **Copy log** link (right end, next to the status) copies the service worker's last 300 diagnostic entries (`chrome.storage.local`, `badcat.debuglog.v1`) to the clipboard: start/stop requests, host disconnects, tab events (`url` shape, `status`, `discarded`), delivery checks and handoff results, and the reason for every stop. For a "no longer a ChatGPT conversation" stop, the `update-not-conversation` entry holds both the URL the event reported and the tab's URL read at that moment, and the stop message ends in `[update: …]` or `[delivery: …]`. URLs are reduced to a shape (host plus a path whose long segments appear only as `<length:id>` or `<length:special>`); query strings, fragments, conversation or project IDs, the repository, SHAs and credentials are never logged. Logging is best-effort and never changes behavior.
-- Only `+1` events for the watched repo are acted on, once per repo + PR + HEAD + review ID (a fresh effective `+1` on the same HEAD hands off again). The ChatGPT message is fixed text built from the PR number; no review body, SHA, repo or credentials are sent. If the composer already holds text (e.g. an earlier handoff ChatGPT was too busy to accept), it is never cleared: the new command is appended after one space (`현재 작업 끝났으면 PR #365 리뷰해. 현재 작업 끝났으면 PR #366 리뷰해.`) and submitted again; a command already pending in the composer is not added twice. If submission fails (composer missing, ChatGPT still answering) it is retried twice and otherwise reported as a handoff failure in the popup and service-worker console; the text stays in the composer and the event is never marked delivered.
-- **Conversation-limit rollover (only while a `+1` is being handed off):** nothing watches ChatGPT's DOM while Watching is on, and an old conversation that already shows the maximum-length alert is never touched. Only when a validated `+1` is being delivered (or at the user's ON, see below) does the content script look, once, for the real alert, rendered on screen (an alert of an earlier chat that stays in the DOM hidden never counts) (an `aside[role="alert"]` whose text mentions the limit, with a `새 대화 시작` / `Start a new chat` button): before typing, and once more if a send fails (the alert may have appeared in response). On a confirmed alert it first announces the rollover to the service worker, which accepts that only from the bound tab's top frame with the live session id while a `+1` is pending and no other rollover is in progress, then clicks the button once and the **same pending event** is retried in the new chat (same tab, repo, native-host connection, delivery ID and ACK/dedupe rules). `https://chatgpt.com/` is a valid page only during that announced rollover (until the new conversation URL exists); a reloaded content script rebinds through a handshake the service worker answers only for the bound tab. Other navigation, Stop or closing the tab still ends the session. There is no forced redirect: ChatGPT keeps the project and restores the draft on its own new-chat page. If the old conversation was in a project (ID = the value between `/g/` and `/c/` in the URL), then before anything is typed the content script reads the selected project from the composer's selector (`data-composer-navigation-target="workspace-project"`, `aria-label` ending in `: <project name>`), opens its `role="dialog"` picker and requires exactly one `div[data-value]` entry with that name whose `data-value` equals the ID, or is the leading part of the URL segment followed by a dash (`<id>-<name-slug>`; never a mere prefix of a longer ID); a mismatch reports both IDs in the popup; it closes the picker, re-reads the composer (nothing is typed if it was re-mounted or its content changed meanwhile, e.g. a late-restored draft) and re-reads the picker again as the very last step before each click or Enter fallback (a project switched to a same-named one with another ID sends nothing). While a project rollover is pending, a conversation of any other project never receives a message (checked in the service worker and again in the content script right before sending). The page URL and the composer element must also be unchanged from the start of the handoff through every wait (composer, settle, project picker): if the tab moved to another chat meanwhile, nothing is typed or sent, checked again right before typing and before Enter / the send button. If ChatGPT leaves the new chat right after Enter and re-mounts the composer (so the old input node proves nothing), the send is confirmed only when the exact command shows up as a new user message bubble (`[data-user-message-bubble="true"]`, text compared exactly after trimming, no generated classes or turn IDs) in a conversation of the expected project; the handoff is then saved and acknowledged once. Otherwise it is reported as unconfirmed: it is never ACKed, never marked delivered, and never sent again automatically: the service worker stops retrying and records the event in `chrome.storage.local`, so a reloaded tab, a service-worker restart or a host replay of the same event is refused with the error kept in the popup. The send button is preferred (a synthetic Enter is not a trusted key press): it is waited for until enabled, and a button that stays disabled sends nothing; Enter is only used when there is no button or the click had no effect, and both use the same outcome check. A "rolling over" answer is progress, not a failed attempt: the service worker looks again shortly (bounded) without using up the delivery retries. After a rollover the project selector and its picker get a few bounded looks while they render; a definite ID mismatch or duplicate name is never retried. ChatGPT keeps hidden composers of earlier chats in the DOM (each with its own disabled send button), so only a composer that is actually rendered (non-zero size) is ever filled, read or submitted. Right before each send (a `+1` handoff and the ON test alike) a visible reasoning selector in the composer form (a `button[aria-haspopup="menu"]` whose text ends in `Low`/`Medium`/`High`) that reads `Medium` is raised to `High`: the menu is opened with a pointer event, one ArrowRight is sent to its slider row (`[data-reasoning-slider="true"]`, never to the neighbouring row that opens the model list), the `role="slider"` inside must reach `aria-valuemax`, and the menu is closed with Escape; `High` or any other level is left alone. This never blocks the send; if it fails the command is still sent and the ON test result notes it. The window does not need focus: if `insertText` (which needs a focused document) inserts nothing into an empty composer, the text is inserted once through a synthetic `paste` event instead (never into a composer that already holds a draft); if that fails too, nothing is sent. The composer fill is awaited until the text settles (whitespace re-wrapped by ProseMirror is tolerated), and in a new chat only the exact pending command (whitespace aside) is ever reused or sent. Right before the send the content script asks the service worker to persist an attempt marker for the event being sent (no marker, no send); if the messaging channel then breaks (e.g. a full page navigation right after the submit) the event stays blocked, while a channel error before any attempt, or a definite "not submitted", is retried as usual. Answers that arrive late from an older session (Stop, then Start) never change the new session's state. Check ChatGPT, then press Start again (Stop alone keeps the block) to clear the record; the host may then replay that event. A restored draft is only ever submitted if it is exactly the pending MissCat command; any other draft is kept untouched and the handoff stays retryable with an error. A duplicate name, a different ID, a missing selector/picker or a project switched at the last moment sends nothing.
-- **Watching ON test (real-browser check, no `+1` needed):** if the tab is a conversation that already shows the maximum-length alert, clicking **Catch 'em all, Meow!** runs one explicit test, once per ON. The service worker arms it only for that start; the content script clicks the alert's real button (`새 채팅에서 계속하기`, besides the earlier wordings) once, follows the same tab to the new chat (also after a full page reload) and waits for ChatGPT to restore the unsent draft. It submits only if the composer holds exactly one `현재 작업 끝났으면 PR #<n> 리뷰해.` and the selected project is verified against the original project ID exactly like a `+1` rollover; an empty, user-written, doubled or extended draft, a wrong or unverifiable project, a moved page or a disabled send button sends nothing, and no PR number is ever made up. Only the real send button is used here: no send button, or a click that does not empty the composer, is reported as a failure instead of falling back to a synthetic Enter. The single attempt is recorded in the service worker before the click. The result (success or the stage that failed: `navigation`, `restore`, `submit`) is shown in the popup as a test result only: it creates no event, delivered record or ACK and does not mean a review happened. Without a limit alert, ON just starts watching and touches nothing. The test never overlaps a real `+1`: from the click until its result is reported (including the window between the send marker and the confirmation), an incoming `+1` waits (bounded), and is checked again right before the tab is asked. A real handoff is recorded as pending (`repo#PR@HEAD:review_id`, in `chrome.storage.local`) only when it failed after the tab verified that the composer held that very command (a draft may then be restored later); failures that left nothing behind (composer missing, text never arrived) are not recorded, and a confirmed delivery removes the record. When the ON test is about to submit the restored `PR #N`, the pending events of that repo and PR, and the events for that PR that the host delivered while the test ran (their independence cannot be shown: they overlap it in time, including ones still queued behind another event), are tied to that command and moved to the same *uncertain* state as an unconfirmed send: never sent again, never ACKed, no timeout; only the user's next Start clears it. Every other event, including a new HEAD or a new review of the same PR that arrives after the test, is independent and delivered at once. If the test definitely submitted nothing, the tied events become retryable again. An event this extension never attempted and that did not overlap the test cannot be tied to the command and is delivered normally. The test never creates a fake `+1`, delivered record or ACK. If no content script answers (e.g. the extension was reloaded after the tab opened), ON injects it into that tab (`scripting` permission, `https://chatgpt.com/*` only) instead of asking for a page reload, which would make the limit alert disappear; only if injection fails does it ask for a reload. Keep watching afterwards as usual; Stop/Start arms a new test.
-- Confirmed submissions are saved in `chrome.storage.local` (the latest 500 identities) **before** ACK. Replayed IDs after a lost ACK or worker/browser restart are re-acknowledged without another message. Old session HEAD keys are baselined once to avoid replay while allowing later review IDs. The content script also remembers recent submissions while its tab stays open, serializes work, and cancels stale session work before typing or clicking. Stop/disconnect never sends an ACK to a replacement connection.
-- An ACK means **request submitted to ChatGPT**, not GitHub Stage 2 review completed. Neither a cleared composer nor delivery state grants `+2` or merge authorization. Retention is bounded; IDs evicted after 500 newer submissions are no longer guaranteed duplicate suppression by the extension, though acknowledged host state still prevents replay.
-- Permissions: `storage`, `nativeMessaging` and `https://chatgpt.com/*`. The extension never sees GitHub credentials; all GitHub access stays in `badcat-host` / `gh`.
-- Icons are the 16/32/48/128 px PNGs in `extensions/badcat-chrome/icons/`.
-- Tests (no install needed, Node ≥ 20): `node --test extensions/badcat-chrome/test/*.test.js` (also run by `python -m unittest` when `node` is available).
 
 ## What MissCat does
 
@@ -511,7 +296,6 @@ badcat-host install --extension-id iiaiioncejjhjmglaiionpmgpjminnkb
 - Discovers PRs created after MissCat starts
 - Detects changes by PR HEAD SHA
 - Reviews every new PR HEAD once per profile
-- Re-reviews an unchanged HEAD once when the PR author answers a blocking `-1` (see below)
 - Avoids duplicate reviews
 - Remembers reviewed commits across restarts
 - Uses an isolated persistent review workspace

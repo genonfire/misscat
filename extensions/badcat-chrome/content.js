@@ -3,7 +3,7 @@
 // submitted (e.g. ChatGPT still answering) is left in the composer; the next handoff is appended to it.
 (function () {
   'use strict';
-  const { isConversationUrl, isNewChatUrl, projectOf, reviewMessage, parseEvent, eventKey } = self.BadCatShared;
+  const { isConversationUrl, isNewChatUrl, projectOf, inProject, reviewMessage, parseEvent, eventKey } = self.BadCatShared;
 
   // ChatGPT's composer is a ProseMirror contenteditable. Match on semantic attributes only (no class
   // names or localized aria-labels); the send button is the submit button in the composer's own form (it sits outside [data-composer-input]).
@@ -284,7 +284,7 @@
     // After a rollover from a project the new chat must verifiably be in that same project, checked
     // before anything is typed; otherwise nothing is sent and the composer is left as it is.
     let verifiedName = null;
-    if (expectedProject && conversation && projectOf(location.href) !== expectedProject) {
+    if (expectedProject && conversation && !inProject(location.href, expectedProject)) {
       return { ok: false, error: 'the conversation is not in the original project' };
     }
     if (!conversation && expectedProject) {
@@ -343,7 +343,7 @@
     }
     if (!active()) return { ok: false, error: 'session stopped' };
     if (moved()) return changed;
-    if (expectedProject && conversation && projectOf(location.href) !== expectedProject) {
+    if (expectedProject && conversation && !inProject(location.href, expectedProject)) {
       return { ok: false, error: 'the conversation is not in the original project' };
     }
     if (verifiedName !== null && projectLabel() !== verifiedName) {
@@ -403,7 +403,7 @@
       // ChatGPT left the new chat and re-mounted the composer: the old node proves nothing. Only the exact
       // command appearing as a new user message (in a conversation of the expected project) confirms the send.
       const landed = () => countUserMessages(text) > before && (location.href === startUrl ||
-        (isConversationUrl(location.href) && (!expectedProject || projectOf(location.href) === expectedProject)));
+        (isConversationUrl(location.href) && (!expectedProject || inProject(location.href, expectedProject))));
       return (await waitFor(landed, 10000)) ? 'sent' : 'uncertain';
     };
     let outcome = await submit(button ? () => button.click() : () => pressEnter(composer));

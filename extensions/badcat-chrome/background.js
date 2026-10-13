@@ -2,7 +2,7 @@
 // The popup only asks it to start/stop; closing the popup changes nothing here.
 importScripts('shared.js');
 
-const { HOST_NAME, normalizeRepo, isConversationUrl, isNewChatUrl, urlShape, projectOf, parseEvent, eventKey } = self.BadCatShared;
+const { HOST_NAME, normalizeRepo, isConversationUrl, isNewChatUrl, urlShape, projectOf, inProject, parseEvent, eventKey } = self.BadCatShared;
 
 const SESSION_KEY = 'badcat.session'; // {active, repo, tabId, error, rollover?: {project}, explicit?: 'armed'|'running'|'used', test?: {ok, message}}
 const DELIVERED_KEY = 'badcat.delivered.v2';
@@ -406,7 +406,7 @@ async function deliverEvent(connection, message) {
     debugLog('delivery-check', { attempt: attemptNo, tab: urlShape(tab.url), rollover: Boolean(current.rollover), newChat: newChat, explicit: current.explicit || null });
     // Before the onUpdated handler has run, a conversation of another project must still not get a message.
     if (current.rollover && current.rollover.project && isConversationUrl(tab.url) &&
-        projectOf(tab.url) !== current.rollover.project) {
+        !inProject(tab.url, current.rollover.project)) {
       await deactivate('The new conversation is not in the original project.');
       return;
     }
@@ -632,7 +632,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
   if (isConversationUrl(changeInfo.url)) {
     if (!session.rollover) return;
     const { rollover: { project }, ...rest } = session; // rollover finished: the new conversation exists
-    if (project && projectOf(changeInfo.url) !== project) {
+    if (project && !inProject(changeInfo.url, project)) {
       await deactivate('The new conversation is not in the original project.');
       return;
     }
