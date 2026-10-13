@@ -17,13 +17,17 @@ async function boot({ session = INACTIVE, tabId = 7 } = {}) {
     addEventListener(type, fn) { handlers[type] = fn; }, ...extra,
   });
   const toggle = el();
-  const elements = { repo: el(), toggle, 'status-text': el(), error: el(), note: el() };
+  const copyHandlers = {};
+  const copyLog = el({ addEventListener(type, fn) { copyHandlers[type] = fn; } });
+  const elements = { repo: el(), toggle, 'status-text': el(), error: el(), note: el(), 'copy-log': copyLog };
+  const clipboard = [];
   const storageListeners = [];
   const chrome = {
     runtime: {
       async sendMessage(message) {
         sent.push(message);
         if (message.type === 'badcat:status') return { ok: true, session };
+        if (message.type === 'badcat:debug-log') return { ok: true, log: [{ event: 'deactivate' }] };
         return { ok: true };
       },
     },
@@ -39,13 +43,14 @@ async function boot({ session = INACTIVE, tabId = 7 } = {}) {
       body: { classList: { toggle() {} } },
     },
     chrome,
+    navigator: { clipboard: { async writeText(text) { clipboard.push(text); } } },
     self: { BadCatShared: require('../shared.js') },
   };
   vm.createContext(context);
   vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'popup.js'), 'utf8'), context);
   await new Promise((r) => setImmediate(r)); // let init() finish
   const changeSession = (next) => storageListeners.forEach((fn) => fn({ 'badcat.session': { newValue: next } }, 'session'));
-  return { toggle, sent, click: () => handlers.click(), changeSession, elements };
+  return { toggle, sent, click: () => handlers.click(), changeSession, elements, copyLog: () => copyHandlers.click(), clipboard };
 }
 
 test('on the tab that started the session the toggle works and stops it with that tab id', async () => {
@@ -76,4 +81,12 @@ test('a session change re-evaluates the control', async () => {
 test('without a known current tab an active session cannot be controlled', async () => {
   const t = await boot({ session: ACTIVE, tabId: null });
   assert.equal(t.toggle.disabled, true);
+});
+
+test('Copy debug log puts the worker log on the clipboard', async () => {
+  const t = await boot({ session: ACTIVE, tabId: 7 });
+  await t.copyLog();
+  assert.equal(t.clipboard.length, 1);
+  assert.equal(JSON.parse(t.clipboard[0])[0].event, 'deactivate');
+  assert.match(t.elements.note.textContent, /copied \(1 entries\)/);
 });

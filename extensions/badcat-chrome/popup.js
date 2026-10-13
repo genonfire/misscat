@@ -71,6 +71,22 @@
     }
   }
 
+  // For bug reports: what the worker saw around a stop (URL shapes and states only, no ids or queries).
+  async function copyLog() {
+    const result = await ask({ type: 'badcat:debug-log' });
+    if (!result.ok) {
+      showError(result.error);
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(result.log, null, 1));
+      noteEl.textContent = 'Debug log copied (' + result.log.length + ' entries).';
+      noteEl.hidden = false;
+    } catch (e) {
+      showError('Cannot copy the debug log.');
+    }
+  }
+
   async function init() {
     const stored = await chrome.storage.local.get(REPO_KEY);
     if (typeof stored[REPO_KEY] === 'string') repoInput.value = stored[REPO_KEY];
@@ -81,6 +97,7 @@
     if (!status.ok) showError(status.error);
 
     toggle.addEventListener('click', onToggle);
+    document.getElementById('copy-log').addEventListener('click', copyLog);
     repoInput.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && !active && !toggle.disabled) onToggle();
     });

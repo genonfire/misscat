@@ -1002,3 +1002,37 @@ test('the explicit send marker is single-use and the state stays running until t
   assert.equal(t.session().explicit, 'running');
   assert.equal((await t.fromContent({ type: 'badcat:hello' })).explicit, undefined); // a reload must not resubmit
 });
+
+const debugLog = async (t) => (await t.popup({ type: 'badcat:debug-log' })).log;
+
+test('a not-a-conversation stop is explained by the debug log: the event URL, the tab URL now, and the stop', async () => {
+  const t = await started();
+  t.tabs[7].url = 'https://chatgpt.com/c/6ace08b6-d7f8-83ee?secret=1#frag';
+  await t.listeners['tabs.onUpdated'](7, { url: 'https://example.com/path/a:b:c:d?token=abc' });
+  const log = await debugLog(t);
+  const events = log.map((e) => e.event);
+  assert.deepEqual(events.slice(-3), ['tab-updated', 'update-not-conversation', 'deactivate']);
+  const detail = log.find((e) => e.event === 'update-not-conversation');
+  assert.equal(detail.fromEvent, 'https://example.com/path/<7:special>');
+  assert.equal(detail.tabNow, 'https://chatgpt.com/c/<18:id>');
+  assert.match(log[log.length - 1].error, /^The tab is no longer a ChatGPT conversation\. \[update: /);
+});
+
+test('the debug log never contains query strings, fragments, ids or the repository', async () => {
+  const t = await started();
+  t.tabs[7].url = 'https://chatgpt.com/g/g-p-123456-proj/c/6ace08b6-d7f8-83ee?secret=1#frag';
+  await t.listeners['tabs.onUpdated'](7, { url: t.tabs[7].url, status: 'loading' });
+  t.natives[0].emit(plus1(9, HEAD1));
+  await t.settle();
+  const text = JSON.stringify(await debugLog(t));
+  for (const leaked of ['secret', 'frag', '6ace08b6', 'g-p-123456', HEAD1, 'o/r']) assert.ok(!text.includes(leaked), leaked);
+  assert.ok(text.includes('tab-updated') && text.includes('delivery-check'));
+});
+
+test('the debug log keeps only the most recent entries', async () => {
+  const t = await started();
+  for (let i = 0; i < 350; i++) await t.listeners['tabs.onUpdated'](7, { status: 'loading' });
+  const log = await debugLog(t);
+  assert.equal(log.length, 300);
+  assert.equal(log[log.length - 1].event, 'tab-updated');
+});
