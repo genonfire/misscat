@@ -2,7 +2,7 @@
 // The popup only asks it to start/stop; closing the popup changes nothing here.
 importScripts('shared.js');
 
-const { HOST_NAME, normalizeRepo, isConversationUrl, isNewChatUrl, projectOf, parseEvent, eventKey } = self.BadCatShared;
+const { HOST_NAME, normalizeRepo, isConversationUrl, isNewChatUrl, isTransientConversationUrl, projectOf, parseEvent, eventKey } = self.BadCatShared;
 
 const SESSION_KEY = 'badcat.session'; // {active, repo, tabId, error, rollover?: {project}, explicit?: 'armed'|'running'|'used', test?: {ok, message}}
 const DELIVERED_KEY = 'badcat.delivered.v2';
@@ -381,6 +381,11 @@ async function deliverEvent(connection, message) {
       return;
     }
     if (!isConversationUrl(tab.url) && !newChat) {
+      if (isTransientConversationUrl(tab.url)) {
+        // A transient ChatGPT route: not a submission failure and not a reason to stop; retry, keep the session.
+        attemptNo += 1;
+        continue;
+      }
       await deactivate('The tab is no longer a ChatGPT conversation.');
       return;
     }
@@ -594,5 +599,6 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
     return;
   }
   if (rolloverPage(session, changeInfo.url)) return;
+  if (isTransientConversationUrl(changeInfo.url)) return; // transient ChatGPT route; delivery re-checks the URL before any send
   await deactivate('The tab is no longer a ChatGPT conversation.');
 });

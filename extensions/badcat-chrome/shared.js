@@ -32,6 +32,18 @@
       CONVERSATION_PATH_RE.test(parsed.pathname);
   }
 
+  // A ChatGPT conversation route whose id is not (yet) a plain id, e.g. a client-side /c/WEB:<uuid> while a
+  // chat is being created. Not a conversation to send into, but also not a reason to stop watching.
+  function isTransientConversationUrl(url) {
+    try {
+      const parsed = new URL(url);
+      return parsed.protocol === 'https:' && parsed.hostname === 'chatgpt.com' &&
+        /\/c\/[^/]+\/?$/.test(parsed.pathname) && !isConversationUrl(url);
+    } catch (e) {
+      return false;
+    }
+  }
+
   // The new-chat landing route ChatGPT shows after "새 대화 시작": a valid state only mid-rollover.
   function isNewChatUrl(url) {
     let parsed;
@@ -93,6 +105,7 @@
     normalizeRepo: normalizeRepo,
     isConversationUrl: isConversationUrl,
     isNewChatUrl: isNewChatUrl,
+    isTransientConversationUrl: isTransientConversationUrl,
     projectOf: projectOf,
     parseEvent: parseEvent,
     eventKey: eventKey,

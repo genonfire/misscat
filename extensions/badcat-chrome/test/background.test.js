@@ -137,6 +137,17 @@ test('a tab that is no longer a conversation at delivery time fails safely', asy
   assert.equal(t.session().active, false);
 });
 
+test('a transient ChatGPT route keeps the session alive and sends nothing', async () => {
+  const t = await started();
+  await t.listeners['tabs.onUpdated'](7, { url: 'https://chatgpt.com/c/WEB:1234' });
+  assert.equal(t.session().active, true);
+  t.tabs[7].url = 'https://chatgpt.com/c/WEB:1234';
+  t.natives[0].emit(plus1(9, HEAD1));
+  await t.settle();
+  assert.equal(t.sent.length, 0);
+  assert.equal(t.session().active, true);
+});
+
 test('a host error or disconnect marks the session inactive with a reason', async () => {
   let t = await started();
   t.natives[0].emit({ error: 'cannot determine the authenticated gh user' });
