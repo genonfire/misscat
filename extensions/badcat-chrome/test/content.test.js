@@ -925,3 +925,25 @@ test('project check: a longer or different ID is still a mismatch and the IDs ar
     assert.deepEqual(t.log.submitted, []);
   }
 });
+
+// --- ChatGPT keeps a hidden composer of an earlier chat first in the DOM; only the rendered one is used ---
+test('a hidden composer in the DOM is ignored: the visible one is filled and its send button clicked', async () => {
+  const t = boot({ buttonSubmits: true, enterSubmits: false, ghostComposer: true });
+  const res = await t.send({ type: 'badcat:handoff', pr: 123 });
+  assert.equal(res.ok, true, res.error);
+  assert.deepEqual(t.log.submitted, [TEXT]);
+  assert.equal(t.log.clicks, 1);
+  assert.equal(t.log.ghostClicks, 0);
+  assert.equal(t.log.ghostEvents, 0);
+  assert.equal(t.ghost.textContent, 'ghost draft');
+});
+
+test('ON test on a new chat ignores the hidden composer too', async () => {
+  const t = newChatBoot({ ghostComposer: true });
+  await t.send({ type: 'badcat:activate', session: SESSION });
+  await probe(t);
+  const result = await explicitDone(t);
+  assert.equal(result.ok, true, result.message);
+  assert.deepEqual(t.log.submitted, [RESTORED]);
+  assert.equal(t.log.ghostClicks, 0);
+});

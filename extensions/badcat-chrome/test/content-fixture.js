@@ -49,11 +49,11 @@ function node(tag, attrs = {}, children = []) {
   return el;
 }
 
-function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubmits = false, sendButton = true, initial = '', label = 'Code Review의 새 채팅', rollover = { ok: true }, hello = { ok: false }, attempt = { ok: true }, selector = null, menu = [], renameOnFill = null, restoreOnMenuOpen = null, alertOnEnter = null, onTimer = null, lateComposer = false, navigateOnMenuOpen = null, afterSubmit = null, priorBubbles = [], buttonDisabled = false, emptyMenuOpens = 0, menuLater = null, fillDelayed = false, execFails = false, pasteFails = false } = {}) {
+function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubmits = false, sendButton = true, initial = '', label = 'Code Review의 새 채팅', rollover = { ok: true }, hello = { ok: false }, attempt = { ok: true }, selector = null, menu = [], renameOnFill = null, restoreOnMenuOpen = null, alertOnEnter = null, onTimer = null, lateComposer = false, navigateOnMenuOpen = null, afterSubmit = null, priorBubbles = [], buttonDisabled = false, emptyMenuOpens = 0, menuLater = null, fillDelayed = false, execFails = false, pasteFails = false, ghostComposer = false } = {}) {
   let delayedFill = null;
   let now = 0; // virtual clock: waits finish instantly
   let enterSubmitsNow = enterSubmits;
-  const log = { submitted: [], keys: [], clicks: 0, decoyClicks: 0, fills: [], pastes: [] };
+  const log = { submitted: [], keys: [], clicks: 0, decoyClicks: 0, fills: [], pastes: [], ghostClicks: 0, ghostEvents: 0 };
 
   const editor = node('div', { contenteditable: 'true', 'data-composer-markdown': '', class: 'ProseMirror', 'aria-label': label });
   Object.assign(editor, {
@@ -118,7 +118,14 @@ function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubm
     node('footer', {}, [stopOrVoice, ...(sendButton ? [send] : [])]),
   ]);
   const prior = priorBubbles.map((t) => { const b = node('div', { 'data-user-message-bubble': 'true' }); b.textContent = t; return b; });
-  const page = node('body', {}, [...prior, node('form', {}, [otherSubmit]), legacy, ...(composer ? [otherEditable] : []), form]);
+  // An older chat's composer that ChatGPT keeps in the DOM, hidden, before the live one: its send button stays disabled.
+  const ghostSend = node('button', { type: 'submit' });
+  ghostSend.disabled = true;
+  ghostSend.click = () => { log.ghostClicks += 1; };
+  const ghost = node('div', { contenteditable: 'true', 'data-composer-markdown': '' });
+  Object.assign(ghost, { textContent: 'ghost draft', offsetWidth: 0, offsetHeight: 0, focus() {}, dispatchEvent() { log.ghostEvents += 1; return true; } });
+  const ghostForm = node('form', {}, [node('div', { 'data-composer-input': '' }, [node('div', {}, [ghost])]), node('footer', {}, [ghostSend])]);
+  const page = node('body', {}, [...(ghostComposer ? [ghostForm] : []), ...prior, node('form', {}, [otherSubmit]), legacy, ...(composer ? [otherEditable] : []), form]);
 
   // The project selector in the composer footer; clicking it lists the projects as [data-value] items.
   let projectMenu = null;
@@ -208,7 +215,7 @@ function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubm
     const keep = listeners[0](message, sender, resolve);
     if (!keep) resolve(undefined);
   });
-  return { log, ctx, selectorButton, runtimeCalls, observers, limitAlert, mutate, setUrl: (u) => { ctx.url = u; }, editor, sendButton: send, setMenu: (m) => { menu = m; }, settle: () => new Promise((r) => setImmediate(r)), send: sendMessage, text, setEnterSubmits: (v) => { enterSubmitsNow = v; } };
+  return { ghost, log, ctx, selectorButton, runtimeCalls, observers, limitAlert, mutate, setUrl: (u) => { ctx.url = u; }, editor, sendButton: send, setMenu: (m) => { menu = m; }, settle: () => new Promise((r) => setImmediate(r)), send: sendMessage, text, setEnterSubmits: (v) => { enterSubmitsNow = v; } };
 }
 
 module.exports = { bootContent: boot };

@@ -20,6 +20,14 @@
   const MENUS = '[role="dialog"]'; // the project picker opens as a dialog of div[data-value] entries
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+  // ChatGPT keeps hidden composers of earlier chats in the DOM (with their own, disabled send button): only the
+  // one that is actually rendered may be filled or submitted. Without layout information it counts as visible.
+  const isVisible = (el) => el.offsetWidth === undefined || Boolean(el.offsetWidth || el.offsetHeight);
+  function findComposer() {
+    for (const el of document.querySelectorAll(COMPOSER)) if (isVisible(el)) return el;
+    return null;
+  }
+
   async function waitFor(check, timeoutMs) {
     const deadline = Date.now() + timeoutMs;
     for (;;) {
@@ -197,12 +205,12 @@
     const limit = await rolloverOnce(session); // an already-limited conversation cannot take the command
     if (limit) return limit;
     if (!active()) return { ok: false, error: 'session stopped' };
-    let composer = await waitFor(() => document.querySelector(COMPOSER), 5000);
+    let composer = await waitFor(() => findComposer(), 5000);
     if (!active()) return { ok: false, error: 'session stopped' };
     if (!composer) return (await rolloverOnce(session)) || { ok: false, error: 'composer not found' };
     // Every asynchronous step below may let the user (or ChatGPT) move to another chat: the decision to
     // type or send is never based on what was true at the start, only on the live page and composer.
-    const moved = () => location.href !== startUrl || document.querySelector(COMPOSER) !== composer;
+    const moved = () => location.href !== startUrl || findComposer() !== composer;
     if (moved()) return changed;
 
     if (!conversation) {
@@ -238,7 +246,7 @@
       if (location.href !== startUrl) return changed;
       // The picker took a while: ChatGPT may have re-mounted the composer (the old node is gone) or restored a
       // draft meanwhile. A new node of the same new chat is adopted if it holds nothing but this very command.
-      const live = document.querySelector(COMPOSER);
+      const live = findComposer();
       if (!live) return changed;
       if (live !== composer) {
         const now = readComposer(live);
@@ -371,10 +379,10 @@
   // Stage 2: in the new chat, submit the restored command with the real send button.
   async function continueExplicit(session, project) {
     const fail = (stage, error) => reportExplicit(session, { ok: false, message: stage + ': ' + error });
-    const reachedNewChat = await waitFor(() => isNewChatUrl(location.href) && document.querySelector(COMPOSER), 15000);
+    const reachedNewChat = await waitFor(() => isNewChatUrl(location.href) && findComposer(), 15000);
     if (!reachedNewChat) return fail('navigation', 'did not reach a new chat');
     await sleep(NEW_CHAT_SETTLE_MS);
-    const draftOf = () => { const c = document.querySelector(COMPOSER); return c ? normalize(readComposer(c)) : ''; };
+    const draftOf = () => { const c = findComposer(); return c ? normalize(readComposer(c)) : ''; };
     const draft = await waitFor(() => RESTORED_RE.test(draftOf()) ? draftOf() : null, 8000);
     if (!draft) {
       return fail('restore', draftOf() === '' ? 'ChatGPT restored no command; nothing sent'
