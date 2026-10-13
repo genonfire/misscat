@@ -431,6 +431,7 @@
   const RESTORED_RE = /^현재 작업 끝났으면 PR #([1-9][0-9]*) 리뷰해\.$/; // the exact MissCat command, nothing else
   let explicitRunning = false;
   const reportExplicit = (session, result) =>
+    console.log('badcat ON test:', result.none ? 'no limit alert' : (result.ok ? 'ok' : 'failed') + ' ' + (result.message || '')) ||
     chrome.runtime.sendMessage({ type: 'badcat:explicit-result', session: session, ...result }).catch(() => {});
 
   // Stage 2: in the new chat, submit the restored command with the real send button.

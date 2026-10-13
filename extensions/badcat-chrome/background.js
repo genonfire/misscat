@@ -439,6 +439,7 @@ async function explicitResult(message, sender) {
   }
   if (explicit !== 'running' && explicit !== 'used') return { ok: false };
   const text = String(message.message || '').slice(0, 200);
+  console.log('ON test:', message.ok === true ? 'ok' : 'failed', text);
   await setSession({ ...rest, explicit: 'used', test: { ok: message.ok === true, message: text },
     error: message.ok === true ? rest.error : 'ON test: ' + text });
   return { ok: true };

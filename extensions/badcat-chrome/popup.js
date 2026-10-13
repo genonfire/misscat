@@ -33,7 +33,8 @@
     repoInput.readOnly = active;
     if (active) repoInput.value = session.repo;
     if (session && session.error) showError(session.error);
-    noteEl.textContent = session && session.test && session.test.ok ? session.test.message : '';
+    // The ON test result stays visible (a later retry error must not hide why the test failed).
+    noteEl.textContent = session && session.test ? (session.test.ok ? '' : 'ON test failed: ') + session.test.message : '';
     noteEl.hidden = !noteEl.textContent;
     updateToggle();
   }
