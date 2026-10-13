@@ -958,6 +958,7 @@ test('reasoning Medium is raised to High with one ArrowRight on the menu row, th
   assert.equal(t.effortLevel(), 'High');
   assert.equal(res.note, 'reasoning set to High');
   assert.equal(t.log.effortEvents.filter((e) => e === 'row:keydown:ArrowRight').length, 1);
+  assert.deepEqual(t.log.effortEvents.filter((e) => e.startsWith('decoy:')), []); // never the model-list row
   assert.ok(t.log.effortEvents.includes('pointerdown')); // opened the way such menus open
   assert.equal(t.log.effortClicks, 0);
   assert.deepEqual(t.log.submitted, [TEXT]);

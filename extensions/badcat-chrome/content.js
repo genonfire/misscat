@@ -127,9 +127,11 @@
   }
 
   // The reasoning-effort selector of the composer (observed: a visible button with aria-haspopup="menu" whose text
-  // ends with the current level, e.g. "추론 수준Medium"). Its menu is a slider row: ArrowRight raises it one step.
+  // ends with the current level, e.g. "추론 수준Medium"). Its menu holds a slider row
+  // (data-reasoning-slider, aria-keyshortcuts="ArrowLeft ArrowRight", levels 0..2) next to an unrelated row that
+  // only shows the level and opens the model list: keys go to the slider row, never to that one.
   const EFFORT_TRIGGER = 'button[aria-haspopup="menu"]';
-  const EFFORT_ITEM = '[role="menuitem"]';
+  const EFFORT_SLIDER = '[data-reasoning-slider="true"]';
   const LEVEL_RE = /(Low|Medium|High)\s*$/i;
   const keyEvent = (type, key, code, keyCode) =>
     new KeyboardEvent(type, { key: key, code: code, keyCode: keyCode, which: keyCode, bubbles: true, cancelable: true });
@@ -143,7 +145,11 @@
     const level = () => { const m = LEVEL_RE.exec((trigger.textContent || '').trim()); return m ? m[1].toLowerCase() : ''; };
     if (level() === 'high') return 'reasoning already High';
     if (level() !== 'medium') return 'reasoning is ' + level() + '; left unchanged';
-    const row = () => [...document.querySelectorAll(EFFORT_ITEM)].find((el) => isVisible(el) && LEVEL_RE.test((el.textContent || '').trim()));
+    const row = () => [...document.querySelectorAll(EFFORT_SLIDER)].find(isVisible);
+    const atMax = () => {
+      const slider = row() && row().querySelector('[role="slider"]');
+      return Boolean(slider) && slider.getAttribute('aria-valuenow') === slider.getAttribute('aria-valuemax');
+    };
     const close = async () => {
       const open = row();
       if (open) open.dispatchEvent(keyEvent('keydown', 'Escape', 'Escape', 27));
@@ -162,7 +168,7 @@
     if (typeof item.focus === 'function') item.focus();
     item.dispatchEvent(keyEvent('keydown', 'ArrowRight', 'ArrowRight', 39));
     item.dispatchEvent(keyEvent('keyup', 'ArrowRight', 'ArrowRight', 39));
-    const raised = await waitFor(() => /high\s*$/i.test((((row() || {}).textContent) || '').trim()) || level() === 'high', 2000);
+    const raised = await waitFor(() => atMax() || level() === 'high', 2000);
     await close();
     if (!raised) return 'could not raise the reasoning to High; left at Medium';
     return await waitFor(() => level() === 'high', 1500) ? 'reasoning set to High' : 'reasoning change to High not confirmed';

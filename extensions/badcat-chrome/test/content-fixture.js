@@ -124,20 +124,25 @@ function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubm
     const trigger = node('button', { type: 'button', 'aria-haspopup': 'menu', 'aria-label': 'ChatGPT 모델 선택' });
     trigger.textContent = '추론 수준' + effortLevel;
     const openMenu = () => {
-      const row = node('div', { role: 'menuitem' });
-      row.textContent = effortLevel;
+      // The first row only shows the level and leads to the model list: it must never receive the arrow key.
+      const decoy = node('div', { role: 'menuitem', 'aria-label': '모델 선택' });
+      decoy.textContent = effortLevel;
+      decoy.focus = () => {};
+      decoy.dispatchEvent = (ev) => { log.effortEvents.push('decoy:' + ev.type + ':' + ev.key); return true; };
+      const slider = node('span', { role: 'slider', 'aria-valuemin': '0', 'aria-valuemax': '2', 'aria-valuenow': effortLevel === 'Medium' ? '1' : '2' });
+      const row = node('div', { role: 'menuitem', 'data-reasoning-slider': 'true', 'aria-label': '파워' }, [slider]);
       row.focus = () => {};
       row.dispatchEvent = (ev) => {
         log.effortEvents.push('row:' + ev.type + ':' + ev.key);
         if (ev.type === 'keydown' && ev.key === 'ArrowRight' && arrowRaises && effortLevel === 'Medium') {
           effortLevel = 'High';
-          row.textContent = 'High';
+          slider.attrs['aria-valuenow'] = '2';
           trigger.textContent = '추론 수준High';
         }
         if (ev.type === 'keydown' && ev.key === 'Escape') { page.children.splice(page.children.indexOf(effortMenu), 1); effortMenu = null; }
         return true;
       };
-      effortMenu = node('div', { role: 'menu' }, [row]);
+      effortMenu = node('div', { role: 'menu' }, [decoy, row]);
       effortMenu.parentElement = page;
       page.children.push(effortMenu);
     };
