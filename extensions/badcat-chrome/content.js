@@ -257,9 +257,10 @@
     if (conversation ? !containsCommand(now, text) : now !== text) {
       return { ok: false, error: 'the composer changed before sending; not sent' };
     }
-    // The selection may have changed (to a same-named project of another ID) while the text was typed and the
-    // button awaited: the picker is read again right before anything is recorded or sent.
-    if (verifiedName !== null) {
+    // The selection may change (to a same-named project of another ID) at any moment before the send: the picker
+    // is read again as the very last step before each click / Enter, and a mismatch sends nothing.
+    const projectStillRight = async () => {
+      if (verifiedName === null) return null;
       const again = await verifyProject(expectedProject);
       if (!active()) return { ok: false, error: 'session stopped' };
       if (!again.name || again.name !== verifiedName || projectLabel() !== verifiedName) {
@@ -267,7 +268,8 @@
       }
       if (moved()) return changed;
       if (normalize(readComposer(composer)) !== text) return { ok: false, error: 'the composer changed before sending; not sent' };
-    }
+      return null;
+    };
     // The real send button is preferred: a synthetic Enter is not a trusted key press. It may need a moment to
     // become enabled after the text arrived; a button that stays disabled (e.g. ChatGPT is answering) means no send.
     const isEnabled = (b) => b && !b.disabled && b.getAttribute('aria-disabled') !== 'true';
@@ -289,6 +291,9 @@
       if (!active()) return { ok: false, error: 'session stopped' };
       if (moved()) return changed;
     }
+    const stop = await projectStillRight();
+    if (stop) return stop;
+    if (button && !isEnabled(button)) return { ok: false, error: 'the send button is disabled; not sent' };
     const before = countUserMessages(text);
     // The button and Enter share one outcome routine: 'sent' (composer emptied in place, or the exact
     // command appeared as a new user message), 'uncertain' (the page moved on without that proof) or 'pending'.
@@ -304,7 +309,11 @@
     };
     let outcome = await submit(button ? () => button.click() : () => pressEnter(composer));
     // The button was accepted but nothing happened: Enter as the fallback, never after the page moved on.
-    if (outcome === 'pending' && button && active() && !moved()) outcome = await submit(() => pressEnter(composer));
+    if (outcome === 'pending' && button && active() && !moved()) {
+      const recheck = await projectStillRight();
+      if (recheck) return recheck;
+      outcome = await submit(() => pressEnter(composer));
+    }
     if (outcome === 'uncertain') {
       if (key) uncertain.add(key);
       return UNCERTAIN; // it may have gone out: never resend automatically

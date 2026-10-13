@@ -628,13 +628,36 @@ test('#64: a replayed event after a confirmed send is acknowledged without anoth
   assert.deepEqual(t.log.submitted, [TEXT]);
 });
 
-test('#64 review: the picker is re-read right before sending; a same-named project with another ID sends nothing and records no attempt', async () => {
+test('#64 review: the picker is re-read right before sending; a same-named project with another ID sends nothing', async () => {
   const t = await activated({ ...projectOpts({ menuLater: [{ text: 'Code Review', value: 'g-p-777' }] }), buttonSubmits: true });
   const res = await t.send(handoffMsg({ project: SLUG }));
   assert.equal(res.ok, false);
   assert.match(res.error, /selected project changed/);
   assert.equal(t.log.clicks + t.log.keys.length, 0);
   assert.deepEqual(t.log.submitted, []);
-  assert.equal(t.runtimeCalls.some((m) => m.type === 'badcat:attempt'), false);
+  // the attempt marker may exist: a definite failure answer makes the worker withdraw it
   assert.equal(t.selectorButton.attrs['aria-expanded'], 'false');
+});
+
+test('#64 review: the project switches to a same-named other ID while the send button is awaited: nothing is clicked', async () => {
+  let t;
+  t = await activated({ ...projectOpts({ buttonDisabled: true, fillDelayed: true }), buttonSubmits: true,
+    onTimer: () => { if (t && t.text() === TEXT && t.sendButton.disabled) { t.sendButton.disabled = false; t.setMenu([{ text: 'Code Review', value: 'g-p-777' }]); } } });
+  const res = await t.send(handoffMsg({ project: SLUG }));
+  assert.equal(res.ok, false);
+  assert.match(res.error, /selected project changed/);
+  assert.equal(t.log.clicks + t.log.keys.length, 0);
+  assert.deepEqual(t.log.submitted, []);
+});
+
+test('#64 review: the project switches after a click that had no effect: the Enter fallback is not pressed', async () => {
+  let t;
+  t = await activated({ ...projectOpts(), enterSubmits: true, buttonSubmits: false,
+    onTimer: () => { if (t && t.log.clicks === 1) t.setMenu([{ text: 'Code Review', value: 'g-p-777' }]); } });
+  const res = await t.send(handoffMsg({ project: SLUG }));
+  assert.equal(res.ok, false);
+  assert.match(res.error, /selected project changed/);
+  assert.equal(t.log.clicks, 1);
+  assert.deepEqual(t.log.keys, []);
+  assert.deepEqual(t.log.submitted, []);
 });
