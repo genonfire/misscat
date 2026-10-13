@@ -2,7 +2,7 @@
 // The popup only asks it to start/stop; closing the popup changes nothing here.
 importScripts('shared.js');
 
-const { HOST_NAME, normalizeRepo, isConversationUrl, isNewChatUrl, projectOf, parseEvent, eventKey } = self.BadCatShared;
+const { HOST_NAME, normalizeRepo, isConversationUrl, isNewChatUrl, urlShape, projectOf, parseEvent, eventKey } = self.BadCatShared;
 
 const SESSION_KEY = 'badcat.session'; // {active, repo, tabId, error, rollover?: {project}, explicit?: 'armed'|'running'|'used', test?: {ok, message}}
 const DELIVERED_KEY = 'badcat.delivered.v2';
@@ -381,7 +381,7 @@ async function deliverEvent(connection, message) {
       return;
     }
     if (!isConversationUrl(tab.url) && !newChat) {
-      await deactivate('The tab is no longer a ChatGPT conversation.');
+      await deactivate('The tab is no longer a ChatGPT conversation. [delivery: ' + urlShape(tab.url) + ']');
       return;
     }
 
@@ -594,5 +594,5 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
     return;
   }
   if (rolloverPage(session, changeInfo.url)) return;
-  await deactivate('The tab is no longer a ChatGPT conversation.');
+  await deactivate('The tab is no longer a ChatGPT conversation. [update: ' + urlShape(changeInfo.url) + ']');
 });

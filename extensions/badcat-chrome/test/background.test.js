@@ -124,8 +124,9 @@ test('closing the target tab stops the session and never picks another tab', asy
 
 test('navigating the target tab away from a conversation stops the session', async () => {
   const t = await started();
-  await t.listeners['tabs.onUpdated'](7, { url: 'https://example.com/' });
+  await t.listeners['tabs.onUpdated'](7, { url: 'https://example.com/?q=secret' });
   assert.equal(t.session().active, false);
+  assert.match(t.session().error, /\[update: https:\/\/example\.com\/\]$/);
 });
 
 test('a tab that is no longer a conversation at delivery time fails safely', async () => {

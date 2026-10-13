@@ -75,3 +75,12 @@ test('isNewChatUrl accepts only the chatgpt.com root; projectOf reads the projec
   assert.equal(S.projectOf('https://chatgpt.com/c/68a1'), null);
   assert.equal(S.projectOf('nope'), null);
 });
+
+test('urlShape describes a URL without query, fragment or ids', () => {
+  const { urlShape } = require('../shared.js');
+  assert.equal(urlShape('https://chatgpt.com/g/g-p-6acc-code-review/c/6ace08b6-d7f8?q=secret#h'), 'https://chatgpt.com/g/<20:id>/c/<13:id>');
+  assert.equal(urlShape('https://chatgpt.com/c/WEB:1234-abcd'), 'https://chatgpt.com/c/<14:special>');
+  assert.equal(urlShape(''), '(empty)');
+  assert.equal(urlShape(undefined), '(empty)');
+  assert.equal(urlShape('not a url'), '(unparsable)');
+});
