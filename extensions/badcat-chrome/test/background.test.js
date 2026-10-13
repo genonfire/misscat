@@ -750,3 +750,29 @@ test('the ON test result is shown as a test result: no ACK, no delivered record,
   assert.equal(t.session().test.ok, false);
   assert.match(t.session().error, /ON test: restore: nothing/);
 });
+
+test('ON injects the content script when none answers (extension reloaded), instead of asking for a page reload', async () => {
+  let injected = false;
+  const t = boot({ control: async (m) => {
+    if (m.type === 'badcat:ping' && !injected) throw new Error('Receiving end does not exist');
+    return { ok: true };
+  } });
+  t.injected.push = ((push) => function (o) { injected = true; return push.call(this, o); })(t.injected.push);
+  assert.equal((await t.popup({ type: 'badcat:start', repo: 'o/r', tabId: 7 })).ok, true);
+  assert.equal(t.injected.length, 1);
+  assert.equal(t.injected[0].target.tabId, 7);
+  assert.equal(JSON.stringify(t.injected[0].files), JSON.stringify(['shared.js', 'content.js']));
+});
+
+test('a live content script is never injected a second time', async () => {
+  const t = await started();
+  assert.equal(t.injected.length, 0);
+});
+
+test('ON still asks for a reload when injection fails', async () => {
+  const t = boot({ injectFails: true, control: async () => { throw new Error('none'); } });
+  const res = await t.popup({ type: 'badcat:start', repo: 'o/r', tabId: 7 });
+  assert.equal(res.ok, false);
+  assert.match(res.error, /Reload the ChatGPT tab/);
+  assert.equal(t.natives.length, 0);
+});

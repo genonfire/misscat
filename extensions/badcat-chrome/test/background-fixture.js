@@ -6,7 +6,7 @@ const crypto = require('node:crypto').webcrypto;
 
 const GOOD_URL = 'https://chatgpt.com/c/abc-123';
 
-function boot({ tabUrl = GOOD_URL, handoff = async () => ({ ok: true }), seed = {}, fakeTimers = false, control = async () => ({ ok: true }), beforeLocalSet = async () => {} } = {}) {
+function boot({ tabUrl = GOOD_URL, handoff = async () => ({ ok: true }), seed = {}, fakeTimers = false, control = async () => ({ ok: true }), beforeLocalSet = async () => {}, injectFails = false } = {}) {
   const timers = [];
   const store = { ...seed };
   const tabs = { 7: { id: 7, url: tabUrl } };
@@ -43,6 +43,7 @@ function boot({ tabUrl = GOOD_URL, handoff = async () => ({ ok: true }), seed = 
         async set(obj) { await beforeLocalSet(obj); Object.assign(store, JSON.parse(JSON.stringify(obj))); },
       },
     },
+    scripting: { injected: [], async executeScript(opts) { this.injected.push(opts); if (injectFails) throw new Error('no'); } },
     tabs: {
       onRemoved: hook('tabs.onRemoved'),
       onUpdated: hook('tabs.onUpdated'),
@@ -78,7 +79,7 @@ function boot({ tabUrl = GOOD_URL, handoff = async () => ({ ok: true }), seed = 
   const navigate = async (url, id = 7) => { tabs[id].url = url; await listeners['tabs.onUpdated'](id, { url }); };
   const session = () => store['badcat.session'];
   const settle = () => new Promise((r) => setImmediate(r));
-  return { popup, fromContent, updates: chrome.tabs.updates, navigate, session, store, tabs, sent, controls, listeners, natives, settle, timers };
+  return { popup, injected: chrome.scripting.injected, fromContent, updates: chrome.tabs.updates, navigate, session, store, tabs, sent, controls, listeners, natives, settle, timers };
 }
 
 module.exports = { bootBackground: boot };

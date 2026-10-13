@@ -70,11 +70,21 @@ async function start(repoInput, tabId) {
   if (!isConversationUrl(tab.url)) {
     return { ok: false, error: 'Open a ChatGPT conversation tab first.' };
   }
-  try {
+  const ping = async () => {
     const pong = await chrome.tabs.sendMessage(tabId, { type: 'badcat:ping' });
     if (!pong || pong.ok !== true) throw new Error('no pong');
+  };
+  try {
+    await ping();
   } catch (e) {
-    return { ok: false, error: 'Reload the ChatGPT tab, then try again.' };
+    // No live content script (e.g. the extension was reloaded after the tab opened). Inject it instead of asking
+    // for a page reload: a reload would make a conversation-limit alert disappear.
+    try {
+      await chrome.scripting.executeScript({ target: { tabId: tabId }, files: ['shared.js', 'content.js'] });
+      await ping();
+    } catch (e2) {
+      return { ok: false, error: 'Reload the ChatGPT tab, then try again.' };
+    }
   }
 
   await clearUncertain(); // starting again is the explicit recovery from an unconfirmed send
