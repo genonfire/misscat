@@ -2,7 +2,7 @@
 // The popup only asks it to start/stop; closing the popup changes nothing here.
 importScripts('shared.js');
 
-const { HOST_NAME, normalizeRepo, isConversationUrl, isNewChatUrl, urlShape, projectOf, inProject, parseEvent, eventKey } = self.BadCatShared;
+const { HOST_NAME, normalizeRepo, isConversationUrl, isChatGptUrl, isNewChatUrl, urlShape, projectOf, inProject, parseEvent, eventKey } = self.BadCatShared;
 
 const SESSION_KEY = 'badcat.session'; // {active, repo, tabId, error, rollover?: {project}, explicit?: 'armed'|'running'|'used', test?: {ok, message}}
 const DELIVERED_KEY = 'badcat.delivered.v2';
@@ -411,6 +411,11 @@ async function deliverEvent(connection, message) {
       return;
     }
     if (!isConversationUrl(tab.url) && !newChat) {
+      if (isChatGptUrl(tab.url)) {
+        // Still on chatgpt.com, just not in a conversation: keep watching, count a failed attempt and retry.
+        attemptNo += 1;
+        continue;
+      }
       await deactivate('The tab is no longer a ChatGPT conversation. [delivery: ' + urlShape(tab.url) + ']');
       return;
     }
@@ -640,6 +645,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
     return;
   }
   if (rolloverPage(session, changeInfo.url)) return;
+  if (isChatGptUrl(changeInfo.url)) return; // anywhere on chatgpt.com keeps the session
   debugLog('update-not-conversation', { fromEvent: urlShape(changeInfo.url), tabNow: await tabShapeNow(tabId) });
   await deactivate('The tab is no longer a ChatGPT conversation. [update: ' + urlShape(changeInfo.url) + ']');
 });

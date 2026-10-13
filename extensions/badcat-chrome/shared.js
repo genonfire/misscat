@@ -34,6 +34,16 @@
       CONVERSATION_PATH_RE.test(parsed.pathname);
   }
 
+  // Any page of https://chatgpt.com: while watching, the tab may sit anywhere on the site without stopping.
+  function isChatGptUrl(url) {
+    try {
+      const parsed = new URL(url);
+      return parsed.protocol === 'https:' && parsed.hostname === 'chatgpt.com';
+    } catch (e) {
+      return false;
+    }
+  }
+
   // A diagnostic-only description of a URL for error messages: scheme, host and a path whose long segments are
   // reduced to their length and whether they look like a plain id. No query, fragment or conversation id.
   function urlShape(url) {
@@ -121,6 +131,7 @@
     HOST_NAME: HOST_NAME,
     normalizeRepo: normalizeRepo,
     isConversationUrl: isConversationUrl,
+    isChatGptUrl: isChatGptUrl,
     isNewChatUrl: isNewChatUrl,
     urlShape: urlShape,
     projectOf: projectOf,

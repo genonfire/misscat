@@ -129,13 +129,24 @@ test('navigating the target tab away from a conversation stops the session', asy
   assert.match(t.session().error, /\[update: https:\/\/example\.com\/\]$/);
 });
 
-test('a tab that is no longer a conversation at delivery time fails safely', async () => {
+test('a tab that left chatgpt.com at delivery time fails safely', async () => {
   const t = await started();
-  t.tabs[7].url = 'https://chatgpt.com/';
+  t.tabs[7].url = 'https://example.com/';
   t.natives[0].emit(plus1(9, HEAD1));
   await t.settle();
   assert.equal(t.sent.length, 0);
   assert.equal(t.session().active, false);
+});
+
+test('a tab elsewhere on chatgpt.com keeps the session and sends nothing', async () => {
+  const t = await started();
+  await t.listeners['tabs.onUpdated'](7, { url: 'https://chatgpt.com/library' });
+  assert.equal(t.session().active, true);
+  t.tabs[7].url = 'https://chatgpt.com/';
+  t.natives[0].emit(plus1(9, HEAD1));
+  await t.settle();
+  assert.equal(t.sent.length, 0);
+  assert.equal(t.session().active, true);
 });
 
 test('a host error or disconnect marks the session inactive with a reason', async () => {
@@ -341,8 +352,8 @@ test('a +1 handoff authorizes a rollover; the session survives the new-chat rout
   await t.navigate('https://chatgpt.com/g/g-p-1-proj/c/new');
   assert.equal(t.session().active, true);
   assert.equal('rollover' in t.session(), false);
-  await t.navigate(NEW_CHAT); // the rollover is over: the root is no longer a valid state
-  assert.equal(t.session().active, false);
+  await t.navigate(NEW_CHAT); // the rollover is over, but anywhere on chatgpt.com keeps the session
+  assert.equal(t.session().active, true);
 });
 
 test('the same pending +1 is delivered after the rollover, with the project, acknowledged once and never resent', async () => {
@@ -380,17 +391,17 @@ test('a rollover cannot be announced without a pending +1, nor twice while one i
   assert.equal((await u.fromContent({ type: 'badcat:rollover', session: usid })).ok, false);
 });
 
-test('the new-chat route without an announced rollover still deactivates', async () => {
+test('the new-chat route without an announced rollover keeps the session (it is on chatgpt.com)', async () => {
   const t = await started();
   await t.navigate(NEW_CHAT);
-  assert.equal(t.session().active, false);
-  assert.equal(t.natives[0].disconnected, true);
+  assert.equal(t.session().active, true);
+  assert.equal(t.natives[0].disconnected, false);
   assert.deepEqual(t.updates, []);
 });
 
-test('during a rollover a conversation in another project, a project home or another site deactivates', async () => {
+test('during a rollover a conversation in another project or another site deactivates', async () => {
   for (const url of ['https://chatgpt.com/g/g-p-2-other/c/new', 'https://chatgpt.com/g/g-p-1-proj-archive/c/new',
-    HOME, 'https://example.com/']) {
+    'https://example.com/']) {
     const { t } = await announced();
     await t.navigate(NEW_CHAT);
     await t.navigate(url);
