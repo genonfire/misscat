@@ -641,3 +641,39 @@ test('a pending write of an old session\'s uncertain key cannot outlive the Star
   await t.settle();
   assert.equal(t.sent.length, 2);
 });
+
+test('#64: "rolling over" does not use up the delivery attempts; the later failures still get all three', async () => {
+  let calls = 0;
+  const t = await started({ tabUrl: PROJECT_URL, fakeTimers: true, handoff: async () => {
+    calls += 1;
+    if (calls <= 2) return { ok: false, rollover: true, error: 'rolling over' };
+    return { ok: false, error: 'cannot verify the new chat is in the original project' };
+  } });
+  t.natives[0].emit(plus1(1, HEAD1));
+  for (let i = 0; i < 40 && t.timers.length + calls < 99; i++) {
+    await t.settle();
+    if (!t.timers.length) break;
+    for (const { fn } of t.timers.splice(0)) fn();
+  }
+  await t.settle();
+  assert.equal(calls, 5); // 2 rollover waits + the 3 regular attempts
+  assert.equal(t.natives[0].posted.filter((m) => m.type === 'ack').length, 0);
+  assert.equal(t.store['badcat.delivered.v2'], undefined);
+});
+
+test('#64: endless "rolling over" is bounded and never marked delivered', async () => {
+  let calls = 0;
+  const t = await started({ tabUrl: PROJECT_URL, fakeTimers: true, handoff: async () => {
+    calls += 1;
+    return { ok: false, rollover: true, error: 'rolling over' };
+  } });
+  t.natives[0].emit(plus1(1, HEAD1));
+  for (let i = 0; i < 60; i++) {
+    await t.settle();
+    if (!t.timers.length) break;
+    for (const { fn } of t.timers.splice(0)) fn();
+  }
+  await t.settle();
+  assert.equal(calls <= 16, true);
+  assert.equal(t.natives[0].posted.filter((m) => m.type === 'ack').length, 0);
+});

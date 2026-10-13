@@ -49,7 +49,8 @@ function node(tag, attrs = {}, children = []) {
   return el;
 }
 
-function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubmits = false, sendButton = true, initial = '', label = 'Code Review의 새 채팅', rollover = { ok: true }, hello = { ok: false }, attempt = { ok: true }, selector = null, menu = [], renameOnFill = null, restoreOnMenuOpen = null, alertOnEnter = null, onTimer = null, lateComposer = false, navigateOnMenuOpen = null, afterSubmit = null, priorBubbles = [] } = {}) {
+function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubmits = false, sendButton = true, initial = '', label = 'Code Review의 새 채팅', rollover = { ok: true }, hello = { ok: false }, attempt = { ok: true }, selector = null, menu = [], renameOnFill = null, restoreOnMenuOpen = null, alertOnEnter = null, onTimer = null, lateComposer = false, navigateOnMenuOpen = null, afterSubmit = null, priorBubbles = [], buttonDisabled = false, emptyMenuOpens = 0, menuLater = null, fillDelayed = false } = {}) {
+  let delayedFill = null;
   let now = 0; // virtual clock: waits finish instantly
   let enterSubmitsNow = enterSubmits;
   const log = { submitted: [], keys: [], clicks: 0, decoyClicks: 0, fills: [] };
@@ -95,6 +96,7 @@ function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubm
   };
 
   const send = node('button', { type: 'submit', 'data-testid': 'whatever-it-is-now' });
+  send.disabled = buttonDisabled;
   send.click = () => { log.clicks += 1; if (buttonSubmits) submit(); };
   const stopOrVoice = node('button', { type: 'button' });
   stopOrVoice.click = () => { log.decoyClicks += 1; };
@@ -126,7 +128,7 @@ function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubm
         projectMenu = null;
         selectorButton.attrs['aria-expanded'] = 'false';
       } else {
-        const items = menu.map((m) => { const i = node('div', { 'data-value': m.value }); i.textContent = m.text; return i; });
+        const items = (selectorButton.clicks <= emptyMenuOpens ? [] : menuLater && selectorButton.clicks > 2 ? menuLater : menu).map((m) => { const i = node('div', { 'data-value': m.value }); i.textContent = m.text; return i; });
         projectMenu = node('div', { role: 'dialog' }, items);
         projectMenu.parentElement = page;
         page.children.push(projectMenu);
@@ -145,7 +147,8 @@ function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubm
     querySelectorAll: (sel) => { materialize(); return page.querySelectorAll(sel); },
     execCommand(cmd, _ui, value) {
       assert.equal(cmd, 'insertText');
-      editor.textContent = editor.collapsed ? editor.textContent + value : value; // collapsed to the end = append
+      const next = editor.collapsed ? editor.textContent + value : value; // collapsed to the end = append
+      if (fillDelayed) delayedFill = next; else editor.textContent = next; // ProseMirror may apply it a tick later
       log.fills.push(value);
       if (renameOnFill !== null && selectorButton) selectorButton.attrs['aria-label'] = '프로젝트 변경: ' + renameOnFill;
       return true;
@@ -181,6 +184,7 @@ function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubm
       async sendMessage(m) { runtimeCalls.push(m); return m.type === 'badcat:hello' ? hello : m.type === 'badcat:attempt' ? attempt : (typeof rollover === 'function' ? rollover(m) : rollover); } } },
     setTimeout: (fn, ms) => {
       now += ms;
+      if (delayedFill !== null) { editor.textContent = delayedFill; delayedFill = null; }
       if (lateAttach) { lateAttach(); lateAttach = null; }
       if (onTimer) onTimer(ms, ctx);
       setImmediate(fn);
@@ -196,7 +200,7 @@ function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubm
     const keep = listeners[0](message, sender, resolve);
     if (!keep) resolve(undefined);
   });
-  return { log, ctx, selectorButton, runtimeCalls, observers, limitAlert, mutate, setUrl: (u) => { ctx.url = u; }, editor, settle: () => new Promise((r) => setImmediate(r)), send: sendMessage, text, setEnterSubmits: (v) => { enterSubmitsNow = v; } };
+  return { log, ctx, selectorButton, runtimeCalls, observers, limitAlert, mutate, setUrl: (u) => { ctx.url = u; }, editor, sendButton: send, setMenu: (m) => { menu = m; }, settle: () => new Promise((r) => setImmediate(r)), send: sendMessage, text, setEnterSubmits: (v) => { enterSubmitsNow = v; } };
 }
 
 module.exports = { bootContent: boot };

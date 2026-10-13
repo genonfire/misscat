@@ -83,9 +83,9 @@ test('failed content submission stays unacknowledged, host replay succeeds once'
 });
 
 test('Stop and same-tab restart cancel pending content and old host retries', async () => {
-  const { content, worker, port } = await boot({ enterSubmits: false, buttonSubmits: true });
+  const { content, worker, port } = await boot({ enterSubmits: false, buttonSubmits: false });
   port.emit(event());
-  // Allow typing/Enter, but stop during content's confirmation wait.
+  // Allow typing, the button and the Enter fallback, but stop during content's confirmation wait.
   for (let i = 0; i < 100 && content.log.keys.length === 0; i++) await worker.settle();
   assert.ok(content.log.keys.length > 0, "handoff reached the composer");
   const stale = worker.sent[0].message;
@@ -95,7 +95,7 @@ test('Stop and same-tab restart cancel pending content and old host retries', as
   await retries(worker);
   port.emit(event());
   await flush(worker);
-  assert.equal(content.log.clicks, 0);
+  assert.equal(content.log.clicks, 1); // only the click of the first, stopped attempt
   assert.deepEqual(content.log.submitted, []);
   assert.deepEqual(acks(port), []);
   content.setEnterSubmits(true);
@@ -106,13 +106,13 @@ test('Stop and same-tab restart cancel pending content and old host retries', as
 });
 
 test('host disconnect cancels content before send fallback', async () => {
-  const { content, worker, port } = await boot({ enterSubmits: false, buttonSubmits: true });
+  const { content, worker, port } = await boot({ enterSubmits: false, buttonSubmits: false });
   port.emit(event());
   for (let i = 0; i < 100 && content.log.keys.length === 0; i++) await worker.settle();
   assert.ok(content.log.keys.length > 0, "handoff reached the composer");
   port.drop();
   await retries(worker);
-  assert.equal(content.log.clicks, 0);
+  assert.equal(content.log.clicks, 1);
   assert.deepEqual(content.log.submitted, []);
   assert.deepEqual(acks(port), []);
 });
