@@ -702,6 +702,9 @@ test('ON test: clicks the real "새 채팅에서 계속하기" once, then submit
   const attempts = t.runtimeCalls.filter((m) => m.type === 'badcat:attempt');
   assert.equal(attempts.length, 1);
   assert.equal(attempts[0].explicit, true);
+  assert.equal(attempts[0].pr, 616); // the background records it so a real +1 for this PR is not sent again
+  assert.equal(result.submitted, true);
+  assert.equal(result.pr, 616);
 });
 
 test('ON test: no limit alert means nothing is clicked, typed or sent', async () => {

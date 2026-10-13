@@ -13,6 +13,10 @@ const MAX_DELIVERED = 500;
 const RETRY_DELAYS_MS = [0, 5000, 15000]; // e.g. ChatGPT still answering when the +1 arrives
 const ROLLOVER_WAIT_MS = 3000; // a started rollover is progress, not a failed attempt: look again shortly
 const MAX_ROLLOVER_WAITS = 10;
+const EXPLICIT_WAIT_MS = 1000; // a +1 never overlaps a running ON test: it waits for the test's result (bounded)
+const MAX_EXPLICIT_WAITS = 90;
+const TESTED_KEY = 'badcat.test-submitted.v1'; // {"repo#pr": time}: commands the ON test submitted (or may have)
+const TESTED_WINDOW_MS = 15 * 60 * 1000;
 
 let storageQueue = Promise.resolve();
 let controlQueue = Promise.resolve();
@@ -175,6 +179,33 @@ function rememberUncertain(key, connection) {
   return save.then(() => saved);
 }
 
+// The ON test submits a restored command that no event is attached to. A real +1 for that very PR must not send the
+// same command again (and is never ACKed on the test's behalf): it stays unresolved at the host until the window ends.
+const testedKey = (repo, pr) => String(repo).toLowerCase() + '#' + pr;
+const validPr = (pr) => Number.isSafeInteger(pr) && pr >= 1;
+
+function updateTested(change) {
+  const save = storageQueue.then(async () => {
+    const stored = await chrome.storage.local.get(TESTED_KEY);
+    const now = Date.now();
+    const kept = Object.entries(stored[TESTED_KEY] || {}).filter(([, at]) => typeof at === 'number' && now - at < TESTED_WINDOW_MS).slice(-50);
+    const map = Object.fromEntries(kept);
+    change(map, now);
+    await chrome.storage.local.set({ [TESTED_KEY]: map });
+  });
+  storageQueue = save.catch(() => {});
+  return save;
+}
+
+const recordTested = (repo, pr) => updateTested((map, now) => { map[testedKey(repo, pr)] = now; });
+const forgetTested = (repo, pr) => updateTested((map) => { delete map[testedKey(repo, pr)]; });
+
+async function wasTested(repo, pr) {
+  const stored = await chrome.storage.local.get(TESTED_KEY);
+  const at = (stored[TESTED_KEY] || {})[testedKey(repo, pr)];
+  return typeof at === 'number' && Date.now() - at < TESTED_WINDOW_MS;
+}
+
 function clearUncertain() {
   const clear = storageQueue.then(() => chrome.storage.local.remove(UNCERTAIN_KEY));
   storageQueue = clear.catch(() => {});
@@ -264,6 +295,7 @@ async function deliverEvent(connection, message) {
 
   let attemptNo = 0;
   let rolloverWaits = 0;
+  let explicitWaits = 0;
   let pause = 0;
   while (attemptNo < RETRY_DELAYS_MS.length) {
     const delay = pause || RETRY_DELAYS_MS[attemptNo];
@@ -272,6 +304,11 @@ async function deliverEvent(connection, message) {
     if (connection !== port) return;
     const current = await getSession();
     if (connection !== port || !current.active || current.repo !== session.repo || current.tabId !== session.tabId) return;
+    if (current.explicit === 'running' && explicitWaits < MAX_EXPLICIT_WAITS) {
+      explicitWaits += 1; // the ON test owns the tab until it reports; waiting is not a failed attempt
+      pause = EXPLICIT_WAIT_MS;
+      continue;
+    }
     const sent = await delivered();
     if (connection !== port) return;
     if (sent.includes(key) || await legacyDelivered(event)) {
@@ -284,6 +321,11 @@ async function deliverEvent(connection, message) {
       // A host replay or a reloaded tab must not resubmit what may already have gone out.
       await reportError(connection, 'Delivery could not be confirmed; check ChatGPT. Not sent again.');
       return;
+    }
+    if (connection !== port) return;
+    if (await wasTested(event.repo, event.pr)) {
+      await reportError(connection, 'PR #' + event.pr + ' was just submitted by the ON test; not sent again.');
+      return; // not ACKed, not marked delivered: the host keeps it until the test window has passed
     }
     if (connection !== port) return;
 
@@ -415,7 +457,8 @@ async function attempt(message, sender) {
   if (session === null || port === null || message.session !== port.sessionId) return { ok: false };
   if (message.explicit === true) {
     // The ON test submits the restored command once. It has no event: no delivered/uncertain record, no ACK.
-    if (session.explicit !== 'running' || !session.rollover || !session.rollover.explicit) return { ok: false };
+    if (session.explicit !== 'running' || !session.rollover || !session.rollover.explicit || !validPr(message.pr)) return { ok: false };
+    await recordTested(session.repo, message.pr); // before the send: a broken channel afterwards must not allow a resend
     await setSession({ ...session, explicit: 'used' }); // single use, persisted before the send
     return { ok: true };
   }
@@ -436,6 +479,8 @@ async function explicitResult(message, sender) {
     return { ok: true };
   }
   if (explicit !== 'running' && explicit !== 'used') return { ok: false };
+  // Definitely not submitted: the command is still waiting, so a real +1 for it may go out normally.
+  if (message.submitted !== true && validPr(message.pr)) await forgetTested(rest.repo, message.pr);
   const text = String(message.message || '').slice(0, 200);
   await setSession({ ...rest, explicit: 'used', test: { ok: message.ok === true, message: text },
     error: message.ok === true ? rest.error : 'ON test: ' + text });

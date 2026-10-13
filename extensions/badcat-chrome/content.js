@@ -382,7 +382,7 @@
       // lead to an automatic resend. No marker, no send.
       let marked = null;
       try {
-        marked = await chrome.runtime.sendMessage({ type: 'badcat:attempt', session: session, explicit: explicit === true });
+        marked = await chrome.runtime.sendMessage({ type: 'badcat:attempt', session: session, explicit: explicit === true, pr: explicit ? pr : undefined });
       } catch (e) { /* background unavailable */ }
       if (!marked || marked.ok !== true) return { ok: false, error: 'could not record the attempt; not sent' };
       if (!active()) return { ok: false, error: 'session stopped' };
@@ -451,9 +451,11 @@
     queue = task.catch(() => {});
     const result = await task.catch((e) => ({ ok: false, error: String(e && e.message) }));
     if (result.ok) {
-      return reportExplicit(session, { ok: true, message: 'Submitted the restored command for PR #' + pr + ' (test only, not a delivery).' + (result.note ? ' ' + result.note + '.' : '') });
+      return reportExplicit(session, { ok: true, submitted: true, pr: pr,
+        message: 'Submitted the restored command for PR #' + pr + ' (test only, not a delivery).' + (result.note ? ' ' + result.note + '.' : '') });
     }
-    return fail('submit', result.error || 'not submitted');
+    // `submitted`: the command may be out there (unconfirmed), so a real +1 for this PR must not send it again.
+    return reportExplicit(session, { ok: false, submitted: result.ambiguous === true, pr: pr, message: 'submit: ' + (result.error || 'not submitted') });
   }
 
   // Stage 1: the limit alert of the current conversation, clicked at most once.

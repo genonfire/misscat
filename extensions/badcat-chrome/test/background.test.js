@@ -716,11 +716,11 @@ test('a wrong session id never gets an explicit rollover or attempt', async () =
 
 test('the explicit attempt is single-use and leaves no delivered/uncertain record and no ACK', async () => {
   const t = await started({ tabUrl: PROJECT_URL });
-  assert.equal((await t.fromContent({ type: 'badcat:attempt', session: sid(t), explicit: true })).ok, false); // no rollover yet
+  assert.equal((await t.fromContent({ type: 'badcat:attempt', session: sid(t), explicit: true, pr: 9 })).ok, false); // no rollover yet
   await t.fromContent({ type: 'badcat:rollover', session: sid(t), explicit: true });
   await t.navigate('https://chatgpt.com/');
-  assert.equal((await t.fromContent({ type: 'badcat:attempt', session: sid(t), explicit: true })).ok, true);
-  assert.equal((await t.fromContent({ type: 'badcat:attempt', session: sid(t), explicit: true })).ok, false);
+  assert.equal((await t.fromContent({ type: 'badcat:attempt', session: sid(t), explicit: true, pr: 9 })).ok, true);
+  assert.equal((await t.fromContent({ type: 'badcat:attempt', session: sid(t), explicit: true, pr: 9 })).ok, false);
   assert.equal(t.session().explicit, 'used');
   assert.equal(t.store['badcat.uncertain.v1'], undefined);
   assert.equal(t.store['badcat.delivered.v2'], undefined);
@@ -732,7 +732,7 @@ test('a reloaded content script resumes only a running, unused ON test', async (
   await t.fromContent({ type: 'badcat:rollover', session: sid(t), explicit: true });
   await t.navigate('https://chatgpt.com/');
   assert.equal(JSON.stringify((await t.fromContent({ type: 'badcat:hello' })).explicit), JSON.stringify({ project: 'g-p-1-proj' }));
-  await t.fromContent({ type: 'badcat:attempt', session: sid(t), explicit: true });
+  await t.fromContent({ type: 'badcat:attempt', session: sid(t), explicit: true, pr: 9 });
   assert.equal((await t.fromContent({ type: 'badcat:hello' })).explicit, undefined);
 });
 
@@ -785,11 +785,104 @@ test('after the ON test ends (failure or success) its temporary rollover excepti
     await t.fromContent({ type: 'badcat:explicit-result', session: sid(t), ...result });
     assert.equal(t.session().rollover.explicit, undefined);
     assert.equal(t.session().rollover.project, 'g-p-1-proj'); // an ordinary rollover: same project checks as for a +1
-    assert.equal((await t.fromContent({ type: 'badcat:attempt', session: sid(t), explicit: true })).ok, false);
+    assert.equal((await t.fromContent({ type: 'badcat:attempt', session: sid(t), explicit: true, pr: 9 })).ok, false);
     assert.equal((await t.fromContent({ type: 'badcat:hello' })).explicit, undefined);
     // a +1 now goes to the tab carrying the project, so the content script verifies it; never a bare send
     t.natives[0].emit(plus1(9, HEAD1));
     await t.settle();
     assert.equal(t.sent[0].message.project, 'g-p-1-proj');
   }
+});
+
+// --- a real +1 and the ON test must never submit the same command twice ---
+const drain = async (t) => { for (let i = 0; i < 40 && t.timers.length; i += 1) { t.timers.shift().fn(); await t.settle(); await t.settle(); } };
+const ackCount = (t) => t.natives[t.natives.length - 1].posted.filter((m) => m.type === 'ack').length;
+// ON in a limited conversation: the test is running (rollover announced, new chat reached).
+async function onTestRunning(opts = {}) {
+  const t = await started({ tabUrl: PROJECT_URL, fakeTimers: true, ...opts });
+  await t.fromContent({ type: 'badcat:rollover', session: sid(t), explicit: true });
+  await t.navigate('https://chatgpt.com/');
+  return t;
+}
+const finishTest = async (t, result) => {
+  await t.fromContent({ type: 'badcat:attempt', session: sid(t), explicit: true, pr: 9 });
+  await t.fromContent({ type: 'badcat:explicit-result', session: sid(t), pr: 9, submitted: true, ok: true, message: 'Submitted', ...result });
+};
+
+test('dedupe: a +1 for the same PR that arrives DURING the ON test waits, then is neither sent nor ACKed', async () => {
+  const t = await onTestRunning();
+  t.natives[0].emit(plus1(9, HEAD1));
+  await t.settle(); await t.settle();
+  assert.equal(t.sent.length, 0); // held while the test owns the tab
+  await finishTest(t);
+  await drain(t);
+  assert.equal(t.sent.length, 0);
+  assert.equal(ackCount(t), 0);
+  assert.equal(t.store['badcat.delivered.v2'], undefined);
+  assert.match(t.session().error, /already submitted|just submitted by the ON test/);
+});
+
+test('dedupe: a +1 for the same PR right AFTER a successful ON test is neither sent nor ACKed, and it survives Stop/Start', async () => {
+  let t = await onTestRunning();
+  await finishTest(t);
+  t.natives[0].emit(plus1(9, HEAD1));
+  await t.settle(); await t.settle(); await drain(t);
+  assert.equal(t.sent.length, 0);
+  assert.equal(ackCount(t), 0);
+  assert.ok(t.store['badcat.test-submitted.v1']['o/r#9']);
+  await t.popup({ type: 'badcat:stop', tabId: 7 });
+  t.tabs[7].url = PROJECT_URL;
+  assert.equal((await t.popup({ type: 'badcat:start', repo: 'o/r', tabId: 7 })).ok, true);
+  t.natives[1].emit(plus1(9, HEAD1)); // the host replays it after the restart
+  await t.settle(); await t.settle(); await drain(t);
+  assert.equal(t.sent.length, 0);
+  assert.equal(t.natives[1].posted.filter((m) => m.type === 'ack').length, 0);
+});
+
+test('dedupe: an unconfirmed ON submission blocks the same PR as well', async () => {
+  const t = await onTestRunning();
+  await finishTest(t, { ok: false, message: 'submit: unconfirmed' }); // submitted: true = may be out there
+  t.natives[0].emit(plus1(9, HEAD1));
+  await t.settle(); await t.settle(); await drain(t);
+  assert.equal(t.sent.length, 0);
+  assert.equal(ackCount(t), 0);
+});
+
+test('dedupe: a +1 for ANOTHER PR is delivered and ACKed normally, during (after the test) and after', async () => {
+  const t = await onTestRunning();
+  t.natives[0].emit(plus1(10, HEAD2));
+  await t.settle(); await t.settle();
+  assert.equal(t.sent.length, 0); // held while the test runs
+  await finishTest(t);
+  await drain(t);
+  assert.equal(t.sent.length, 1);
+  assert.equal(t.sent[0].message.pr, 10);
+  assert.equal(ackCount(t), 1);
+  assert.equal(t.natives[0].posted.find((m) => m.type === 'ack').pr, 10);
+});
+
+test('dedupe: if the ON test did not submit anything, a +1 for that PR is sent normally', async () => {
+  const t = await onTestRunning();
+  await finishTest(t, { ok: false, submitted: false, message: 'submit: the send button is disabled; not sent' });
+  assert.equal(t.store['badcat.test-submitted.v1']['o/r#9'], undefined);
+  t.natives[0].emit(plus1(9, HEAD1));
+  await t.settle(); await t.settle(); await drain(t);
+  assert.equal(t.sent.length, 1);
+  assert.equal(ackCount(t), 1);
+});
+
+test('dedupe: the block ends after its window, so a later +1 for that PR is delivered', async () => {
+  const t = await onTestRunning();
+  await finishTest(t);
+  t.store['badcat.test-submitted.v1']['o/r#9'] = Date.now() - 16 * 60 * 1000;
+  t.natives[0].emit(plus1(9, HEAD1));
+  await t.settle(); await t.settle(); await drain(t);
+  assert.equal(t.sent.length, 1);
+  assert.equal(ackCount(t), 1);
+});
+
+test('dedupe: an explicit attempt without a valid PR number is refused', async () => {
+  const t = await onTestRunning();
+  assert.equal((await t.fromContent({ type: 'badcat:attempt', session: sid(t), explicit: true })).ok, false);
+  assert.equal((await t.fromContent({ type: 'badcat:attempt', session: sid(t), explicit: true, pr: 0 })).ok, false);
 });
