@@ -838,3 +838,36 @@ test('ON test: after a full page reload the new content script continues from th
   assert.deepEqual(t.log.submitted, [RESTORED]);
   assert.equal(t.log.clicks, 1);
 });
+
+// --- an unfocused window: execCommand inserts nothing, the paste fallback must still fill and send ---
+test('unfocused window: when insertText inserts nothing, the text is pasted and sent with the send button', async () => {
+  const t = boot({ buttonSubmits: true, enterSubmits: false, execFails: true });
+  const res = await t.send({ type: 'badcat:handoff', pr: 123 });
+  assert.equal(res.ok, true);
+  assert.deepEqual(t.log.pastes, [TEXT]);
+  assert.deepEqual(t.log.submitted, [TEXT]);
+  assert.equal(t.log.clicks, 1);
+});
+
+test('the paste fallback is not used when insertText worked', async () => {
+  const t = boot({ buttonSubmits: true, enterSubmits: false });
+  assert.equal((await t.send({ type: 'badcat:handoff', pr: 123 })).ok, true);
+  assert.deepEqual(t.log.pastes, []);
+});
+
+test('the paste fallback never touches a composer that already holds a draft', async () => {
+  const t = boot({ execFails: true, initial: 'my draft' });
+  const res = await t.send({ type: 'badcat:handoff', pr: 123 });
+  assert.equal(res.ok, false);
+  assert.deepEqual(t.log.pastes, []);
+  assert.deepEqual(t.log.submitted, []);
+  assert.equal(t.text(), 'my draft');
+});
+
+test('if the paste inserts nothing either, nothing is sent and the failure is reported', async () => {
+  const t = boot({ execFails: true, pasteFails: true });
+  const res = await t.send({ type: 'badcat:handoff', pr: 123 });
+  assert.equal(res.ok, false);
+  assert.match(res.error, /could not fill the composer/);
+  assert.deepEqual(t.log.submitted, []);
+});

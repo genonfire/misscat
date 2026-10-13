@@ -49,17 +49,22 @@ function node(tag, attrs = {}, children = []) {
   return el;
 }
 
-function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubmits = false, sendButton = true, initial = '', label = 'Code Review의 새 채팅', rollover = { ok: true }, hello = { ok: false }, attempt = { ok: true }, selector = null, menu = [], renameOnFill = null, restoreOnMenuOpen = null, alertOnEnter = null, onTimer = null, lateComposer = false, navigateOnMenuOpen = null, afterSubmit = null, priorBubbles = [], buttonDisabled = false, emptyMenuOpens = 0, menuLater = null, fillDelayed = false } = {}) {
+function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubmits = false, sendButton = true, initial = '', label = 'Code Review의 새 채팅', rollover = { ok: true }, hello = { ok: false }, attempt = { ok: true }, selector = null, menu = [], renameOnFill = null, restoreOnMenuOpen = null, alertOnEnter = null, onTimer = null, lateComposer = false, navigateOnMenuOpen = null, afterSubmit = null, priorBubbles = [], buttonDisabled = false, emptyMenuOpens = 0, menuLater = null, fillDelayed = false, execFails = false, pasteFails = false } = {}) {
   let delayedFill = null;
   let now = 0; // virtual clock: waits finish instantly
   let enterSubmitsNow = enterSubmits;
-  const log = { submitted: [], keys: [], clicks: 0, decoyClicks: 0, fills: [] };
+  const log = { submitted: [], keys: [], clicks: 0, decoyClicks: 0, fills: [], pastes: [] };
 
   const editor = node('div', { contenteditable: 'true', 'data-composer-markdown': '', class: 'ProseMirror', 'aria-label': label });
   Object.assign(editor, {
     textContent: initial, selected: false, collapsed: false,
     focus() {},
     dispatchEvent(ev) {
+      if (ev.type === 'paste') { // a synthetic paste event: the fallback for a window without focus
+        log.pastes.push(ev.clipboardData.getData('text/plain'));
+        if (!pasteFails) editor.textContent = ev.clipboardData.getData('text/plain');
+        return true;
+      }
       log.keys.push(ev.type + ':' + ev.key);
       if (alertOnEnter && ev.type === 'keydown' && !alertOnEnter.done) { alertOnEnter.done = true; ctx.alert = limitAlert(alertOnEnter.text, alertOnEnter.labels); }
       if (ev.type === 'keydown' && ev.key === 'Enter' && enterSubmitsNow) submit();
@@ -147,6 +152,7 @@ function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubm
     querySelectorAll: (sel) => { materialize(); return page.querySelectorAll(sel); },
     execCommand(cmd, _ui, value) {
       assert.equal(cmd, 'insertText');
+      if (execFails) { log.fills.push(value); return false; } // no focus: nothing is inserted
       const next = editor.collapsed ? editor.textContent + value : value; // collapsed to the end = append
       if (fillDelayed) delayedFill = next; else editor.textContent = next; // ProseMirror may apply it a tick later
       log.fills.push(value);
@@ -174,6 +180,8 @@ function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubm
       selectAllChildren() { editor.selected = true; editor.collapsed = false; },
       collapseToEnd() { editor.collapsed = true; },
     }) },
+    DataTransfer: class { constructor() { this.d = {}; } setData(k, v) { this.d[k] = v; } getData(k) { return this.d[k] || ''; } },
+    ClipboardEvent: class { constructor(type, init) { this.type = type; Object.assign(this, init); } },
     KeyboardEvent: class { constructor(type, init) { this.type = type; Object.assign(this, init); } },
     MutationObserver: class {
       constructor(callback) { this.callback = callback; this.disconnected = false; observers.push(this); }

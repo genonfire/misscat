@@ -103,6 +103,14 @@
     return existing + insert;
   }
 
+  // execCommand('insertText') needs the document to be focused; with the ChatGPT window in the background nothing
+  // is inserted. A paste event carrying the text works without focus (ProseMirror reads event.clipboardData).
+  function pasteInto(el, text) {
+    const data = new DataTransfer();
+    data.setData('text/plain', text);
+    el.dispatchEvent(new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true }));
+  }
+
   function findSendButton(composer) {
     const form = composer.closest(COMPOSER_FORM);
     return form ? form.querySelector(SEND_BUTTON) : null;
@@ -242,6 +250,14 @@
       await waitFor(() => normalize(readComposer(composer)) === normalize(full), 1500);
       if (!active()) return { ok: false, error: 'session stopped' };
       if (moved()) return changed;
+      // Nothing arrived at all in an empty composer (e.g. the window has no focus): insert by paste instead.
+      // Never with existing text: the paste position would not be ours to choose.
+      if (existing === '' && normalize(readComposer(composer)) === '') {
+        pasteInto(composer, text);
+        await waitFor(() => normalize(readComposer(composer)) === normalize(full), 1500);
+        if (!active()) return { ok: false, error: 'session stopped' };
+        if (moved()) return changed;
+      }
       const now = normalize(readComposer(composer));
       if (now !== normalize(full)) {
         return { ok: false, error: now.includes(text) ? 'the composer changed while filling; not sent' : 'could not fill the composer' };
