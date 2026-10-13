@@ -905,3 +905,23 @@ for (const [name, options, expected] of [
     assert.deepEqual(t.log.fills, []);
   });
 }
+
+// --- the picker lists the bare project ID while the URL carries "<id>-<name>" ---
+test('project check: the picker ID may be the leading part of the URL slug', async () => {
+  const { t } = await limited({ menu: [{ value: 'g-p-1', text: 'Code Review' }] });
+  await probe(t);
+  const result = await explicitDone(t);
+  assert.equal(result.ok, true, result.message);
+  assert.deepEqual(t.log.submitted, [RESTORED]);
+});
+
+test('project check: a longer or different ID is still a mismatch and the IDs are reported', async () => {
+  for (const value of ['g-p-10', 'g-p-2', 'g-p-']) {
+    const { t } = await limited({ menu: [{ value, text: 'Code Review' }] });
+    await probe(t);
+    const result = await explicitDone(t);
+    assert.equal(result.ok, false, value);
+    assert.match(result.message, /not in the original project; not sent \(picker ID /);
+    assert.deepEqual(t.log.submitted, []);
+  }
+});

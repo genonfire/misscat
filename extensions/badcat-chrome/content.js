@@ -50,6 +50,10 @@
   // value between /g/ and /c/ in its URL, compared exactly). One look: {name} when verified, {mismatch} when the
   // name is listed twice or maps to another ID (never retried, never sent), {notReady} when the selector or its
   // menu has not rendered yet. The menu is opened, read and closed again.
+  // The URL segment may be "<id>-<name-slug>" while the picker lists just "<id>": equal, or the picker's ID
+  // is the slug's leading part followed by a dash (never a mere prefix of a longer ID).
+  const idMatchesSlug = (value, slug) => value !== '' && (value === slug || slug.startsWith(value + '-'));
+
   async function verifyProjectOnce(slug) {
     const button = document.querySelector(PROJECT_BUTTON);
     const label = projectLabel();
@@ -60,7 +64,10 @@
     if (items) {
       const same = items.filter((item) => labelNames(label, (item.textContent || '').trim()));
       if (same.length > 1) result = { mismatch: true };
-      else if (same.length === 1) result = same[0].getAttribute('data-value') === slug ? { name: label } : { mismatch: true };
+      else if (same.length === 1) {
+        const value = same[0].getAttribute('data-value') || '';
+        result = idMatchesSlug(value, slug) ? { name: label } : { mismatch: true, found: value };
+      }
     }
     if (button.getAttribute('aria-expanded') === 'true') button.click();
     await waitFor(() => menuItems().length === 0, 1000);
@@ -222,7 +229,10 @@
     if (!conversation && expectedProject) {
       const verified = await verifyProject(expectedProject);
       if (!active()) return { ok: false, error: 'session stopped' };
-      if (verified.mismatch) return { ok: false, error: 'the new chat is not in the original project; not sent' };
+      if (verified.mismatch) {
+        const seen = verified.found ? ' (picker ID ' + verified.found + ', conversation ' + expectedProject + ')' : ' (duplicate project name)';
+        return { ok: false, error: 'the new chat is not in the original project; not sent' + seen };
+      }
       if (!verified.name) return { ok: false, error: 'cannot verify the new chat is in the original project' };
       verifiedName = verified.name;
       if (location.href !== startUrl) return changed;
