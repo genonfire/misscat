@@ -126,6 +126,48 @@
     el.dispatchEvent(new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true }));
   }
 
+  // The reasoning-effort selector of the composer (observed: a visible button with aria-haspopup="menu" whose text
+  // ends with the current level, e.g. "추론 수준Medium"). Its menu is a slider row: ArrowRight raises it one step.
+  const EFFORT_TRIGGER = 'button[aria-haspopup="menu"]';
+  const EFFORT_ITEM = '[role="menuitem"]';
+  const LEVEL_RE = /(Low|Medium|High)\s*$/i;
+  const keyEvent = (type, key, code, keyCode) =>
+    new KeyboardEvent(type, { key: key, code: code, keyCode: keyCode, which: keyCode, bubbles: true, cancelable: true });
+
+  // Medium -> High before the send; High stays, anything else is left alone. Never blocks the send: the result is
+  // only a note. Returns the note ('' when there is no such selector).
+  async function raiseEffort(composer) {
+    const form = composer.closest(COMPOSER_FORM);
+    const trigger = form && [...form.querySelectorAll(EFFORT_TRIGGER)].find((b) => isVisible(b) && LEVEL_RE.test((b.textContent || '').trim()));
+    if (!trigger) return '';
+    const level = () => { const m = LEVEL_RE.exec((trigger.textContent || '').trim()); return m ? m[1].toLowerCase() : ''; };
+    if (level() === 'high') return 'reasoning already High';
+    if (level() !== 'medium') return 'reasoning is ' + level() + '; left unchanged';
+    const row = () => [...document.querySelectorAll(EFFORT_ITEM)].find((el) => isVisible(el) && LEVEL_RE.test((el.textContent || '').trim()));
+    const close = async () => {
+      const open = row();
+      if (open) open.dispatchEvent(keyEvent('keydown', 'Escape', 'Escape', 27));
+      await waitFor(() => !row(), 1000);
+    };
+    // Menus of this kind open on pointerdown, not on a plain click.
+    const press = (type) => trigger.dispatchEvent(new PointerEvent(type, { bubbles: true, cancelable: true, button: 0, ctrlKey: false, pointerType: 'mouse' }));
+    press('pointerdown');
+    press('pointerup');
+    let item = await waitFor(row, 1500);
+    if (!item) {
+      trigger.click();
+      item = await waitFor(row, 1500);
+    }
+    if (!item) return 'could not open the reasoning menu; left at Medium';
+    if (typeof item.focus === 'function') item.focus();
+    item.dispatchEvent(keyEvent('keydown', 'ArrowRight', 'ArrowRight', 39));
+    item.dispatchEvent(keyEvent('keyup', 'ArrowRight', 'ArrowRight', 39));
+    const raised = await waitFor(() => /high\s*$/i.test((((row() || {}).textContent) || '').trim()) || level() === 'high', 2000);
+    await close();
+    if (!raised) return 'could not raise the reasoning to High; left at Medium';
+    return await waitFor(() => level() === 'high', 1500) ? 'reasoning set to High' : 'reasoning change to High not confirmed';
+  }
+
   function findSendButton(composer) {
     const form = composer.closest(COMPOSER_FORM);
     return form ? form.querySelector(SEND_BUTTON) : null;
@@ -284,6 +326,15 @@
 
     if (!active()) return { ok: false, error: 'session stopped' };
     if (moved()) return changed;
+    let note = '';
+    try {
+      note = await raiseEffort(composer);
+    } catch (e) {
+      note = 'could not change the reasoning level';
+    }
+    if (note) console.log('badcat:', note);
+    if (!active()) return { ok: false, error: 'session stopped' };
+    if (moved()) return changed;
     if (expectedProject && conversation && projectOf(location.href) !== expectedProject) {
       return { ok: false, error: 'the conversation is not in the original project' };
     }
@@ -364,7 +415,7 @@
         submitted.add(key);
         if (submitted.size > 500) submitted.delete(submitted.values().next().value);
       }
-      return { ok: true };
+      return note ? { ok: true, note: note } : { ok: true };
     }
     // The send failed: the limit alert may have appeared in response; one bounded recheck.
     return (await rolloverOnce(session)) || { ok: false, error: 'message was not submitted' };
@@ -394,7 +445,7 @@
     queue = task.catch(() => {});
     const result = await task.catch((e) => ({ ok: false, error: String(e && e.message) }));
     if (result.ok) {
-      return reportExplicit(session, { ok: true, message: 'Submitted the restored command for PR #' + pr + ' (test only, not a delivery).' });
+      return reportExplicit(session, { ok: true, message: 'Submitted the restored command for PR #' + pr + ' (test only, not a delivery).' + (result.note ? ' ' + result.note + '.' : '') });
     }
     return fail('submit', result.error || 'not submitted');
   }

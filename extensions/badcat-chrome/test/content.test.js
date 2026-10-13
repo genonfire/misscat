@@ -947,3 +947,73 @@ test('ON test on a new chat ignores the hidden composer too', async () => {
   assert.deepEqual(t.log.submitted, [RESTORED]);
   assert.equal(t.log.ghostClicks, 0);
 });
+
+// --- reasoning effort: Medium is raised to High before the send (never blocks it) ---
+const effortBoot = (options = {}) => boot({ buttonSubmits: true, enterSubmits: false, effort: 'Medium', ...options });
+
+test('reasoning Medium is raised to High with one ArrowRight on the menu row, then the command is sent', async () => {
+  const t = effortBoot();
+  const res = await t.send({ type: 'badcat:handoff', pr: 123 });
+  assert.equal(res.ok, true, res.error);
+  assert.equal(t.effortLevel(), 'High');
+  assert.equal(res.note, 'reasoning set to High');
+  assert.equal(t.log.effortEvents.filter((e) => e === 'row:keydown:ArrowRight').length, 1);
+  assert.ok(t.log.effortEvents.includes('pointerdown')); // opened the way such menus open
+  assert.equal(t.log.effortClicks, 0);
+  assert.deepEqual(t.log.submitted, [TEXT]);
+  assert.equal(t.log.clicks, 1);
+  assert.equal(t.log.decoyClicks, 0);
+});
+
+test('reasoning already High, or another level, is left alone', async () => {
+  for (const effort of ['High', 'Low']) {
+    const t = effortBoot({ effort });
+    const res = await t.send({ type: 'badcat:handoff', pr: 123 });
+    assert.equal(res.ok, true);
+    assert.equal(t.effortLevel(), effort);
+    assert.deepEqual(t.log.effortEvents, [], effort);
+  }
+});
+
+test('a menu that only opens on click is still opened', async () => {
+  const t = effortBoot({ effortOpensOn: 'click' });
+  const res = await t.send({ type: 'badcat:handoff', pr: 123 });
+  assert.equal(res.ok, true);
+  assert.equal(t.effortLevel(), 'High');
+  assert.equal(t.log.effortClicks, 1);
+});
+
+test('if High cannot be set the command is still sent and the note says so', async () => {
+  const t = effortBoot({ arrowRaises: false });
+  const res = await t.send({ type: 'badcat:handoff', pr: 123 });
+  assert.equal(res.ok, true);
+  assert.match(res.note, /could not raise/);
+  assert.equal(t.effortLevel(), 'Medium');
+  assert.deepEqual(t.log.submitted, [TEXT]);
+});
+
+test('if the menu never opens the command is still sent', async () => {
+  const t = effortBoot({ effortOpensOn: 'never' });
+  const res = await t.send({ type: 'badcat:handoff', pr: 123 });
+  assert.equal(res.ok, true);
+  assert.match(res.note, /could not open/);
+  assert.deepEqual(t.log.submitted, [TEXT]);
+});
+
+test('no reasoning selector: nothing is touched and there is no note', async () => {
+  const t = boot({ buttonSubmits: true, enterSubmits: false });
+  const res = await t.send({ type: 'badcat:handoff', pr: 123 });
+  assert.equal(res.ok, true);
+  assert.equal(res.note, undefined);
+});
+
+test('ON test on a new chat raises Medium to High and says so in the result', async () => {
+  const t = newChatBoot({ effort: 'Medium' });
+  await t.send({ type: 'badcat:activate', session: SESSION });
+  await probe(t);
+  const result = await explicitDone(t);
+  assert.equal(result.ok, true, result.message);
+  assert.match(result.message, /reasoning set to High/);
+  assert.equal(t.effortLevel(), 'High');
+  assert.deepEqual(t.log.submitted, [RESTORED]);
+});
