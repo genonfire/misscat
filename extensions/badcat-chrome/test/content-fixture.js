@@ -205,10 +205,11 @@ function boot({ url = GOOD_URL, composer = true, enterSubmits = true, buttonSubm
   const runtimeCalls = [];
   const observers = [];
   const ctx = { url };
-  const limitAlert = (text, labels) => {
+  const limitAlert = (text, labels, hidden = false) => {
     const buttons = labels.map((l) => { const b = node('button', { type: 'button' }); b.textContent = l; b.clicks = 0; b.click = () => { b.clicks += 1; }; return b; });
     const aside = node('aside', { role: 'alert' }, buttons);
     aside.textContent = text + labels.join('');
+    if (hidden) { aside.offsetWidth = 0; aside.offsetHeight = 0; buttons.forEach((b) => { b.offsetWidth = 0; b.offsetHeight = 0; }); }
     aside.buttons = buttons;
     page.children.push(aside);
     aside.parentElement = page;

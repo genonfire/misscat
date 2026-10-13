@@ -190,12 +190,13 @@
   const UNCERTAIN = { ok: false, ambiguous: true, error: 'submission could not be confirmed; not sent again' };
   const ROLLOVER_COOLDOWN_MS = 30000;
   let rolloverClickedAt = null;
-  // The "new chat" button of the real limit alert, or null. Duplicated buttons: the first match wins.
+  // The "new chat" button of the real limit alert, or null. Duplicated buttons: the first match wins. Alerts of
+  // earlier chats may stay in the DOM hidden: only a rendered alert and button count.
   function findLimitButton() {
     for (const alert of document.querySelectorAll(LIMIT_ALERT)) {
-      if (!LIMIT_TEXT_RE.test(alert.textContent || '')) continue; // some other alert
+      if (!isVisible(alert) || !LIMIT_TEXT_RE.test(alert.textContent || '')) continue; // hidden, or some other alert
       for (const button of alert.querySelectorAll('button')) {
-        if (NEW_CHAT_LABELS.includes((button.textContent || '').trim())) return button;
+        if (isVisible(button) && NEW_CHAT_LABELS.includes((button.textContent || '').trim())) return button;
       }
     }
     return null;

@@ -1032,3 +1032,25 @@ test('ON test: a duplicate probe of the same session runs once', async () => {
   assert.deepEqual(clicks(alert), [1]);
   assert.equal(t.log.submitted.length, 1);
 });
+
+// --- a limit alert of an earlier chat that ChatGPT keeps in the DOM, hidden, is never clicked ---
+test('ON test: a hidden limit alert in the DOM is ignored (nothing clicked, nothing announced)', async () => {
+  const t = boot({ url: 'https://chatgpt.com/c/abc-123', initial: 'my own draft' });
+  await t.send({ type: 'badcat:activate', session: SESSION });
+  const alert = t.limitAlert(LIMIT, ['새 채팅에서 계속하기'], true);
+  await probe(t);
+  const result = await explicitDone(t);
+  assert.equal(result.none, true);
+  assert.deepEqual(clicks(alert), [0]);
+  assert.equal(announced(t).length, 0);
+  assert.equal(t.text(), 'my own draft');
+});
+
+test('+1 handoff: a hidden limit alert does not start a rollover; the command is sent normally', async () => {
+  const t = await activated();
+  const alert = t.limitAlert(LIMIT, ['새 대화 시작'], true);
+  const res = await pending(t);
+  assert.equal(res.rollover, undefined);
+  assert.deepEqual(clicks(alert), [0]);
+  assert.equal(announced(t).length, 0);
+});
