@@ -872,40 +872,6 @@ test('if the paste inserts nothing either, nothing is sent and the failure is re
   assert.deepEqual(t.log.submitted, []);
 });
 
-// --- ON pressed on a new chat that already holds the restored, unsent command ---
-const newChatBoot = (options = {}) => boot({ url: NEW_CHAT, buttonSubmits: true, enterSubmits: false, initial: RESTORED,
-  selector: 'Code Review', menu: [{ value: 'g-p-1-proj', text: 'Code Review' }], ...options });
-
-test('ON on a new chat submits the restored command with the real send button', async () => {
-  const t = newChatBoot();
-  await t.send({ type: 'badcat:activate', session: SESSION });
-  await probe(t);
-  const result = await explicitDone(t);
-  assert.equal(result.ok, true, result.message);
-  assert.deepEqual(t.log.submitted, [RESTORED]);
-  assert.equal(t.log.clicks, 1);
-  assert.deepEqual(t.log.keys, []);
-  assert.deepEqual(t.log.fills, []);
-  assert.equal(announced(t).length, 0); // no limit alert is involved
-});
-
-for (const [name, options, expected] of [
-  ['a different draft', { initial: 'something I typed' }, /something other than one MissCat command/],
-  ['an empty composer', { initial: '' }, /restored no command/],
-  ['no project selected', { selector: null }, /no project is selected/],
-]) {
-  test('ON on a new chat with ' + name + ' sends nothing', async () => {
-    const t = newChatBoot(options);
-    await t.send({ type: 'badcat:activate', session: SESSION });
-    await probe(t);
-    const result = await explicitDone(t);
-    assert.equal(result.ok, false);
-    assert.match(result.message, expected);
-    assert.deepEqual(t.log.submitted, []);
-    assert.deepEqual(t.log.fills, []);
-  });
-}
-
 // --- the picker lists the bare project ID while the URL carries "<id>-<name>" ---
 test('project check: the picker ID may be the leading part of the URL slug', async () => {
   const { t } = await limited({ menu: [{ value: 'g-p-1', text: 'Code Review' }] });
@@ -938,9 +904,8 @@ test('a hidden composer in the DOM is ignored: the visible one is filled and its
   assert.equal(t.ghost.textContent, 'ghost draft');
 });
 
-test('ON test on a new chat ignores the hidden composer too', async () => {
-  const t = newChatBoot({ ghostComposer: true });
-  await t.send({ type: 'badcat:activate', session: SESSION });
+test('ON test ignores the hidden composer too', async () => {
+  const { t } = await limited({ ghostComposer: true });
   await probe(t);
   const result = await explicitDone(t);
   assert.equal(result.ok, true, result.message);
@@ -1008,9 +973,8 @@ test('no reasoning selector: nothing is touched and there is no note', async () 
   assert.equal(res.note, undefined);
 });
 
-test('ON test on a new chat raises Medium to High and says so in the result', async () => {
-  const t = newChatBoot({ effort: 'Medium' });
-  await t.send({ type: 'badcat:activate', session: SESSION });
+test('ON test raises Medium to High and says so in the result', async () => {
+  const { t } = await limited({ effort: 'Medium' });
   await probe(t);
   const result = await explicitDone(t);
   assert.equal(result.ok, true, result.message);

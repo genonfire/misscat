@@ -26,7 +26,7 @@ test('starts OFF; ON binds the current tab and tells the host which repo to watc
 });
 
 test('start refuses a non-conversation tab, a missing tab and a bad repo without connecting', async () => {
-  let t = boot({ tabUrl: 'https://chatgpt.com/library' });
+  let t = boot({ tabUrl: 'https://chatgpt.com/' });
   assert.equal((await t.popup({ type: 'badcat:start', repo: 'o/r', tabId: 7 })).ok, false);
   t = boot();
   assert.equal((await t.popup({ type: 'badcat:start', repo: 'o/r', tabId: 99 })).ok, false);
@@ -775,17 +775,4 @@ test('ON still asks for a reload when injection fails', async () => {
   assert.equal(res.ok, false);
   assert.match(res.error, /Reload the ChatGPT tab/);
   assert.equal(t.natives.length, 0);
-});
-
-test('ON on a new chat (restored unsent command) starts a running ON test and keeps the tab valid', async () => {
-  const t = await started({ tabUrl: 'https://chatgpt.com/' });
-  assert.equal(t.session().explicit, 'running');
-  assert.equal(t.session().rollover.explicit, true);
-  assert.equal(t.session().rollover.project, '');
-  assert.equal(t.controls.filter((m) => m.type === 'badcat:explicit').length, 1);
-  assert.equal((await t.fromContent({ type: 'badcat:attempt', session: sid(t), explicit: true })).ok, true);
-  assert.equal((await t.fromContent({ type: 'badcat:attempt', session: sid(t), explicit: true })).ok, false);
-  await t.navigate('https://chatgpt.com/g/g-p-1-proj/c/new'); // the sent message created the conversation
-  assert.equal(t.session().active, true);
-  assert.equal(t.session().rollover, undefined);
 });

@@ -338,7 +338,6 @@
     } catch (e) {
       note = 'could not change the reasoning level';
     }
-    if (note) console.log('badcat:', note);
     if (!active()) return { ok: false, error: 'session stopped' };
     if (moved()) return changed;
     if (expectedProject && conversation && projectOf(location.href) !== expectedProject) {
@@ -431,7 +430,6 @@
   const RESTORED_RE = /^현재 작업 끝났으면 PR #([1-9][0-9]*) 리뷰해\.$/; // the exact MissCat command, nothing else
   let explicitRunning = false;
   const reportExplicit = (session, result) =>
-    console.log('badcat ON test:', result.none ? 'no limit alert' : (result.ok ? 'ok' : 'failed') + ' ' + (result.message || '')) ||
     chrome.runtime.sendMessage({ type: 'badcat:explicit-result', session: session, ...result }).catch(() => {});
 
   // Stage 2: in the new chat, submit the restored command with the real send button.
@@ -461,12 +459,6 @@
   async function startExplicit(session) {
     if (explicitRunning) return;
     explicitRunning = true;
-    if (isNewChatUrl(location.href)) {
-      // Started on a new chat that may already hold the restored, unsent command. Its original conversation (and
-      // project ID) is unknown, so at least a selected project must be visible.
-      if (projectLabel() === '') return reportExplicit(session, { ok: false, message: 'restore: no project is selected in this new chat; nothing sent' });
-      return continueExplicit(session, '');
-    }
     if (!isConversationUrl(location.href)) return reportExplicit(session, { none: true });
     const button = findLimitButton();
     if (!button || button.disabled) return reportExplicit(session, { none: true });
