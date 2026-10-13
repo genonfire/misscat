@@ -15,8 +15,8 @@ const ROLLOVER_WAIT_MS = 3000; // a started rollover is progress, not a failed a
 const MAX_ROLLOVER_WAITS = 10;
 const EXPLICIT_WAIT_MS = 1000; // a +1 never overlaps a running ON test: it waits for the test's result (bounded)
 const MAX_EXPLICIT_WAITS = 90;
-const TESTED_KEY = 'badcat.test-submitted.v1'; // {"repo#pr": time}: commands the ON test submitted (or may have)
-const TESTED_WINDOW_MS = 15 * 60 * 1000;
+const PENDING_KEY = 'badcat.pending.v1'; // {eventKey: {repo, pr}}: handoffs that were started but never confirmed delivered
+const MAX_PENDING = 50;
 
 let storageQueue = Promise.resolve();
 let controlQueue = Promise.resolve();
@@ -179,31 +179,45 @@ function rememberUncertain(key, connection) {
   return save.then(() => saved);
 }
 
-// The ON test submits a restored command that no event is attached to. A real +1 for that very PR must not send the
-// same command again (and is never ACKed on the test's behalf): it stays unresolved at the host until the window ends.
-const testedKey = (repo, pr) => String(repo).toLowerCase() + '#' + pr;
+// The ON test submits a restored command that no event is attached to. The only event it can be tied to is one whose
+// handoff this extension started for that PR and never confirmed: that exact event becomes "uncertain" (never sent
+// again, never ACKed, cleared only by the user's next Start), with no timeout. Every other event, including a new
+// HEAD or review of the same PR, is independent and goes out at once.
 const validPr = (pr) => Number.isSafeInteger(pr) && pr >= 1;
 
-function updateTested(change) {
+function updatePending(change) {
   const save = storageQueue.then(async () => {
-    const stored = await chrome.storage.local.get(TESTED_KEY);
-    const now = Date.now();
-    const kept = Object.entries(stored[TESTED_KEY] || {}).filter(([, at]) => typeof at === 'number' && now - at < TESTED_WINDOW_MS).slice(-50);
-    const map = Object.fromEntries(kept);
-    change(map, now);
-    await chrome.storage.local.set({ [TESTED_KEY]: map });
+    const stored = await chrome.storage.local.get(PENDING_KEY);
+    const map = { ...(stored[PENDING_KEY] || {}) };
+    change(map);
+    await chrome.storage.local.set({ [PENDING_KEY]: Object.fromEntries(Object.entries(map).slice(-MAX_PENDING)) });
   });
   storageQueue = save.catch(() => {});
   return save;
 }
 
-const recordTested = (repo, pr) => updateTested((map, now) => { map[testedKey(repo, pr)] = now; });
-const forgetTested = (repo, pr) => updateTested((map) => { delete map[testedKey(repo, pr)]; });
+const markPending = (key, event) => updatePending((map) => { delete map[key]; map[key] = { repo: event.repo, pr: event.pr }; });
+const unmarkPending = (key) => updatePending((map) => { delete map[key]; });
 
-async function wasTested(repo, pr) {
-  const stored = await chrome.storage.local.get(TESTED_KEY);
-  const at = (stored[TESTED_KEY] || {})[testedKey(repo, pr)];
-  return typeof at === 'number' && Date.now() - at < TESTED_WINDOW_MS;
+// At the ON test's attempt: the pending events of exactly this repo and PR are the ones the restored command belongs to.
+async function linkTestedEvents(repo, pr, connection) {
+  const linked = [];
+  await updatePending((map) => {
+    for (const [key, value] of Object.entries(map)) {
+      if (value.repo === repo.toLowerCase() && value.pr === pr) { linked.push(key); delete map[key]; }
+    }
+  });
+  for (const key of linked) await rememberUncertain(key, connection);
+  return linked;
+}
+
+// The test definitely submitted nothing: the command is still waiting, so those events are retryable again.
+async function unlinkTestedEvents(keys) {
+  for (const key of keys) {
+    await forgetUncertain(key);
+    const [repo, rest] = key.split('#');
+    await updatePending((map) => { map[key] = { repo: repo, pr: Number(rest.split('@')[0]) }; });
+  }
 }
 
 function clearUncertain() {
@@ -323,12 +337,6 @@ async function deliverEvent(connection, message) {
       return;
     }
     if (connection !== port) return;
-    if (await wasTested(event.repo, event.pr)) {
-      await reportError(connection, 'PR #' + event.pr + ' was just submitted by the ON test; not sent again.');
-      return; // not ACKed, not marked delivered: the host keeps it until the test window has passed
-    }
-    if (connection !== port) return;
-
     let tab;
     try {
       tab = await chrome.tabs.get(current.tabId);
@@ -351,6 +359,7 @@ async function deliverEvent(connection, message) {
     }
 
     inFlight = { connection: connection, key: key };
+    await markPending(key, event); // until delivery is confirmed this event may own a draft left in a composer
     try {
       const request = { type: 'badcat:handoff', pr: event.pr, event: event, session: connection.sessionId };
       if (current.rollover && current.rollover.project) request.project = current.rollover.project;
@@ -367,6 +376,7 @@ async function deliverEvent(connection, message) {
         storageQueue = save.catch(() => {});
         await save;
         await forgetUncertain(key); // it was confirmed after all
+        await unmarkPending(key);
         await clearError(connection);
         acknowledge(connection, event);
         return;
@@ -458,8 +468,9 @@ async function attempt(message, sender) {
   if (message.explicit === true) {
     // The ON test submits the restored command once. It has no event: no delivered/uncertain record, no ACK.
     if (session.explicit !== 'running' || !session.rollover || !session.rollover.explicit || !validPr(message.pr)) return { ok: false };
-    await recordTested(session.repo, message.pr); // before the send: a broken channel afterwards must not allow a resend
-    await setSession({ ...session, explicit: 'used' }); // single use, persisted before the send
+    // Before the send: a broken channel afterwards must not allow a resend of the events this command belongs to.
+    const linked = await linkTestedEvents(session.repo, message.pr, port);
+    await setSession({ ...session, explicit: 'used', linked: linked }); // single use, persisted before the send
     return { ok: true };
   }
   if (inFlight === null || inFlight.connection !== port) return { ok: false };
@@ -470,7 +481,7 @@ async function attempt(message, sender) {
 async function explicitResult(message, sender) {
   const session = await boundSender(sender, true);
   if (session === null || port === null || message.session !== port.sessionId) return { ok: false };
-  const { explicit, ...rest } = session;
+  const { explicit, linked, ...rest } = session;
   // The test's own exception ends with its result (success, failure or no alert): what remains of a started
   // rollover is the ordinary one a +1 would have made, with the same project checks.
   if (rest.rollover && rest.rollover.explicit) rest.rollover = { project: rest.rollover.project };
@@ -479,8 +490,8 @@ async function explicitResult(message, sender) {
     return { ok: true };
   }
   if (explicit !== 'running' && explicit !== 'used') return { ok: false };
-  // Definitely not submitted: the command is still waiting, so a real +1 for it may go out normally.
-  if (message.submitted !== true && validPr(message.pr)) await forgetTested(rest.repo, message.pr);
+  // Definitely not submitted: the command is still waiting, so the events tied to it are retryable again.
+  if (message.submitted !== true && Array.isArray(linked)) await unlinkTestedEvents(linked);
   const text = String(message.message || '').slice(0, 200);
   await setSession({ ...rest, explicit: 'used', test: { ok: message.ok === true, message: text },
     error: message.ok === true ? rest.error : 'ON test: ' + text });

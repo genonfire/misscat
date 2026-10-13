@@ -794,95 +794,125 @@ test('after the ON test ends (failure or success) its temporary rollover excepti
   }
 });
 
-// --- a real +1 and the ON test must never submit the same command twice ---
-const drain = async (t) => { for (let i = 0; i < 40 && t.timers.length; i += 1) { t.timers.shift().fn(); await t.settle(); await t.settle(); } };
+// --- a real +1 and the ON test must never submit the same command twice: decided per event, never by a timer ---
+const drain = async (t) => { for (let i = 0; i < 60 && t.timers.length; i += 1) { t.timers.shift().fn(); await t.settle(); await t.settle(); } };
 const ackCount = (t) => t.natives[t.natives.length - 1].posted.filter((m) => m.type === 'ack').length;
-// ON in a limited conversation: the test is running (rollover announced, new chat reached).
-async function onTestRunning(opts = {}) {
-  const t = await started({ tabUrl: PROJECT_URL, fakeTimers: true, ...opts });
+const sentFor = (t, pr, head) => t.sent.filter((x) => x.message.pr === pr && (!head || x.message.event.head === head)).length;
+const uncertainList = (t) => t.store['badcat.uncertain.v1'] || [];
+
+// A limited conversation. The first handoff of PR 9 (HEAD1, review 100) fails and leaves its command as a draft: that
+// event is "pending". Then the ON test reaches the new chat. `mode.ok` switches the tab's answer for later handoffs.
+async function pendingThenTest({ failFirst = true } = {}) {
+  const mode = { ok: false };
+  const t = await started({ tabUrl: PROJECT_URL, fakeTimers: true, handoff: async () => (mode.ok ? { ok: true } : { ok: false, error: 'composer not found' }) });
+  if (failFirst) {
+    t.natives[0].emit(plus1(9, HEAD1));
+    await t.settle(); await t.settle(); await drain(t);
+    assert.ok(Object.keys(t.store['badcat.pending.v1'] || {}).length === 1);
+  }
+  mode.ok = true;
   await t.fromContent({ type: 'badcat:rollover', session: sid(t), explicit: true });
   await t.navigate('https://chatgpt.com/');
-  return t;
+  return { t, mode };
 }
-const finishTest = async (t, result) => {
-  await t.fromContent({ type: 'badcat:attempt', session: sid(t), explicit: true, pr: 9 });
-  await t.fromContent({ type: 'badcat:explicit-result', session: sid(t), pr: 9, submitted: true, ok: true, message: 'Submitted', ...result });
-};
+const attemptTest = (t, pr = 9) => t.fromContent({ type: 'badcat:attempt', session: sid(t), explicit: true, pr: pr });
+const resultOf = (t, extra = {}) => t.fromContent({ type: 'badcat:explicit-result', session: sid(t), pr: 9, submitted: true, ok: true, message: 'Submitted', ...extra });
+const emit = async (t, event) => { t.natives[t.natives.length - 1].emit(event); await t.settle(); await t.settle(); await drain(t); };
 
-test('dedupe: a +1 for the same PR that arrives DURING the ON test waits, then is neither sent nor ACKed', async () => {
-  const t = await onTestRunning();
-  t.natives[0].emit(plus1(9, HEAD1));
-  await t.settle(); await t.settle();
-  assert.equal(t.sent.length, 0); // held while the test owns the tab
-  await finishTest(t);
-  await drain(t);
-  assert.equal(t.sent.length, 0);
+test('dedupe: the event whose draft the ON test submitted is never sent again, however late the host replays it', async () => {
+  const { t } = await pendingThenTest();
+  assert.equal((await attemptTest(t)).ok, true);
+  await resultOf(t);
+  const before = sentFor(t, 9);
+  await emit(t, plus1(9, HEAD1)); // the host's replay, now or in 16 minutes: there is no clock in this decision
+  await emit(t, plus1(9, HEAD1));
+  assert.equal(sentFor(t, 9), before);
   assert.equal(ackCount(t), 0);
   assert.equal(t.store['badcat.delivered.v2'], undefined);
-  assert.match(t.session().error, /already submitted|just submitted by the ON test/);
+  assert.deepEqual(JSON.parse(JSON.stringify(uncertainList(t))), ['o/r#9@' + HEAD1 + ':100']);
+  assert.match(t.session().error, /could not be confirmed/);
+  assert.equal(t.session().active, true);
+  await t.popup({ type: 'badcat:stop', tabId: 7 }); // Stop alone keeps the block; only Start clears it
+  assert.equal(uncertainList(t).length, 1);
 });
 
-test('dedupe: a +1 for the same PR right AFTER a successful ON test is neither sent nor ACKed, and it survives Stop/Start', async () => {
-  let t = await onTestRunning();
-  await finishTest(t);
-  t.natives[0].emit(plus1(9, HEAD1));
-  await t.settle(); await t.settle(); await drain(t);
-  assert.equal(t.sent.length, 0);
-  assert.equal(ackCount(t), 0);
-  assert.ok(t.store['badcat.test-submitted.v1']['o/r#9']);
-  await t.popup({ type: 'badcat:stop', tabId: 7 });
-  t.tabs[7].url = PROJECT_URL;
-  assert.equal((await t.popup({ type: 'badcat:start', repo: 'o/r', tabId: 7 })).ok, true);
-  t.natives[1].emit(plus1(9, HEAD1)); // the host replays it after the restart
-  await t.settle(); await t.settle(); await drain(t);
-  assert.equal(t.sent.length, 0);
-  assert.equal(t.natives[1].posted.filter((m) => m.type === 'ack').length, 0);
+test('dedupe: a NEW +1 for the same PR (new HEAD, or new review ID) is delivered and ACKed at once', async () => {
+  const { t } = await pendingThenTest();
+  await attemptTest(t);
+  await resultOf(t);
+  const before = sentFor(t, 9);
+  await emit(t, plus1(9, HEAD2, { review_id: 101 }));
+  assert.equal(sentFor(t, 9, HEAD2), 1);
+  await emit(t, plus1(9, HEAD1, { review_id: 102 })); // same HEAD, newer review
+  assert.equal(sentFor(t, 9, HEAD1), before + 1);
+  assert.equal(ackCount(t), 2);
+  assert.equal(uncertainList(t).length, 1); // only the linked event stays blocked
 });
 
-test('dedupe: an unconfirmed ON submission blocks the same PR as well', async () => {
-  const t = await onTestRunning();
-  await finishTest(t, { ok: false, message: 'submit: unconfirmed' }); // submitted: true = may be out there
-  t.natives[0].emit(plus1(9, HEAD1));
-  await t.settle(); await t.settle(); await drain(t);
-  assert.equal(t.sent.length, 0);
-  assert.equal(ackCount(t), 0);
+test('dedupe: a +1 for another PR is delivered and ACKed normally', async () => {
+  const { t } = await pendingThenTest();
+  await attemptTest(t);
+  await resultOf(t);
+  await emit(t, plus1(10, HEAD2));
+  assert.equal(sentFor(t, 10), 1);
+  assert.equal(ackCount(t), 1);
 });
 
-test('dedupe: a +1 for ANOTHER PR is delivered and ACKed normally, during (after the test) and after', async () => {
-  const t = await onTestRunning();
-  t.natives[0].emit(plus1(10, HEAD2));
+test('dedupe: a +1 that arrives DURING the test waits; the linked event stays blocked, an independent one goes out', async () => {
+  const { t } = await pendingThenTest();
+  const before = sentFor(t, 9);
+  t.natives[0].emit(plus1(9, HEAD1)); // replay of the pending event
+  t.natives[0].emit(plus1(9, HEAD2, { review_id: 101 })); // an independent new one
   await t.settle(); await t.settle();
-  assert.equal(t.sent.length, 0); // held while the test runs
-  await finishTest(t);
+  assert.equal(sentFor(t, 9), before); // both held while the test owns the tab
+  await attemptTest(t);
+  await resultOf(t);
   await drain(t);
-  assert.equal(t.sent.length, 1);
-  assert.equal(t.sent[0].message.pr, 10);
-  assert.equal(ackCount(t), 1);
-  assert.equal(t.natives[0].posted.find((m) => m.type === 'ack').pr, 10);
-});
-
-test('dedupe: if the ON test did not submit anything, a +1 for that PR is sent normally', async () => {
-  const t = await onTestRunning();
-  await finishTest(t, { ok: false, submitted: false, message: 'submit: the send button is disabled; not sent' });
-  assert.equal(t.store['badcat.test-submitted.v1']['o/r#9'], undefined);
-  t.natives[0].emit(plus1(9, HEAD1));
-  await t.settle(); await t.settle(); await drain(t);
-  assert.equal(t.sent.length, 1);
+  assert.equal(sentFor(t, 9, HEAD1), before); // blocked: never a second copy of the submitted command
+  assert.equal(sentFor(t, 9, HEAD2), 1);
   assert.equal(ackCount(t), 1);
 });
 
-test('dedupe: the block ends after its window, so a later +1 for that PR is delivered', async () => {
-  const t = await onTestRunning();
-  await finishTest(t);
-  t.store['badcat.test-submitted.v1']['o/r#9'] = Date.now() - 16 * 60 * 1000;
-  t.natives[0].emit(plus1(9, HEAD1));
-  await t.settle(); await t.settle(); await drain(t);
-  assert.equal(t.sent.length, 1);
+test('dedupe: an event the extension never attempted cannot be tied to the command and is delivered', async () => {
+  const { t } = await pendingThenTest({ failFirst: false });
+  await attemptTest(t);
+  await resultOf(t);
+  assert.equal(uncertainList(t).length, 0);
+  await emit(t, plus1(9, HEAD1));
+  assert.equal(sentFor(t, 9), 1);
   assert.equal(ackCount(t), 1);
+});
+
+test('dedupe: if the ON test definitely submitted nothing, the tied event is retryable again', async () => {
+  const { t } = await pendingThenTest();
+  await attemptTest(t);
+  assert.equal(uncertainList(t).length, 1);
+  await resultOf(t, { ok: false, submitted: false, message: 'submit: the send button is disabled; not sent' });
+  assert.equal(uncertainList(t).length, 0);
+  assert.equal(Object.keys(t.store['badcat.pending.v1']).length, 1);
+  const before = sentFor(t, 9);
+  await emit(t, plus1(9, HEAD1));
+  assert.equal(sentFor(t, 9), before + 1);
+  assert.equal(ackCount(t), 1);
+});
+
+test('dedupe: an unconfirmed ON submission keeps the tied event blocked', async () => {
+  const { t } = await pendingThenTest();
+  await attemptTest(t);
+  await resultOf(t, { ok: false, submitted: true, message: 'submit: unconfirmed' });
+  assert.equal(uncertainList(t).length, 1);
+});
+
+test('dedupe: a delivered event leaves the pending list', async () => {
+  const t = await started({ tabUrl: PROJECT_URL, fakeTimers: true });
+  await emit(t, plus1(9, HEAD1));
+  assert.equal(ackCount(t), 1);
+  assert.equal(Object.keys(t.store['badcat.pending.v1']).length, 0);
 });
 
 test('dedupe: an explicit attempt without a valid PR number is refused', async () => {
-  const t = await onTestRunning();
+  const { t } = await pendingThenTest();
   assert.equal((await t.fromContent({ type: 'badcat:attempt', session: sid(t), explicit: true })).ok, false);
   assert.equal((await t.fromContent({ type: 'badcat:attempt', session: sid(t), explicit: true, pr: 0 })).ok, false);
+  assert.equal(uncertainList(t).length, 0);
 });
