@@ -800,15 +800,17 @@ const ackCount = (t) => t.natives[t.natives.length - 1].posted.filter((m) => m.t
 const sentFor = (t, pr, head) => t.sent.filter((x) => x.message.pr === pr && (!head || x.message.event.head === head)).length;
 const uncertainList = (t) => t.store['badcat.uncertain.v1'] || [];
 
-// A limited conversation. The first handoff of PR 9 (HEAD1, review 100) fails and leaves its command as a draft: that
-// event is "pending". Then the ON test reaches the new chat. `mode.ok` switches the tab's answer for later handoffs.
-async function pendingThenTest({ failFirst = true } = {}) {
+// A limited conversation. The first handoff of PR 9 (HEAD1, review 100) fails AFTER the tab verified that the composer
+// holds its command (`draft: true`): that event is "pending". `draft: false` models a failure that left nothing behind
+// (composer missing, nothing typed). Then the ON test reaches the new chat. `mode.ok` switches the tab's answer later.
+async function pendingThenTest({ failFirst = true, draft = true } = {}) {
   const mode = { ok: false };
-  const t = await started({ tabUrl: PROJECT_URL, fakeTimers: true, handoff: async () => (mode.ok ? { ok: true } : { ok: false, error: 'composer not found' }) });
+  const failure = draft ? { ok: false, error: 'the send button is disabled; not sent', draft: true } : { ok: false, error: 'composer not found' };
+  const t = await started({ tabUrl: PROJECT_URL, fakeTimers: true, handoff: async () => (mode.ok ? { ok: true } : failure) });
   if (failFirst) {
     t.natives[0].emit(plus1(9, HEAD1));
     await t.settle(); await t.settle(); await drain(t);
-    assert.ok(Object.keys(t.store['badcat.pending.v1'] || {}).length === 1);
+    assert.equal(Object.keys(t.store['badcat.pending.v1'] || {}).length, draft ? 1 : 0);
   }
   mode.ok = true;
   await t.fromContent({ type: 'badcat:rollover', session: sid(t), explicit: true });
@@ -858,17 +860,46 @@ test('dedupe: a +1 for another PR is delivered and ACKed normally', async () => 
   assert.equal(ackCount(t), 1);
 });
 
-test('dedupe: a +1 that arrives DURING the test waits; the linked event stays blocked, an independent one goes out', async () => {
+test('dedupe: events that arrive DURING the test for the same PR cannot be shown independent and stay blocked; other PRs go out', async () => {
   const { t } = await pendingThenTest();
   const before = sentFor(t, 9);
   t.natives[0].emit(plus1(9, HEAD1)); // replay of the pending event
-  t.natives[0].emit(plus1(9, HEAD2, { review_id: 101 })); // an independent new one
+  t.natives[0].emit(plus1(9, HEAD2, { review_id: 101 })); // overlaps the test in time: not provably independent
+  t.natives[0].emit(plus1(10, HEAD2)); // another PR
   await t.settle(); await t.settle();
-  assert.equal(sentFor(t, 9), before); // both held while the test owns the tab
+  assert.equal(sentFor(t, 9) + sentFor(t, 10), before); // all held while the test owns the tab
   await attemptTest(t);
   await resultOf(t);
   await drain(t);
-  assert.equal(sentFor(t, 9, HEAD1), before); // blocked: never a second copy of the submitted command
+  assert.equal(sentFor(t, 9), before);
+  assert.equal(sentFor(t, 10), 1);
+  assert.equal(ackCount(t), 1);
+  assert.equal(uncertainList(t).length, 2);
+  await emit(t, plus1(9, HEAD2, { review_id: 102 })); // a later, independent review of the PR goes out at once
+  assert.equal(sentFor(t, 9, HEAD2), 1);
+  assert.equal(ackCount(t), 2);
+});
+
+test('dedupe: held events are released again if the test definitely submitted nothing', async () => {
+  const { t } = await pendingThenTest();
+  const before = sentFor(t, 9);
+  t.natives[0].emit(plus1(9, HEAD2, { review_id: 101 }));
+  await t.settle(); await t.settle();
+  await attemptTest(t);
+  await resultOf(t, { ok: false, submitted: false, message: 'submit: not sent' });
+  await drain(t);
+  assert.equal(uncertainList(t).length, 0);
+  assert.equal(sentFor(t, 9, HEAD2), 1);
+  assert.equal(ackCount(t), 1);
+});
+
+test('dedupe: a failure that left no draft never ties its event to the ON test: a new event of that PR is not blocked', async () => {
+  const { t } = await pendingThenTest({ draft: false });
+  assert.equal(Object.keys(t.store['badcat.pending.v1'] || {}).length, 0);
+  await attemptTest(t);
+  await resultOf(t);
+  assert.equal(uncertainList(t).length, 0);
+  await emit(t, plus1(9, HEAD2, { review_id: 101 }));
   assert.equal(sentFor(t, 9, HEAD2), 1);
   assert.equal(ackCount(t), 1);
 });

@@ -236,6 +236,14 @@
   // `explicit`: the one-time test started by Watching ON. The command is whatever MissCat command ChatGPT restored
   // in the new chat (the caller has already matched it exactly); nothing is typed and no limit alert is clicked.
   async function handoff(pr, session, event, expectedProject, explicit) {
+    // `draft` on a failed result: the composer verifiably held this very command at some point of the attempt, so a
+    // restored draft of it may exist later. No such proof (composer missing, nothing typed) means no draft.
+    const state = { draft: false };
+    const result = await handoffRun(state, pr, session, event, expectedProject, explicit);
+    return state.draft && result && result.ok !== true ? { ...result, draft: true } : result;
+  }
+
+  async function handoffRun(state, pr, session, event, expectedProject, explicit) {
     // A freshly reloaded page may still be rebinding to its session.
     if (session !== undefined && activeSession === null) await waitFor(() => activeSession !== null, 3000);
     const active = () => session === undefined || session === activeSession;
@@ -309,6 +317,7 @@
     }
     if (moved()) return changed;
     if (explicit && normalize(existing) !== text) return { ok: false, error: 'the restored command is no longer in the composer; not sent' };
+    if (containsCommand(normalize(existing), text)) state.draft = true; // already pending in the composer
     if (!containsCommand(normalize(existing), text)) {
       const full = existing ? existing + ' ' + text : text;
       appendToComposer(composer, existing, text);
@@ -329,6 +338,7 @@
       if (now !== normalize(full)) {
         return { ok: false, error: now.includes(text) ? 'the composer changed while filling; not sent' : 'could not fill the composer' };
       }
+      state.draft = true; // the composer now holds the command
     }
 
     if (!active()) return { ok: false, error: 'session stopped' };

@@ -1057,3 +1057,29 @@ test('+1 handoff: a hidden limit alert does not start a rollover; the command is
   assert.deepEqual(clicks(alert), [0]);
   assert.equal(announced(t).length, 0);
 });
+
+// --- a failed handoff says whether a draft holding its command was left behind (the background ties events to it) ---
+test('a failure after the composer holds the command reports draft: true', async () => {
+  const t = boot({ buttonDisabled: true });
+  const res = await t.send({ type: 'badcat:handoff', pr: 123 });
+  assert.equal(res.ok, false);
+  assert.equal(res.draft, true);
+});
+
+test('a failure with nothing typed (composer missing, text never arrived) reports no draft', async () => {
+  let t = boot({ composer: false });
+  let res = await t.send({ type: 'badcat:handoff', pr: 123 });
+  assert.equal(res.ok, false);
+  assert.equal(res.draft, undefined);
+  t = boot({ execFails: true, pasteFails: true });
+  res = await t.send({ type: 'badcat:handoff', pr: 123 });
+  assert.equal(res.ok, false);
+  assert.equal(res.draft, undefined);
+});
+
+test('a command already pending in the composer counts as a draft when the send fails', async () => {
+  const t = boot({ initial: TEXT, buttonDisabled: true });
+  const res = await t.send({ type: 'badcat:handoff', pr: 123 });
+  assert.equal(res.ok, false);
+  assert.equal(res.draft, true);
+});

@@ -149,6 +149,8 @@ function onHostMessage(connection, message) {
     deactivate('badcat-host: ' + message.error.slice(0, 200)); // not queued: retries may be sleeping
     return;
   }
+  const arrived = receivedKey(message);
+  if (arrived !== null) received.set(arrived.key, { repo: arrived.repo, pr: arrived.pr });
   queue = queue.then(() => handleEvent(connection, message)).catch(async (e) => {
     console.error('handoff failed', e);
     await reportError(connection, 'Handoff failed; delivery remains retryable.');
@@ -199,25 +201,39 @@ function updatePending(change) {
 const markPending = (key, event) => updatePending((map) => { delete map[key]; map[key] = { repo: event.repo, pr: event.pr }; });
 const unmarkPending = (key) => updatePending((map) => { delete map[key]; });
 
-// At the ON test's attempt: the pending events of exactly this repo and PR are the ones the restored command belongs to.
+// At the ON test's attempt: events whose handoff verifiably left this very command in a composer (pending), and the
+// events received from the host and still unfinished during the test for the same PR, whose independence cannot be shown (they overlap it in time),
+// are tied to the command. Every other event is independent.
 async function linkTestedEvents(repo, pr, connection) {
-  const linked = [];
+  const pending = [];
   await updatePending((map) => {
     for (const [key, value] of Object.entries(map)) {
-      if (value.repo === repo.toLowerCase() && value.pr === pr) { linked.push(key); delete map[key]; }
+      if (value.repo === repo.toLowerCase() && value.pr === pr) { pending.push(key); delete map[key]; }
     }
   });
-  for (const key of linked) await rememberUncertain(key, connection);
-  return linked;
+  for (const key of pending) await rememberUncertain(key, connection);
+  return { pending: pending, held: await linkHeldEvents(repo, pr, connection) };
 }
 
-// The test definitely submitted nothing: the command is still waiting, so those events are retryable again.
-async function unlinkTestedEvents(keys) {
-  for (const key of keys) {
+async function linkHeldEvents(repo, pr, connection) {
+  const held = [];
+  for (const [key, value] of received) {
+    if (value.repo === repo.toLowerCase() && value.pr === pr) {
+      await rememberUncertain(key, connection);
+      held.push(key);
+    }
+  }
+  return held;
+}
+
+// The test definitely submitted nothing: the command is still waiting, so the tied events are retryable again.
+async function unlinkTestedEvents(linked) {
+  for (const key of linked.pending || []) {
     await forgetUncertain(key);
     const [repo, rest] = key.split('#');
     await updatePending((map) => { map[key] = { repo: repo, pr: Number(rest.split('@')[0]) }; });
   }
+  for (const key of linked.held || []) await forgetUncertain(key);
 }
 
 function clearUncertain() {
@@ -288,6 +304,15 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 // Every handoff belongs to the connection that received the event; once that connection is no longer
 // the live one, the handoff is abandoned, even if repo and tab are unchanged in a newer session.
 let inFlight = null; // {connection, key}: the handoff currently being sent to the tab (one at a time)
+// Events received from the host and not finished yet (queued behind another one, waiting for the ON test, or retrying).
+// Registered on arrival: the connection handles events one at a time, so a queued one has not started yet.
+const received = new Map(); // eventKey -> {repo, pr}
+function receivedKey(message) {
+  if (message === null || typeof message !== 'object' || message.status !== '+1' || typeof message.repo !== 'string' ||
+      !Number.isSafeInteger(message.pr) || typeof message.head !== 'string' || !Number.isSafeInteger(message.review_id)) return null;
+  return { key: eventKey({ repo: message.repo, pr: message.pr, head: message.head, review_id: message.review_id }),
+    repo: message.repo.toLowerCase(), pr: message.pr };
+}
 let pendingEvents = 0; // validated +1 handoffs in progress; a rollover is only ever authorized by one of them
 
 async function handleEvent(connection, message) {
@@ -296,6 +321,8 @@ async function handleEvent(connection, message) {
     await deliverEvent(connection, message);
   } finally {
     pendingEvents -= 1;
+    const done = receivedKey(message);
+    if (done !== null) received.delete(done.key);
   }
 }
 
@@ -359,7 +386,6 @@ async function deliverEvent(connection, message) {
     }
 
     inFlight = { connection: connection, key: key };
-    await markPending(key, event); // until delivery is confirmed this event may own a draft left in a composer
     try {
       const request = { type: 'badcat:handoff', pr: event.pr, event: event, session: connection.sessionId };
       if (current.rollover && current.rollover.project) request.project = current.rollover.project;
@@ -393,6 +419,8 @@ async function deliverEvent(connection, message) {
       // Definitely not submitted: the attempt marker (if any) is withdrawn and the retry policy applies.
       console.error('handoff not delivered:', result && result.error);
       await forgetUncertain(key);
+      // Only a draft that verifiably holds this command can later be restored and submitted by the ON test.
+      if (result && result.draft === true) await markPending(key, event);
       if (result && result.rollover === true && rolloverWaits < MAX_ROLLOVER_WAITS) {
         // The tab is moving to the new chat: that is not a failed submission, so it keeps its attempts.
         rolloverWaits += 1;
@@ -470,7 +498,7 @@ async function attempt(message, sender) {
     if (session.explicit !== 'running' || !session.rollover || !session.rollover.explicit || !validPr(message.pr)) return { ok: false };
     // Before the send: a broken channel afterwards must not allow a resend of the events this command belongs to.
     const linked = await linkTestedEvents(session.repo, message.pr, port);
-    await setSession({ ...session, explicit: 'used', linked: linked }); // single use, persisted before the send
+    await setSession({ ...session, explicit: 'used', linked: linked, testPr: message.pr }); // single use, persisted before the send
     return { ok: true };
   }
   if (inFlight === null || inFlight.connection !== port) return { ok: false };
@@ -481,7 +509,7 @@ async function attempt(message, sender) {
 async function explicitResult(message, sender) {
   const session = await boundSender(sender, true);
   if (session === null || port === null || message.session !== port.sessionId) return { ok: false };
-  const { explicit, linked, ...rest } = session;
+  const { explicit, linked, testPr, ...rest } = session;
   // The test's own exception ends with its result (success, failure or no alert): what remains of a started
   // rollover is the ordinary one a +1 would have made, with the same project checks.
   if (rest.rollover && rest.rollover.explicit) rest.rollover = { project: rest.rollover.project };
@@ -491,7 +519,9 @@ async function explicitResult(message, sender) {
   }
   if (explicit !== 'running' && explicit !== 'used') return { ok: false };
   // Definitely not submitted: the command is still waiting, so the events tied to it are retryable again.
-  if (message.submitted !== true && Array.isArray(linked)) await unlinkTestedEvents(linked);
+  if (message.submitted !== true && linked) await unlinkTestedEvents(linked);
+  // Events that arrived at the host while the command was going out are tied to it as well.
+  if (message.submitted === true && validPr(testPr)) await linkHeldEvents(rest.repo, testPr, port);
   const text = String(message.message || '').slice(0, 200);
   await setSession({ ...rest, explicit: 'used', test: { ok: message.ok === true, message: text },
     error: message.ok === true ? rest.error : 'ON test: ' + text });
