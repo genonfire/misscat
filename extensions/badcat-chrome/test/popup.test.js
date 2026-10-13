@@ -17,7 +17,7 @@ async function boot({ session = INACTIVE, tabId = 7 } = {}) {
     addEventListener(type, fn) { handlers[type] = fn; }, ...extra,
   });
   const toggle = el();
-  const elements = { repo: el(), toggle, 'status-text': el(), error: el() };
+  const elements = { repo: el(), toggle, 'status-text': el(), error: el(), note: el() };
   const storageListeners = [];
   const chrome = {
     runtime: {

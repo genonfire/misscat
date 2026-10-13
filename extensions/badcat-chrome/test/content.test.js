@@ -663,3 +663,178 @@ test('#64 review: the project switches after a click that had no effect: the Ent
   assert.deepEqual(t.log.keys, []);
   assert.deepEqual(t.log.submitted, []);
 });
+
+// --- Watching ON test: the background probes once; the content script clicks the real limit button, waits for
+// the restored command in the new chat and submits it with the real send button (never a synthetic Enter) ---
+const NEW_CHAT = 'https://chatgpt.com/';
+const RESTORED = '현재 작업 끝났으면 PR #616 리뷰해.';
+const results = (t) => t.runtimeCalls.filter((m) => m.type === 'badcat:explicit-result');
+const explicitDone = async (t) => {
+  for (let i = 0; i < 300 && results(t).length === 0; i += 1) await t.settle();
+  return results(t)[0];
+};
+// A limited conversation whose "새 채팅에서 계속하기" button moves the tab to the new chat with `draft` restored.
+async function limited(options = {}, { draft = RESTORED, labels = ['새 채팅에서 계속하기'] } = {}) {
+  const t = boot({ url: 'https://chatgpt.com/g/g-p-1-proj/c/old', buttonSubmits: true, enterSubmits: false,
+    selector: 'Code Review', menu: [{ value: 'g-p-1-proj', text: 'Code Review' }], ...options });
+  await t.send({ type: 'badcat:activate', session: SESSION });
+  const alert = t.limitAlert(LIMIT, labels);
+  alert.buttons[0].click = () => {
+    alert.buttons[0].clicks += 1;
+    t.setUrl(NEW_CHAT);
+    t.editor.textContent = draft; // ChatGPT restores the unsent command
+  };
+  return { t, alert };
+}
+const probe = (t) => t.send({ type: 'badcat:explicit', session: SESSION });
+
+test('ON test: clicks the real "새 채팅에서 계속하기" once, then submits the restored command with the send button', async () => {
+  const { t, alert } = await limited();
+  assert.equal((await probe(t)).ok, true);
+  const result = await explicitDone(t);
+  assert.equal(result.ok, true, result.message);
+  assert.deepEqual(clicks(alert), [1]);
+  assert.equal(JSON.stringify(announced(t)), JSON.stringify([{ type: 'badcat:rollover', session: SESSION, explicit: true }]));
+  assert.deepEqual(t.log.submitted, [RESTORED]);
+  assert.equal(t.log.clicks, 1); // the real send button
+  assert.deepEqual(t.log.keys, []); // no synthetic key events
+  assert.deepEqual(t.log.fills, []); // nothing typed: only the restored command is submitted
+  const attempts = t.runtimeCalls.filter((m) => m.type === 'badcat:attempt');
+  assert.equal(attempts.length, 1);
+  assert.equal(attempts[0].explicit, true);
+});
+
+test('ON test: no limit alert means nothing is clicked, typed or sent', async () => {
+  const t = boot({ url: 'https://chatgpt.com/c/abc-123', initial: 'my own draft' });
+  await t.send({ type: 'badcat:activate', session: SESSION });
+  await probe(t);
+  const result = await explicitDone(t);
+  assert.equal(result.none, true);
+  assert.equal(announced(t).length, 0);
+  assert.deepEqual(t.log.fills, []);
+  assert.deepEqual(t.log.submitted, []);
+  assert.equal(t.text(), 'my own draft');
+});
+
+test('ON test: a probe for another session is ignored', async () => {
+  const { t, alert } = await limited();
+  assert.equal((await t.send({ type: 'badcat:explicit', session: 'other' })).ok, false);
+  await t.settle();
+  assert.deepEqual(clicks(alert), [0]);
+  assert.equal(announced(t).length, 0);
+});
+
+test('ON test: a refused rollover leaves the alert alone', async () => {
+  const { t, alert } = await limited({ rollover: { ok: false } });
+  await probe(t);
+  const result = await explicitDone(t);
+  assert.equal(result.ok, false);
+  assert.match(result.message, /not authorized/);
+  assert.deepEqual(clicks(alert), [0]);
+});
+
+test('ON test: the old "새 대화 시작" wording is still recognized', async () => {
+  const { t, alert } = await limited({}, { labels: ['새 대화 시작'] });
+  await probe(t);
+  assert.equal((await explicitDone(t)).ok, true);
+  assert.deepEqual(clicks(alert), [1]);
+});
+
+test('ON test: a duplicate probe never clicks or submits twice', async () => {
+  const { t, alert } = await limited();
+  await probe(t);
+  await probe(t);
+  await explicitDone(t);
+  assert.deepEqual(clicks(alert), [1]);
+  assert.equal(t.log.submitted.length, 1);
+});
+
+for (const [name, draft, expected] of [
+  ['an empty restored draft', '', /restored no command/],
+  ['a user draft', 'please summarize this', /something other than one MissCat command/],
+  ['two commands', RESTORED + ' ' + RESTORED, /something other than one MissCat command/],
+  ['the command plus other text', RESTORED + ' and also delete everything', /something other than one MissCat command/],
+  ['a command with a made-up PR number', '현재 작업 끝났으면 PR #0 리뷰해.', /something other than one MissCat command/],
+]) {
+  test('ON test: ' + name + ' is never submitted and the reason is reported', async () => {
+    const { t } = await limited({}, { draft });
+    await probe(t);
+    const result = await explicitDone(t);
+    assert.equal(result.ok, false);
+    assert.match(result.message, expected);
+    assert.deepEqual(t.log.submitted, []);
+    assert.deepEqual(t.log.fills, []); // an empty composer is not filled with an invented PR number either
+    assert.equal(t.runtimeCalls.filter((m) => m.type === 'badcat:attempt').length, 0);
+  });
+}
+
+test('ON test: a disabled send button sends nothing', async () => {
+  const { t } = await limited({ buttonDisabled: true });
+  await probe(t);
+  const result = await explicitDone(t);
+  assert.equal(result.ok, false);
+  assert.match(result.message, /disabled/);
+  assert.deepEqual(t.log.submitted, []);
+  assert.deepEqual(t.log.keys, []);
+});
+
+test('ON test: no send button means failure, not a synthetic Enter', async () => {
+  const { t } = await limited({ sendButton: false, enterSubmits: true });
+  await probe(t);
+  const result = await explicitDone(t);
+  assert.equal(result.ok, false);
+  assert.match(result.message, /send button not found/);
+  assert.deepEqual(t.log.submitted, []);
+  assert.deepEqual(t.log.keys, []);
+});
+
+test('ON test: a send button click that does nothing is a failure; the fake Enter is not used to pass it', async () => {
+  const { t } = await limited({ buttonSubmits: false, enterSubmits: true });
+  await probe(t);
+  const result = await explicitDone(t);
+  assert.equal(result.ok, false);
+  assert.match(result.message, /click had no effect/);
+  assert.equal(t.log.clicks, 1);
+  assert.deepEqual(t.log.keys, []);
+  assert.deepEqual(t.log.submitted, []);
+});
+
+test('ON test: a new chat in another project is never submitted', async () => {
+  const { t } = await limited({ selector: 'Other', menu: [{ value: 'g-p-9-other', text: 'Other' }] });
+  await probe(t);
+  const result = await explicitDone(t);
+  assert.equal(result.ok, false);
+  assert.match(result.message, /not in the original project/);
+  assert.deepEqual(t.log.submitted, []);
+  assert.equal(t.log.clicks, 0);
+});
+
+test('ON test: an unverifiable project (no selector) is never submitted', async () => {
+  const { t } = await limited({ selector: null });
+  await probe(t);
+  const result = await explicitDone(t);
+  assert.equal(result.ok, false);
+  assert.match(result.message, /cannot verify/);
+  assert.deepEqual(t.log.submitted, []);
+});
+
+test('ON test: if the tab never reaches a new chat the stage is reported', async () => {
+  const t = boot({ url: 'https://chatgpt.com/c/abc-123' });
+  await t.send({ type: 'badcat:activate', session: SESSION });
+  const alert = t.limitAlert(LIMIT, ['새 채팅에서 계속하기']);
+  await probe(t);
+  const result = await explicitDone(t);
+  assert.equal(result.ok, false);
+  assert.match(result.message, /^navigation:/);
+  assert.deepEqual(clicks(alert), [1]);
+  assert.deepEqual(t.log.submitted, []);
+});
+
+test('ON test: after a full page reload the new content script continues from the hello answer', async () => {
+  const t = boot({ url: NEW_CHAT, buttonSubmits: true, enterSubmits: false, initial: RESTORED,
+    hello: { ok: true, session: SESSION, explicit: { project: '' } } });
+  const result = await explicitDone(t);
+  assert.equal(result.ok, true, result.message);
+  assert.deepEqual(t.log.submitted, [RESTORED]);
+  assert.equal(t.log.clicks, 1);
+});

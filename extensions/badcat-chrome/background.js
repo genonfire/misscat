@@ -4,7 +4,7 @@ importScripts('shared.js');
 
 const { HOST_NAME, normalizeRepo, isConversationUrl, isNewChatUrl, projectOf, parseEvent, eventKey } = self.BadCatShared;
 
-const SESSION_KEY = 'badcat.session'; // {active, repo, tabId, error, rollover?: {project}}
+const SESSION_KEY = 'badcat.session'; // {active, repo, tabId, error, rollover?: {project}, explicit?: 'armed'|'running'|'used', test?: {ok, message}}
 const DELIVERED_KEY = 'badcat.delivered.v2';
 const LEGACY_KEY = 'badcat.delivered';
 const UNCERTAIN_KEY = 'badcat.uncertain.v1'; // handoffs that may have been submitted but could not be confirmed
@@ -89,13 +89,16 @@ async function start(repoInput, tabId) {
   queue = Promise.resolve();
   connection.onMessage.addListener((message) => onHostMessage(connection, message));
   connection.onDisconnect.addListener(() => onHostDisconnect(connection));
-  await setSession({ active: true, repo: repo, tabId: tabId, error: null });
+  // Watching ON arms exactly one explicit rollover/submit test; it needs no +1 event (see explicitProbe).
+  await setSession({ active: true, repo: repo, tabId: tabId, error: null, explicit: 'armed' });
   if (connection !== port) return { ok: false, error: 'badcat-host disconnected.' };
   try {
     const activated = await chrome.tabs.sendMessage(tabId, { type: 'badcat:activate', session: connection.sessionId });
     if (!activated || activated.ok !== true) throw new Error('activation failed');
     if (connection !== port) return { ok: false, error: 'badcat-host disconnected.' };
     connection.postMessage({ type: 'start', repo: repo });
+    // One bounded look for the real limit alert; the content script reports every outcome back.
+    chrome.tabs.sendMessage(tabId, { type: 'badcat:explicit', session: connection.sessionId }).catch(() => disarmExplicit(connection));
   } catch (e) {
     if (connection === port) await deactivate('Cannot start the ChatGPT handoff session.');
     return { ok: false, error: 'Cannot start the ChatGPT handoff session.' };
@@ -181,6 +184,14 @@ async function reportError(connection, error) {
   const session = await getSession();
   if (connection === port && session.active) {
     await setSession({ ...session, error: String(error || 'Handoff failed').slice(0, 200) });
+  }
+}
+
+async function disarmExplicit(connection) {
+  const session = await getSession();
+  if (connection === port && session.active && session.explicit === 'armed') {
+    const { explicit, ...rest } = session;
+    await setSession(rest);
   }
 }
 
@@ -348,10 +359,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (sender.id !== chrome.runtime.id || !message || typeof message !== 'object') return false;
   // A content script may only rebind itself to, or announce a rollover of, the session's own tab.
   if (sender.tab) {
-    if (message.type !== 'badcat:hello' && message.type !== 'badcat:rollover' && message.type !== 'badcat:attempt') return false;
+    const types = ['badcat:hello', 'badcat:rollover', 'badcat:attempt', 'badcat:explicit-result'];
+    if (!types.includes(message.type)) return false;
     const handle = async () => {
       await ready;
       if (message.type === 'badcat:hello') return hello(sender);
+      if (message.type === 'badcat:explicit-result') return explicitResult(message, sender);
       return message.type === 'badcat:attempt' ? attempt(message, sender) : rollover(message, sender);
     };
     const action = controlQueue.then(handle);
@@ -390,14 +403,40 @@ async function boundSender(sender, allowNewChat) {
 async function attempt(message, sender) {
   const session = await boundSender(sender, true);
   if (session === null || port === null || message.session !== port.sessionId) return { ok: false };
+  if (message.explicit === true) {
+    // The ON test submits the restored command once. It has no event: no delivered/uncertain record, no ACK.
+    if (session.explicit !== 'running' || !session.rollover || !session.rollover.explicit) return { ok: false };
+    await setSession({ ...session, explicit: 'used' }); // single use, persisted before the send
+    return { ok: true };
+  }
   if (inFlight === null || inFlight.connection !== port) return { ok: false };
   return { ok: await rememberUncertain(inFlight.key, inFlight.connection) };
+}
+
+// Outcome of the ON test, shown in the popup. It is a test result only: never a delivery or a review result.
+async function explicitResult(message, sender) {
+  const session = await boundSender(sender, true);
+  if (session === null || port === null || message.session !== port.sessionId) return { ok: false };
+  const { explicit, ...rest } = session;
+  if (message.none === true) {
+    if (explicit === 'armed') await setSession(rest);
+    return { ok: true };
+  }
+  if (explicit !== 'running' && explicit !== 'used') return { ok: false };
+  const text = String(message.message || '').slice(0, 200);
+  await setSession({ ...rest, explicit: 'used', test: { ok: message.ok === true, message: text },
+    error: message.ok === true ? rest.error : 'ON test: ' + text });
+  return { ok: true };
 }
 
 // A freshly loaded content script (e.g. after a full-page rollover navigation) asks for its session id.
 async function hello(sender) {
   const session = await boundSender(sender, true);
-  return session === null ? { ok: false } : { ok: true, session: port.sessionId };
+  if (session === null) return { ok: false };
+  // A reloaded page continues a running ON test (its rollover was announced, its single attempt is unused).
+  const resume = session.explicit === 'running' && session.rollover && session.rollover.explicit;
+  return resume ? { ok: true, session: port.sessionId, explicit: { project: session.rollover.project || '' } }
+    : { ok: true, session: port.sessionId };
 }
 
 // The content script saw the conversation-limit alert and is about to click "new chat". Record it
@@ -405,8 +444,15 @@ async function hello(sender) {
 async function rollover(message, sender) {
   const session = await boundSender(sender, false);
   if (session === null || port === null || message.session !== port.sessionId) return { ok: false };
-  // Only while a +1 is being handed off, and only one rollover at a time (until its new conversation exists).
-  if (pendingEvents === 0 || session.rollover) return { ok: false };
+  if (session.rollover) return { ok: false }; // one rollover at a time (until its new conversation exists)
+  if (message.explicit === true) {
+    // Authorized once by the user's Watching ON, without a +1.
+    if (session.explicit !== 'armed') return { ok: false };
+    await setSession({ ...session, explicit: 'running', rollover: { project: projectOf(sender.url), explicit: true } });
+    return { ok: true };
+  }
+  // Otherwise only while a +1 is being handed off.
+  if (pendingEvents === 0) return { ok: false };
   await setSession({ ...session, rollover: { project: projectOf(sender.url) } });
   return { ok: true };
 }

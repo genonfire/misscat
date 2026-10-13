@@ -13,7 +13,7 @@
   // The conversation-limit alert (observed wording; matched on text, never on generated classes).
   const LIMIT_ALERT = 'aside[role="alert"]';
   const LIMIT_TEXT_RE = /최대\s*(길이|깊이)|maximum\s+(conversation\s+)?(length|depth)/i;
-  const NEW_CHAT_LABELS = ['새 대화 시작', '새 채팅 시작', 'Start new chat', 'Start a new chat'];
+  const NEW_CHAT_LABELS = ['새 채팅에서 계속하기', '새 대화 시작', '새 채팅 시작', 'Start new chat', 'Start a new chat'];
   const NEW_CHAT_SETTLE_MS = 800; // ChatGPT restores the unsent draft shortly after the composer appears
   // The new chat's project selector (semantic attribute only) and the menu items it lists.
   const PROJECT_BUTTON = '[data-composer-navigation-target="workspace-project"]';
@@ -161,7 +161,9 @@
   };
 
   const submitted = new Set(); // survives service-worker restart while this tab stays open
-  async function handoff(pr, session, event, expectedProject) {
+  // `explicit`: the one-time test started by Watching ON. The command is whatever MissCat command ChatGPT restored
+  // in the new chat (the caller has already matched it exactly); nothing is typed and no limit alert is clicked.
+  async function handoff(pr, session, event, expectedProject, explicit) {
     // A freshly reloaded page may still be rebinding to its session.
     if (session !== undefined && activeSession === null) await waitFor(() => activeSession !== null, 3000);
     const active = () => session === undefined || session === activeSession;
@@ -176,12 +178,13 @@
     const startUrl = location.href;
     const changed = { ok: false, error: 'the page changed during the handoff; not sent' };
     const text = reviewMessage(pr);
-    const limit = await tryRollover(session); // an already-limited conversation cannot take the command
+    const rolloverOnce = explicit ? async () => null : tryRollover;
+    const limit = await rolloverOnce(session); // an already-limited conversation cannot take the command
     if (limit) return limit;
     if (!active()) return { ok: false, error: 'session stopped' };
     let composer = await waitFor(() => document.querySelector(COMPOSER), 5000);
     if (!active()) return { ok: false, error: 'session stopped' };
-    if (!composer) return (await tryRollover(session)) || { ok: false, error: 'composer not found' };
+    if (!composer) return (await rolloverOnce(session)) || { ok: false, error: 'composer not found' };
     // Every asynchronous step below may let the user (or ChatGPT) move to another chat: the decision to
     // type or send is never based on what was true at the start, only on the live page and composer.
     const moved = () => location.href !== startUrl || document.querySelector(COMPOSER) !== composer;
@@ -230,6 +233,7 @@
       }
     }
     if (moved()) return changed;
+    if (explicit && normalize(existing) !== text) return { ok: false, error: 'the restored command is no longer in the composer; not sent' };
     if (!containsCommand(normalize(existing), text)) {
       const full = existing ? existing + ' ' + text : text;
       appendToComposer(composer, existing, text);
@@ -278,14 +282,16 @@
       button = await waitFor(() => { const b = findSendButton(composer); return isEnabled(b) ? b : null; }, 2000);
       if (!active()) return { ok: false, error: 'session stopped' };
       if (moved()) return changed;
-      if (!button) return (await tryRollover(session)) || { ok: false, error: 'the send button is disabled; not sent' };
+      if (!button) return (await rolloverOnce(session)) || { ok: false, error: 'the send button is disabled; not sent' };
     }
+    // The ON test must prove the real UI path: no send button means no synthetic-Enter substitute.
+    if (explicit && !button) return { ok: false, error: 'send button not found; not sent' };
     if (session !== undefined) {
       // Durable "may be submitted" marker first: a channel broken by the navigation after sending must not
       // lead to an automatic resend. No marker, no send.
       let marked = null;
       try {
-        marked = await chrome.runtime.sendMessage({ type: 'badcat:attempt', session: session });
+        marked = await chrome.runtime.sendMessage({ type: 'badcat:attempt', session: session, explicit: explicit === true });
       } catch (e) { /* background unavailable */ }
       if (!marked || marked.ok !== true) return { ok: false, error: 'could not record the attempt; not sent' };
       if (!active()) return { ok: false, error: 'session stopped' };
@@ -309,6 +315,7 @@
     };
     let outcome = await submit(button ? () => button.click() : () => pressEnter(composer));
     // The button was accepted but nothing happened: Enter as the fallback, never after the page moved on.
+    if (explicit && outcome === 'pending') return { ok: false, error: 'the send button click had no effect; the command is still in the composer' };
     if (outcome === 'pending' && button && active() && !moved()) {
       const recheck = await projectStillRight();
       if (recheck) return recheck;
@@ -326,7 +333,55 @@
       return { ok: true };
     }
     // The send failed: the limit alert may have appeared in response; one bounded recheck.
-    return (await tryRollover(session)) || { ok: false, error: 'message was not submitted' };
+    return (await rolloverOnce(session)) || { ok: false, error: 'message was not submitted' };
+  }
+
+  // --- Watching ON test: one explicit rollover and submit, authorized by the user's click, without a +1. ---
+  const RESTORED_RE = /^현재 작업 끝났으면 PR #([1-9][0-9]*) 리뷰해\.$/; // the exact MissCat command, nothing else
+  let explicitRunning = false;
+  const reportExplicit = (session, result) =>
+    chrome.runtime.sendMessage({ type: 'badcat:explicit-result', session: session, ...result }).catch(() => {});
+
+  // Stage 2: in the new chat, submit the restored command with the real send button.
+  async function continueExplicit(session, project) {
+    const fail = (stage, error) => reportExplicit(session, { ok: false, message: stage + ': ' + error });
+    const reachedNewChat = await waitFor(() => isNewChatUrl(location.href) && document.querySelector(COMPOSER), 15000);
+    if (!reachedNewChat) return fail('navigation', 'did not reach a new chat');
+    await sleep(NEW_CHAT_SETTLE_MS);
+    const draftOf = () => { const c = document.querySelector(COMPOSER); return c ? normalize(readComposer(c)) : ''; };
+    const draft = await waitFor(() => RESTORED_RE.test(draftOf()) ? draftOf() : null, 8000);
+    if (!draft) {
+      return fail('restore', draftOf() === '' ? 'ChatGPT restored no command; nothing sent'
+        : 'the composer holds something other than one MissCat command; nothing sent');
+    }
+    const pr = Number(RESTORED_RE.exec(draft)[1]);
+    if (!Number.isSafeInteger(pr)) return fail('restore', 'invalid PR number; nothing sent');
+    const task = queue.then(() => handoff(pr, session, null, project, true));
+    queue = task.catch(() => {});
+    const result = await task.catch((e) => ({ ok: false, error: String(e && e.message) }));
+    if (result.ok) {
+      return reportExplicit(session, { ok: true, message: 'Submitted the restored command for PR #' + pr + ' (test only, not a delivery).' });
+    }
+    return fail('submit', result.error || 'not submitted');
+  }
+
+  // Stage 1: the limit alert of the current conversation, clicked at most once.
+  async function startExplicit(session) {
+    if (explicitRunning) return;
+    explicitRunning = true;
+    if (!isConversationUrl(location.href)) return reportExplicit(session, { none: true });
+    const button = findLimitButton();
+    if (!button || button.disabled) return reportExplicit(session, { none: true });
+    const project = projectOf(location.href) || '';
+    let answer = null;
+    try {
+      answer = await chrome.runtime.sendMessage({ type: 'badcat:rollover', session: session, explicit: true });
+    } catch (e) { /* background unavailable: leave the alert alone */ }
+    if (!answer || answer.ok !== true || session !== activeSession) {
+      return reportExplicit(session, { ok: false, message: 'rollover: not authorized; the alert was left alone' });
+    }
+    button.click();
+    await continueExplicit(session, project);
   }
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -338,6 +393,12 @@
     if (message.type === 'badcat:activate') {
       activeSession = message.session;
       sendResponse({ ok: true });
+      return false;
+    }
+    if (message.type === 'badcat:explicit') {
+      const ok = message.session === activeSession;
+      sendResponse({ ok: ok });
+      if (ok) startExplicit(message.session);
       return false;
     }
     if (message.type === 'badcat:cancel') {
@@ -365,6 +426,11 @@
     chrome.runtime.sendMessage({ type: 'badcat:hello' }).then((answer) => {
       if (answer && answer.ok === true && typeof answer.session === 'string' && activeSession === null) {
         activeSession = answer.session;
+        // The page was reloaded by the ON test's own rollover: carry on with the submit step.
+        if (answer.explicit && typeof answer.explicit.project === 'string' && !explicitRunning) {
+          explicitRunning = true;
+          continueExplicit(answer.session, answer.explicit.project);
+        }
       }
     }, () => {});
   } catch (e) { /* extension context unavailable */ }
