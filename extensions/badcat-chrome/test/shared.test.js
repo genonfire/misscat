@@ -88,6 +88,7 @@ test('urlShape describes a URL without query, fragment or ids', () => {
 test('temporary conversation ids and bare/slugged project IDs are accepted', () => {
   const id = 'g-p-' + 'a1b2c3d4'.repeat(4);
   assert.ok(S.isConversationUrl('https://chatgpt.com/g/' + id + '/c/WEB:1234-abcd'));
+  assert.ok(S.isConversationUrl('https://chatgpt.com/g/' + id + '/c/WEB%3A6ace08b6-d7f8-4a1b-9c2d-0123456789ab.tmp~x'));
   assert.ok(S.inProject('https://chatgpt.com/g/' + id + '/c/x', id + '-proj'));
   assert.ok(S.inProject('https://chatgpt.com/g/' + id + '-proj/c/x', id));
   assert.equal(S.inProject('https://chatgpt.com/g/' + id + 'f/c/x', id + '-proj'), false);

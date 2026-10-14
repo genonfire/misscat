@@ -8,8 +8,9 @@
   const NAME_RE = /^[A-Za-z0-9_.-]+$/;
   const HEAD_RE = /^[0-9a-f]{40}$/;
   // A ChatGPT conversation: /c/<id>, also under a project or GPT prefix (/g/<slug>/c/<id>).
-  // ChatGPT briefly uses a temporary id with other characters (e.g. WEB:<uuid>) before the real one appears.
-  const CONVERSATION_PATH_RE = /\/c\/[A-Za-z0-9:_-]+\/?$/;
+  // ChatGPT briefly uses a temporary id with other characters (e.g. WEB:<uuid>, possibly percent-encoded or
+  // longer) before the real one appears, so accept any non-empty final segment rather than a character list.
+  const CONVERSATION_PATH_RE = /\/c\/[^/\s]+\/?$/;
 
   // "owner/repo" or null. Mirrors badcat-host's validation; the host validates again.
   function normalizeRepo(value) {
@@ -31,6 +32,16 @@
     }
     return parsed.protocol === 'https:' && parsed.hostname === 'chatgpt.com' &&
       CONVERSATION_PATH_RE.test(parsed.pathname);
+  }
+
+  // Any page of https://chatgpt.com: while watching, the tab may sit anywhere on the site without stopping.
+  function isChatGptUrl(url) {
+    try {
+      const parsed = new URL(url);
+      return parsed.protocol === 'https:' && parsed.hostname === 'chatgpt.com';
+    } catch (e) {
+      return false;
+    }
   }
 
   // A diagnostic-only description of a URL for error messages: scheme, host and a path whose long segments are
@@ -120,6 +131,7 @@
     HOST_NAME: HOST_NAME,
     normalizeRepo: normalizeRepo,
     isConversationUrl: isConversationUrl,
+    isChatGptUrl: isChatGptUrl,
     isNewChatUrl: isNewChatUrl,
     urlShape: urlShape,
     projectOf: projectOf,

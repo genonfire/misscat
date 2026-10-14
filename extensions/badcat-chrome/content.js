@@ -3,7 +3,7 @@
 // submitted (e.g. ChatGPT still answering) is left in the composer; the next handoff is appended to it.
 (function () {
   'use strict';
-  const { isConversationUrl, isNewChatUrl, projectOf, inProject, reviewMessage, parseEvent, eventKey } = self.BadCatShared;
+  const { isConversationUrl, isChatGptUrl, isNewChatUrl, projectOf, inProject, reviewMessage, parseEvent, eventKey } = self.BadCatShared;
 
   // ChatGPT's composer is a ProseMirror contenteditable. Match on semantic attributes only (no class
   // names or localized aria-labels); the send button is the submit button in the composer's own form (it sits outside [data-composer-input]).
@@ -253,7 +253,7 @@
     if (key && submitted.has(key)) return { ok: true };
     if (key && uncertain.has(key)) return UNCERTAIN;
     const conversation = isConversationUrl(location.href);
-    if (!conversation && !(session !== undefined && isNewChatUrl(location.href))) {
+    if (!conversation && !(session !== undefined && isChatGptUrl(location.href))) {
       return { ok: false, error: 'not a conversation page' };
     }
     const startUrl = location.href;
