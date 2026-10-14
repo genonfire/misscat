@@ -253,11 +253,12 @@ class WatcherTests(unittest.TestCase):
 
     def test_batch_label_never_emits_unless_urgent(self):
         for labels, expected in ((("batch",), []), (("batch", "urgent"), [event()]), (("urgent",), [event()])):
-            client = FakeClient(reviews=[review(1, "+1", A)])
-            client.labels = frozenset(labels)
-            w = self.watcher(client)
-            w.cycle()
-            self.assertEqual(self.events, expected, labels)
+            with self.subTest(labels=labels):
+                self.setUp()  # fresh event list and persisted state for every case
+                client = FakeClient(reviews=[review(1, "+1", A)])
+                client.labels = frozenset(labels)
+                self.watcher(client).cycle()
+                self.assertEqual(self.events, expected)
 
     def test_restart_does_not_repeat_the_event(self):
         client = FakeClient(reviews=[review(1, "+1", A)])
