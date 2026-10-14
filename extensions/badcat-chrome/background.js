@@ -410,12 +410,9 @@ async function deliverEvent(connection, message) {
       await deactivate('The new conversation is not in the original project.');
       return;
     }
-    if (!isConversationUrl(tab.url) && !newChat) {
-      if (isChatGptUrl(tab.url)) {
-        // Still on chatgpt.com, just not in a conversation: keep watching, count a failed attempt and retry.
-        attemptNo += 1;
-        continue;
-      }
+    // Anywhere on chatgpt.com the content script decides: it sends only if it finds a ready composer,
+    // otherwise it reports a retryable failure and the session stays on.
+    if (!isChatGptUrl(tab.url) && !newChat) {
       await deactivate('The tab is no longer a ChatGPT conversation. [delivery: ' + urlShape(tab.url) + ']');
       return;
     }
@@ -535,18 +532,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 // Mid-rollover, the plain new-chat route is a valid page (the content script verifies the project).
 const rolloverPage = (session, url) => Boolean(session.rollover) && isNewChatUrl(url);
 
-async function boundSender(sender, allowNewChat) {
+async function boundSender(sender, allowNewChat, anyChatGpt) {
   const session = await getSession();
   if (!session.active || port === null || sender.frameId !== 0 || !sender.tab || sender.tab.id !== session.tabId) return null;
   const url = sender.url;
-  if (isConversationUrl(url) || (allowNewChat && rolloverPage(session, url))) return session;
+  if (isConversationUrl(url) || (allowNewChat && (rolloverPage(session, url) || (anyChatGpt === true && isChatGptUrl(url))))) return session;
   return null;
 }
 
 // The content script is about to press Enter / click send: persist "this event may now be submitted" first, so
 // that a broken messaging channel afterwards can never lead to an automatic resubmission.
 async function attempt(message, sender) {
-  const session = await boundSender(sender, true);
+  const session = await boundSender(sender, true, true); // any chatgpt.com page with a ready composer
   if (session === null || port === null || message.session !== port.sessionId) return { ok: false };
   if (message.explicit === true) {
     // The ON test submits the restored command once. It has no event: no delivered/uncertain record, no ACK.

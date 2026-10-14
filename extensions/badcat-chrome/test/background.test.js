@@ -138,15 +138,16 @@ test('a tab that left chatgpt.com at delivery time fails safely', async () => {
   assert.equal(t.session().active, false);
 });
 
-test('a tab elsewhere on chatgpt.com keeps the session and sends nothing', async () => {
-  const t = await started();
+test('a tab elsewhere on chatgpt.com stays on; the content script decides and a missing composer is retried', async () => {
+  let ready = false;
+  const t = await started({ fakeTimers: true, handoff: async () => (ready ? { ok: true } : { ok: false, error: 'composer not found' }) });
   await t.listeners['tabs.onUpdated'](7, { url: 'https://chatgpt.com/library' });
   assert.equal(t.session().active, true);
-  t.tabs[7].url = 'https://chatgpt.com/';
+  t.tabs[7].url = 'https://chatgpt.com/library';
   t.natives[0].emit(plus1(9, HEAD1));
   await t.settle();
-  assert.equal(t.sent.length, 0);
   assert.equal(t.session().active, true);
+  assert.equal(t.natives[0].posted.filter((m) => m.type === 'ack').length, 0);
 });
 
 test('a host error or disconnect marks the session inactive with a reason', async () => {
