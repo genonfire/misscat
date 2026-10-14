@@ -252,6 +252,10 @@ class ReviewStateWatcher(Poller):
             if pr.draft or verdict.stage != PLUS1 or type(rid) is not int or not 0 < rid <= 2 ** 53 - 1:
                 self.outstanding.pop(pr.number, None)
                 return
+            if "batch" in pr.labels and "urgent" not in pr.labels:
+                # BadCat merges these at +1: nothing for the extension to hand off (urgent overrides batch).
+                self.outstanding.pop(pr.number, None)
+                return
             if self.state.has(pr.number, pr.head, rid):
                 self.outstanding.pop(pr.number, None)
                 return

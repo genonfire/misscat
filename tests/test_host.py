@@ -41,6 +41,7 @@ class FakeClient:
     def __init__(self, head=A, reviews=None, number=7):
         self.head, self.number, self.review_list = head, number, reviews or []
         self.fail, self.open, self.reads = {}, True, 0
+        self.labels = frozenset()
 
     def _maybe_fail(self, name):
         if name in self.fail:
@@ -52,7 +53,7 @@ class FakeClient:
 
     def open_prs(self):
         self._maybe_fail("open_prs")
-        return [OpenPR(self.number, self.head, False, "u", "t")] if self.open else []
+        return [OpenPR(self.number, self.head, False, "u", "t", self.labels)] if self.open else []
 
     def reviews(self, number):
         self.reads += 1
@@ -249,6 +250,15 @@ class WatcherTests(unittest.TestCase):
         reads = client.reads
         w.cycle()
         self.assertGreater(client.reads, reads)  # a later effective +1 remains discoverable
+
+    def test_batch_label_never_emits_unless_urgent(self):
+        for labels, expected in ((("batch",), []), (("batch", "urgent"), [event()]), (("urgent",), [event()])):
+            with self.subTest(labels=labels):
+                self.setUp()  # fresh event list and persisted state for every case
+                client = FakeClient(reviews=[review(1, "+1", A)])
+                client.labels = frozenset(labels)
+                self.watcher(client).cycle()
+                self.assertEqual(self.events, expected)
 
     def test_restart_does_not_repeat_the_event(self):
         client = FakeClient(reviews=[review(1, "+1", A)])
