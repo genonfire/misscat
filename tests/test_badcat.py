@@ -2,6 +2,7 @@
 import contextlib
 import io
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -320,6 +321,24 @@ class WatcherTests(unittest.TestCase):
         self.run_cycle(self.watcher(c, merge=2))
         self.assertEqual(reads, 2)
         self.assertEqual(c.calls, [])
+
+    def test_no_review_label_added_after_listing_gives_no_ready_state(self):
+        for merge in (False, 2):
+            with self.subTest(merge=merge):
+                c = FakeClient(reviews=seq(rev("+1", A), rev("+2", A)))
+                c.raw["labels"] = [{"name": "no-review"}]  # listing had no label; pr() does
+                w = self.watcher(c, merge=merge)
+                with self.assertLogs("badcat", level="INFO") as logs:
+                    logging.getLogger("badcat").info("start")  # assertLogs needs at least one record
+                    self.run_cycle(w)
+                self.assertFalse(any("ready to merge" in m for m in logs.output))
+                self.assertEqual(c.calls, [])
+                self.assertFalse(any(e.get("gate") for e in w.state.prs.values()))
+                c.raw["labels"] = []
+                self.run_cycle(w)
+                self.assertEqual(c.calls, [("merge", 7, A)] if merge else [])
+                if not merge:
+                    self.assertTrue(any(e.get("gate") == "ok" for e in w.state.prs.values()))
 
     def test_batch_merge_keeps_protocol_and_ci_gates(self):
         cases = (

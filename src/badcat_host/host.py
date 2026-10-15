@@ -31,7 +31,7 @@ from typing import BinaryIO, Callable, Optional
 
 from misscat import GhError, MissCatError, NAME_RE, OWNER_RE, _write_atomic, canonical_repo
 
-from badcat.github import NO_REVIEW_LABEL, GhClient, OpenPR
+from badcat.github import NO_REVIEW_LABEL, GhClient, OpenPR, pr_labels
 from badcat.protocol import PLUS1, evaluate, initial_plus1_review_id
 
 from . import __version__
@@ -269,6 +269,10 @@ class ReviewStateWatcher(Poller):
             event, deadline, attempts = pending
             self.outstanding[pr.number] = pending
             if self.now() < deadline:
+                return
+            if NO_REVIEW_LABEL in pr_labels(self.client.pr(pr.number)):
+                # label added after the listing: fail closed; nothing is acknowledged, so it re-emits once removed
+                self.outstanding.pop(pr.number, None)
                 return
             # Store before writing: a synchronous ack cannot miss its outstanding frame.
             self.outstanding[pr.number] = (event, self.now() + (60, 120, 300)[min(attempts, 2)], attempts + 1)

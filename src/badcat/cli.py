@@ -268,15 +268,19 @@ class Watcher:
         reviews = self.client.reviews(pr.number)
         verdict = evaluate(reviews, pr.head, self.trusted)
         eligible = self._review_ready(verdict.stage, pr.labels)
-        gate = None
+        gate, labels = None, pr.labels
         if eligible:
             raw = self.client.pr(pr.number)
-            gate = merge_gate(self.client, raw, pr.head)
-        self._report(pr, reviews, verdict, gate)
+            labels = pr_labels(raw)  # labels may have changed since the listing
+            eligible = self._review_ready(verdict.stage, labels)
+            if eligible:
+                gate = merge_gate(self.client, raw, pr.head)
+        self._report(pr, reviews, verdict, gate, labels)
         if eligible and gate is None and self.merge:
             self._merge(pr)
 
-    def _report(self, pr: OpenPR, reviews: list, verdict: Verdict, gate: Optional[str]) -> None:
+    def _report(self, pr: OpenPR, reviews: list, verdict: Verdict, gate: Optional[str],
+                labels: frozenset[str]) -> None:
         """Log transitions. A review is announced by its literal first line, whatever it says;
         strict protocol validation (evaluate) is separate and never affects what is printed."""
         prev = self.state.get(pr.number)
@@ -295,7 +299,7 @@ class Watcher:
         if note and (prev is None or prev.get("note") != note):
             log.info("PR #%d: %s", pr.number, note)
         entry = {"head": pr.head, "reviews": [r.id for r in submitted], "note": note, "gate": None}
-        if self._review_ready(verdict.stage, pr.labels):
+        if self._review_ready(verdict.stage, labels):
             entry["gate"] = "ok" if gate is None else gate
             if prev is None or prev.get("head") != pr.head or prev.get("gate") != entry["gate"]:
                 if gate is None:
