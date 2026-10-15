@@ -15,7 +15,7 @@ from typing import Callable, Optional
 from misscat import GhError, MissCatError, _write_atomic, resolve_repo_arg
 
 from . import __version__
-from .github import GhClient, OpenPR, pr_labels
+from .github import NO_REVIEW_LABEL, GhClient, OpenPR, pr_labels
 from .protocol import PLUS1, READY, WAITING, Verdict, evaluate
 
 log = logging.getLogger("badcat")
@@ -254,7 +254,10 @@ class Watcher:
         return evaluate(self.client.reviews(number), head, self.trusted)
 
     def _review_ready(self, stage: str, labels: frozenset[str]) -> bool:
-        # --merge=2 permits +1 only for batch; urgent overrides batch if both appear.
+        # no-review beats every stage and label. --merge=2 permits +1 only for batch;
+        # urgent overrides batch if both appear.
+        if NO_REVIEW_LABEL in labels:
+            return False
         return stage == READY or (
             stage == PLUS1 and (self.merge_level == 1 or
                                 (self.merge_level == 2 and "batch" in labels

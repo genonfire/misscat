@@ -283,6 +283,44 @@ class WatcherTests(unittest.TestCase):
         self.assertEqual(reads, 2)
         self.assertEqual(c.calls, [], "batch removal before merge must revoke +1 access")
 
+    def test_no_review_label_blocks_merge_at_every_stage_and_beats_batch_urgent(self):
+        for merge in (1, 2):
+            for labels in (("no-review",), ("no-review", "batch"), ("no-review", "urgent"),
+                           ("no-review", "batch", "urgent")):
+                for reviews in (seq(rev("+1", A)), seq(rev("+1", A), rev("+2", A))):
+                    with self.subTest(merge=merge, labels=labels, n=len(reviews)):
+                        c = FakeClient(reviews=reviews, labels=labels)
+                        w = self.watcher(c, merge=merge)
+                        self.run_cycle(w)
+                        self.assertEqual(c.calls, [])
+                        self.assertFalse(any(e.get("gate") for e in w.state.prs.values()))
+
+    def test_no_review_label_is_exact_and_removal_restores_eligibility(self):
+        c = FakeClient(reviews=seq(rev("+1", A), rev("+2", A)), labels=("No-Review",))
+        self.run_cycle(self.watcher(c, merge=2))
+        self.assertEqual(c.calls, [("merge", 7, A)])
+        c = FakeClient(reviews=seq(rev("+1", A), rev("+2", A)), labels=("no-review",))
+        w = self.watcher(c, merge=2)
+        self.run_cycle(w)
+        self.assertEqual(c.calls, [])
+        c.labels = frozenset()
+        c.raw["labels"] = []
+        self.run_cycle(w)
+        self.assertEqual(c.calls, [("merge", 7, A)])
+
+    def test_no_review_label_added_after_listing_blocks_merge(self):
+        c = FakeClient(reviews=seq(rev("+1", A), rev("+2", A)))
+        raw = c.raw
+        reads = 0
+        def pr(number):
+            nonlocal reads
+            reads += 1
+            return raw if reads == 1 else {**raw, "labels": [{"name": "no-review"}]}
+        c.pr = pr
+        self.run_cycle(self.watcher(c, merge=2))
+        self.assertEqual(reads, 2)
+        self.assertEqual(c.calls, [])
+
     def test_batch_merge_keeps_protocol_and_ci_gates(self):
         cases = (
             (seq(rev("+1", A), rev("-1", A)), None),

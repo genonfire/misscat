@@ -260,6 +260,19 @@ class WatcherTests(unittest.TestCase):
                 self.watcher(client).cycle()
                 self.assertEqual(self.events, expected)
 
+    def test_no_review_label_suppresses_event_until_removed(self):
+        for labels in (("no-review",), ("no-review", "urgent"), ("no-review", "batch")):
+            with self.subTest(labels=labels):
+                self.setUp()
+                client = FakeClient(reviews=[review(1, "+1", A)])
+                client.labels = frozenset(labels)
+                w = self.watcher(client)
+                w.cycle()
+                self.assertEqual(self.events, [])
+                client.labels = frozenset()
+                w.cycle()
+                self.assertEqual(self.events, [event()])
+
     def test_restart_does_not_repeat_the_event(self):
         client = FakeClient(reviews=[review(1, "+1", A)])
         self.watcher(client).cycle()

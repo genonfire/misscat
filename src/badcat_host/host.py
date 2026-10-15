@@ -31,7 +31,7 @@ from typing import BinaryIO, Callable, Optional
 
 from misscat import GhError, MissCatError, NAME_RE, OWNER_RE, _write_atomic, canonical_repo
 
-from badcat.github import GhClient, OpenPR
+from badcat.github import NO_REVIEW_LABEL, GhClient, OpenPR
 from badcat.protocol import PLUS1, evaluate, initial_plus1_review_id
 
 from . import __version__
@@ -249,7 +249,7 @@ class ReviewStateWatcher(Poller):
         with self.lock:
             self.state.baseline(pr.number, pr.head, reviews, self.trusted)
             rid = verdict.plus1_review_id
-            if pr.draft or verdict.stage != PLUS1 or type(rid) is not int or not 0 < rid <= 2 ** 53 - 1:
+            if pr.draft or NO_REVIEW_LABEL in pr.labels or verdict.stage != PLUS1 or type(rid) is not int or not 0 < rid <= 2 ** 53 - 1:
                 self.outstanding.pop(pr.number, None)
                 return
             if "batch" in pr.labels and "urgent" not in pr.labels:
