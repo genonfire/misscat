@@ -281,6 +281,8 @@ badcat . --merge=1                         # merge after +1
 badcat . --merge --trusted-reviewer luna   # trust reviews by this login (default: your gh user)
 ```
 
+A PR labeled exactly `no-review` is never eligible: BadCat reports no "ready to merge" for it and never merges it, whatever its reviews or `batch`/`urgent` labels. Labels are re-read from GitHub just before a merge, so adding `no-review` after the PR was listed still blocks the merge; removing the label restores eligibility. The read-only `badcat-host` Chrome host likewise emits no `+1` event for a `no-review` PR (like a draft), and emits one again once the label is removed. MissCat skips `no-review` PRs too.
+
 A review counts only if it is a submitted `COMMENTED` review by a trusted login whose body starts with:
 
 ```text

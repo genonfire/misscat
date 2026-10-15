@@ -42,6 +42,12 @@ class FakeClient:
         self.head, self.number, self.review_list = head, number, reviews or []
         self.fail, self.open, self.reads = {}, True, 0
         self.labels = frozenset()
+        self.fresh_labels = None  # labels returned by pr(); defaults to the listed ones
+
+    def pr(self, number):
+        self._maybe_fail("pr")
+        labels = self.labels if self.fresh_labels is None else self.fresh_labels
+        return {"labels": [{"name": label} for label in labels]}
 
     def _maybe_fail(self, name):
         if name in self.fail:
@@ -259,6 +265,30 @@ class WatcherTests(unittest.TestCase):
                 client.labels = frozenset(labels)
                 self.watcher(client).cycle()
                 self.assertEqual(self.events, expected)
+
+    def test_no_review_label_suppresses_event_until_removed(self):
+        for labels in (("no-review",), ("no-review", "urgent"), ("no-review", "batch")):
+            with self.subTest(labels=labels):
+                self.setUp()
+                client = FakeClient(reviews=[review(1, "+1", A)])
+                client.labels = frozenset(labels)
+                w = self.watcher(client)
+                w.cycle()
+                self.assertEqual(self.events, [])
+                client.labels = frozenset()
+                w.cycle()
+                self.assertEqual(self.events, [event()])
+
+    def test_label_added_after_listing_emits_nothing_until_removed(self):
+        client = FakeClient(reviews=[review(1, "+1", A)])
+        client.fresh_labels = frozenset({"no-review"})  # listed without the label, then labeled
+        w = self.watcher(client)
+        w.cycle()
+        self.assertEqual(self.events, [])
+        self.assertEqual(w.outstanding, {})
+        client.fresh_labels = frozenset({"No-Review"})
+        w.cycle()
+        self.assertEqual(self.events, [event()])
 
     def test_restart_does_not_repeat_the_event(self):
         client = FakeClient(reviews=[review(1, "+1", A)])

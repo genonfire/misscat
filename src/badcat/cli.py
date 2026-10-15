@@ -15,7 +15,7 @@ from typing import Callable, Optional
 from misscat import GhError, MissCatError, _write_atomic, resolve_repo_arg
 
 from . import __version__
-from .github import GhClient, OpenPR, pr_labels
+from .github import NO_REVIEW_LABEL, GhClient, OpenPR, pr_labels
 from .protocol import PLUS1, READY, WAITING, Verdict, evaluate
 
 log = logging.getLogger("badcat")
@@ -254,7 +254,10 @@ class Watcher:
         return evaluate(self.client.reviews(number), head, self.trusted)
 
     def _review_ready(self, stage: str, labels: frozenset[str]) -> bool:
-        # --merge=2 permits +1 only for batch; urgent overrides batch if both appear.
+        # no-review beats every stage and label. --merge=2 permits +1 only for batch;
+        # urgent overrides batch if both appear.
+        if NO_REVIEW_LABEL in labels:
+            return False
         return stage == READY or (
             stage == PLUS1 and (self.merge_level == 1 or
                                 (self.merge_level == 2 and "batch" in labels
@@ -265,15 +268,19 @@ class Watcher:
         reviews = self.client.reviews(pr.number)
         verdict = evaluate(reviews, pr.head, self.trusted)
         eligible = self._review_ready(verdict.stage, pr.labels)
-        gate = None
+        gate, labels = None, pr.labels
         if eligible:
             raw = self.client.pr(pr.number)
-            gate = merge_gate(self.client, raw, pr.head)
-        self._report(pr, reviews, verdict, gate)
+            labels = pr_labels(raw)  # labels may have changed since the listing
+            eligible = self._review_ready(verdict.stage, labels)
+            if eligible:
+                gate = merge_gate(self.client, raw, pr.head)
+        self._report(pr, reviews, verdict, gate, labels)
         if eligible and gate is None and self.merge:
             self._merge(pr)
 
-    def _report(self, pr: OpenPR, reviews: list, verdict: Verdict, gate: Optional[str]) -> None:
+    def _report(self, pr: OpenPR, reviews: list, verdict: Verdict, gate: Optional[str],
+                labels: frozenset[str]) -> None:
         """Log transitions. A review is announced by its literal first line, whatever it says;
         strict protocol validation (evaluate) is separate and never affects what is printed."""
         prev = self.state.get(pr.number)
@@ -292,7 +299,7 @@ class Watcher:
         if note and (prev is None or prev.get("note") != note):
             log.info("PR #%d: %s", pr.number, note)
         entry = {"head": pr.head, "reviews": [r.id for r in submitted], "note": note, "gate": None}
-        if self._review_ready(verdict.stage, pr.labels):
+        if self._review_ready(verdict.stage, labels):
             entry["gate"] = "ok" if gate is None else gate
             if prev is None or prev.get("head") != pr.head or prev.get("gate") != entry["gate"]:
                 if gate is None:

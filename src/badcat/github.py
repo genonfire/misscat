@@ -13,6 +13,9 @@ TIMEOUT = 60
 MAX_PAGES = 20
 
 
+NO_REVIEW_LABEL = "no-review"  # exact label: the PR is neither reviewed nor merged
+
+
 @dataclass(frozen=True)
 class OpenPR:
     number: int
