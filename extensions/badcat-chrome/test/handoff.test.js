@@ -28,7 +28,7 @@ async function boot(options = {}, workerOptions = {}) {
 const acks = p => JSON.parse(JSON.stringify(p.posted.filter(m => m.type === 'ack')));
 const flush = async w => { for (let i = 0; i < 100; i++) await w.settle(); };
 const retries = async w => {
-  for (let i = 0; i < 3; i++) {
+  for (let i = 0; i < 4; i++) {
     await flush(w);
     for (const { fn } of w.timers.splice(0)) fn();
   }
@@ -70,7 +70,7 @@ test('failed content submission stays unacknowledged, host replay succeeds once'
   const { content, worker, port } = await boot({ enterSubmits: false });
   port.emit(event());
   await retries(worker);
-  assert.equal(worker.sent.length, 3);
+  assert.equal(worker.sent.length, 4);
   assert.deepEqual(acks(port), []);
   assert.equal(worker.store['badcat.delivered.v2'], undefined);
   assert.equal(content.text(), command);
