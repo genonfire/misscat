@@ -210,7 +210,7 @@ test('a handoff that fails within a live connection gives up, and a later +1 sti
   t.natives[0].emit(plus1(5, HEAD1));
   await t.settle();
   for (let i = 0; i < 5; i++) await wake(t);
-  assert.equal(t.sent.filter((s) => s.message.pr === 5).length, 3); // bounded retries
+  assert.equal(t.sent.filter((s) => s.message.pr === 5).length, 4); // bounded retries
   assert.equal(t.timers.length, 0);
   t.natives[0].emit(plus1(6, HEAD2));
   await t.settle();
@@ -290,7 +290,7 @@ test('failed content submission has bounded retries and no acknowledgement', asy
   t.natives[0].emit(plus1(123, HEAD1));
   await t.settle();
   for (let i = 0; i < 5; i++) await wake(t);
-  assert.equal(t.sent.length, 3);
+  assert.equal(t.sent.length, 4);
   assert.equal(t.natives[0].posted.filter(m => m.type === 'ack').length, 0);
   assert.match(t.session().error, /Handoff failed/);
   assert.equal(t.store['badcat.delivered.v2'], undefined);
@@ -656,7 +656,7 @@ test('a pending write of an old session\'s uncertain key cannot outlive the Star
   assert.equal(t.sent.length, 2);
 });
 
-test('#64: "rolling over" does not use up the delivery attempts; the later failures still get all three', async () => {
+test('#64: "rolling over" does not use up the delivery attempts; the later failures still get all four', async () => {
   let calls = 0;
   const t = await started({ tabUrl: PROJECT_URL, fakeTimers: true, handoff: async () => {
     calls += 1;
@@ -670,7 +670,7 @@ test('#64: "rolling over" does not use up the delivery attempts; the later failu
     for (const { fn } of t.timers.splice(0)) fn();
   }
   await t.settle();
-  assert.equal(calls, 5); // 2 rollover waits + the 3 regular attempts
+  assert.equal(calls, 6); // 2 rollover waits + the 4 regular attempts
   assert.equal(t.natives[0].posted.filter((m) => m.type === 'ack').length, 0);
   assert.equal(t.store['badcat.delivered.v2'], undefined);
 });
