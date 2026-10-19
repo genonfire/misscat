@@ -8,11 +8,9 @@
   const SEND = '[data-testid="code-prompt-send"]';
   const timing = { settleMs: 1500, buttonWaitMs: 10000, confirmMs: 60000, pollMs: 100 };
   const cancelled = new Set(); // deliveries the worker revoked (Watching turned OFF)
-  // The verified approach is every PR anchor on the page. Only the composer and explicit user-message markers are
-  // skipped (a user's own reference to another PR is not one this session produced); structural regions such as
-  // header/aside are NOT excluded because the live page may render the session's PR cards there.
-  const NOT_PRODUCED = '[contenteditable="true"], [data-testid="code-prompt-input"], [data-testid*="user-message"], ' +
-    '[data-author="user"], [data-role="user"], [data-message-author-role="user"]';
+  // Only PR links inside the agent's own messages count as PRs this session produced: not the user's messages,
+  // the composer or any other part of the page (verified live: agent PR links sit in assistant-message turns).
+  const PRODUCED = '[data-testid="assistant-message"]';
   const attempted = new Set(); // delivery ids already clicked in this page: a repeat is never submitted again
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -32,7 +30,7 @@
   }
 
   function scan() {
-    const hrefs = Array.from(root.document.querySelectorAll('a[href]')).filter((a) => !a.closest(NOT_PRODUCED)).map((a) => a.href);
+    const hrefs = Array.from(root.document.querySelectorAll('a[href]')).filter((a) => a.closest(PRODUCED)).map((a) => a.href);
     return { ok: true, conversationId: here(), links: hrefs.filter((h) => N.parsePrUrl(h) !== null) };
   }
 
