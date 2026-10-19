@@ -9,6 +9,8 @@
   --error: #b3402f;
 }
 
+body.nasty { --accent: #ac91ad; }
+
 * { box-sizing: border-box; }
 
 body {

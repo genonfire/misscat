@@ -292,6 +292,24 @@ HEAD: <40-hex sha of the PR's current HEAD>
 <review evidence>
 ```
 
+## NastyCat (Claude Code session watcher)
+
+The `extensions/badcat-chrome` extension has a second, site-dependent mode. On a Claude Code (Remote Control) conversation, `https://claude.ai/code/<id>`, the popup shows **NastyCat** (same layout and icon, muted mauve accent, **Prompt** instead of **Repository**). On `chatgpt.com` it is the unchanged MissCat popup. Pages elsewhere on claude.ai are rejected.
+
+```bash
+nastycat-host install --extension-id <extension id>   # once, like badcat-host; macOS
+```
+
+Type a prompt (e.g. `#860 A 진행해`) and press **No napping, Meow!**. The prompt is frozen into that tab's own session; the popup remembers one global last-entered prompt, but arming window A and window B with different prompts keeps them independent. There is no cap on the number of sessions, and stopping or closing one tab affects only that tab.
+
+- PR links (`https://github.com/<owner>/<repo>/pull/<n>`) are read from the conversation's DOM every ~60 s, counting only links inside the agent's own messages (`data-testid="assistant-message"`), never user messages, the composer or the sidebar (`chrome.alarms`); all links accumulate, none is assumed to be "the" PR.
+- `nastycat-host` asks GitHub (through your existing `gh` login, read-only) whether each PR is merged and when. A PR closed without merging never triggers.
+- On arming, a baseline is taken first: no PRs, or only already-merged PRs, sends the prompt once as a kick-off; any open PR means wait. Old merged PRs never wake the session afterwards; a PR created and merged between two polls does (guarded by `merged_at`, not PR order). Several merges seen in one poll send the prompt once.
+- Delivery inserts the prompt into `[data-testid="code-prompt-input"]` only if it is empty, waits for the send button, clicks once, and confirms only when the submitted message appears in the transcript and is no longer "Pending". Turning Watching OFF revokes a not-yet-clicked delivery. A busy editor or missing button is retried on the next poll; an unconfirmed submission, a lost reply or a worker restart is marked uncertain and is **never** resent automatically. Stop and re-arm to continue.
+- Moving the tab to another conversation stops the session. Sessions live in `chrome.storage.session`, so a browser restart never replays anything. **Copy log** copies NastyCat's own bounded log (300 entries; PR keys, phases and error kinds, never prompts or conversation text).
+
+`nastycat-host` has no state of its own and cannot write to GitHub. It is separate from `badcat-host`: neither imports the other's session logic.
+
 ## What MissCat does
 
 - Watches all open PRs in a repository

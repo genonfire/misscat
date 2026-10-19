@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "misscat"
-version = "1.4.11"
-description = "Watch a GitHub repository and run an AI review on every new PR HEAD (plus BadCat, a review-state watcher with opt-in merge, and badcat-host, its read-only Native Messaging host)"
+version = "1.5.0"
+description = "Watch a GitHub repository and run an AI review on every new PR HEAD (plus BadCat, a review-state watcher with opt-in merge, badcat-host, its read-only Native Messaging host, and nastycat-host, the read-only merge-state host of the NastyCat Chrome mode)"
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
@@ -40,6 +40,7 @@ Issues = "https://github.com/genonfire/misscat/issues"
 misscat = "misscat:main"
 badcat = "badcat.cli:main"
 badcat-host = "badcat_host.host:main"
+nastycat-host = "nastycat_host.host:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

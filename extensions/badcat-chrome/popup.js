@@ -88,9 +88,13 @@
   }
 
   async function init() {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    // Routed by the active tab's URL: a Claude page gets NastyCat; everything else is the unchanged MissCat popup.
+    if (tab && self.NastyCatShared && self.NastyCatShared.isClaudeUrl(tab.url)) {
+      return self.NastyCatPopup.init(tab, { input: repoInput, toggle, statusText, errorEl, noteEl });
+    }
     const stored = await chrome.storage.local.get(REPO_KEY);
     if (typeof stored[REPO_KEY] === 'string') repoInput.value = stored[REPO_KEY];
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     tabId = tab && Number.isInteger(tab.id) ? tab.id : null;
     const status = await ask({ type: 'badcat:status' });
     render(status.ok ? status.session : null);
