@@ -5,7 +5,8 @@
 
   const HOST_NAME = 'com.genonfire.nastycat_host';
   const MAX_PROMPT = 2000;
-  const MAX_LINKS = 5000; // a sanity bound far above any conversation; never truncates realistic history
+  // Beyond this many distinct PR links the session stops visibly (see nastycat.js) instead of silently dropping the tail.
+  const MAX_LINKS = 20000;
   const OWNER_RE = /^[A-Za-z0-9-]+$/;
   const NAME_RE = /^[A-Za-z0-9_.-]+$/;
   const SESSION_PATH_RE = /^\/code\/([A-Za-z0-9_-]{1,128})\/?$/;
@@ -63,7 +64,6 @@
       if (seen.has(key)) continue;
       seen.add(key);
       out.push(link);
-      if (out.length >= MAX_LINKS) break;
     }
     return out;
   }
@@ -175,7 +175,7 @@
   }
 
   const api = {
-    HOST_NAME: HOST_NAME, STARTUP: STARTUP, MAX_PROMPT: MAX_PROMPT,
+    HOST_NAME: HOST_NAME, MAX_LINKS: MAX_LINKS, STARTUP: STARTUP, MAX_PROMPT: MAX_PROMPT,
     isClaudeUrl: isClaudeUrl, parseClaudeSession: parseClaudeSession, parsePrUrl: parsePrUrl, prKey: prKey,
     collectLinks: collectLinks, normalizePrompt: normalizePrompt, parseHostResult: parseHostResult,
     newSession: newSession, keysToCheck: keysToCheck, decide: decide, settle: settle,

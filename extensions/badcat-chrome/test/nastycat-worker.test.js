@@ -286,3 +286,14 @@ test('re-arming during that gap does not let the old intent through', async () =
   await new Promise((r) => setTimeout(r, 50));
   assert.deepEqual(t.tabs[7].delivered.map((m) => m.prompt), []);
 });
+
+test('an over-capacity conversation stops visibly instead of watching a truncated view', async () => {
+  const t = boot();
+  const N = require('../nastycat-shared.js');
+  t.tabs[7].links = Array.from({ length: N.MAX_LINKS + 1 }, (_, i) => PR(i + 1));
+  await t.popup({ type: 'nastycat:start', prompt: 'go', tabId: 7 });
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(t.sessions()[7].active, false);
+  assert.match(t.sessions()[7].error, /too many PR links/);
+  assert.equal(t.tabs[7].delivered.length, 0);
+});

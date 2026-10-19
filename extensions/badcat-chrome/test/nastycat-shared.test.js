@@ -165,3 +165,11 @@ test('a long conversation never loses discovery of a new PR behind 200+ historic
   const out = step(s, links, { [key(260)]: answer(true, new Date(S0 + 9).toISOString()) }, S0 + 20);
   assert.deepEqual(out.send.keys, [key(260)]);
 });
+
+test('discovery is lossless past any fixed cap: the newest link after thousands is kept', () => {
+  const hrefs = [];
+  for (let i = 1; i <= N.MAX_LINKS + 1; i++) hrefs.push(PRURL(i));
+  const links = N.collectLinks(hrefs);
+  assert.equal(links.length, N.MAX_LINKS + 1);
+  assert.equal(links[links.length - 1].pr, N.MAX_LINKS + 1);
+});

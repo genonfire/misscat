@@ -34,7 +34,7 @@ function boot({ pendingMs = 0, shows = true, href = 'https://claude.ai/code/sess
       if (sel === '[data-testid="code-prompt-send"]') return state.sendVisible ? button : null;
       return null;
     },
-    querySelectorAll(sel) { return sel === '*' ? messages : anchors.map((h) => ({ href: h })); },
+    querySelectorAll(sel) { return sel === '*' ? messages : anchors.map((h) => (typeof h === 'string' ? { href: h, closest: () => null } : h)); },
     execCommand(cmd, _ui, value) {
       if (cmd === 'insertText') {
         if (!insertWorks) return false;
@@ -73,6 +73,13 @@ test('scan returns the conversation identity and every valid PR link, nothing el
   const scan = await t.msg({ type: 'nastycat:scan' });
   assert.equal(scan.conversationId, 'session_A');
   assert.equal(scan.links.length, 2);
+});
+
+test('scan ignores PR links in the sidebar, composer and user messages', async () => {
+  const skip = (href) => ({ href, closest: () => ({}) });
+  const t = boot({ anchors: ['https://github.com/o/r/pull/954', skip('https://github.com/x/y/pull/1'), skip('https://github.com/x/y/pull/2')] });
+  const scan = await t.msg({ type: 'nastycat:scan' });
+  assert.equal(JSON.stringify(scan.links), JSON.stringify(['https://github.com/o/r/pull/954']));
 });
 
 test('delivery inserts the exact prompt, waits for the send button, clicks once and confirms', async () => {

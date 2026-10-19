@@ -8,6 +8,11 @@
   const SEND = '[data-testid="code-prompt-send"]';
   const timing = { settleMs: 400, buttonWaitMs: 5000, confirmMs: 60000, pollMs: 100 };
   const cancelled = new Set(); // deliveries the worker revoked (Watching turned OFF)
+  // Links outside the agent's own output are not "PRs produced by this session": site navigation and session lists,
+  // the composer, and the user's own messages (which may merely reference some other PR).
+  const NOT_PRODUCED = 'nav, aside, header, footer, form, [role="navigation"], [role="complementary"], [role="banner"], ' +
+    '[contenteditable="true"], [data-testid="code-prompt-input"], [data-testid*="sidebar"], [data-testid*="user-message"], ' +
+    '[data-author="user"], [data-role="user"], [data-message-author-role="user"]';
   const attempted = new Set(); // delivery ids already clicked in this page: a repeat is never submitted again
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -27,7 +32,7 @@
   }
 
   function scan() {
-    const hrefs = Array.from(root.document.querySelectorAll('a[href]'), (a) => a.href);
+    const hrefs = Array.from(root.document.querySelectorAll('a[href]')).filter((a) => !a.closest(NOT_PRODUCED)).map((a) => a.href);
     return { ok: true, conversationId: here(), links: hrefs.filter((h) => N.parsePrUrl(h) !== null) };
   }
 

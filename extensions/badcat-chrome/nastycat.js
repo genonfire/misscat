@@ -163,6 +163,10 @@
         return;
       }
       const links = N.collectLinks(scan.links);
+      if (links.length > N.MAX_LINKS) { // never watch with a truncated view: fail visibly instead
+        await failSession(tabId, armId, 'This conversation has too many PR links to watch reliably. Watching stopped.', 'too-many-links');
+        return;
+      }
       const ask = N.keysToCheck(s, links);
       let results = {};
       try {
