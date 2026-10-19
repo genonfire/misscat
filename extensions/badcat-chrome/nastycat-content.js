@@ -8,10 +8,10 @@
   const SEND = '[data-testid="code-prompt-send"]';
   const timing = { settleMs: 1500, buttonWaitMs: 10000, confirmMs: 60000, pollMs: 100 };
   const cancelled = new Set(); // deliveries the worker revoked (Watching turned OFF)
-  // Links outside the agent's own output are not "PRs produced by this session": site navigation and session lists,
-  // the composer, and the user's own messages (which may merely reference some other PR).
-  const NOT_PRODUCED = 'nav, aside, header, footer, form, [role="navigation"], [role="complementary"], [role="banner"], ' +
-    '[contenteditable="true"], [data-testid="code-prompt-input"], [data-testid*="sidebar"], [data-testid*="user-message"], ' +
+  // The verified approach is every PR anchor on the page. Only the composer and explicit user-message markers are
+  // skipped (a user's own reference to another PR is not one this session produced); structural regions such as
+  // header/aside are NOT excluded because the live page may render the session's PR cards there.
+  const NOT_PRODUCED = '[contenteditable="true"], [data-testid="code-prompt-input"], [data-testid*="user-message"], ' +
     '[data-author="user"], [data-role="user"], [data-message-author-role="user"]';
   const attempted = new Set(); // delivery ids already clicked in this page: a repeat is never submitted again
 

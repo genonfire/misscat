@@ -75,7 +75,7 @@ test('scan returns the conversation identity and every valid PR link, nothing el
   assert.equal(scan.links.length, 2);
 });
 
-test('scan ignores PR links in the sidebar, composer and user messages', async () => {
+test('scan ignores PR links in the composer and user messages', async () => {
   const skip = (href) => ({ href, closest: () => ({}) });
   const t = boot({ anchors: ['https://github.com/o/r/pull/954', skip('https://github.com/x/y/pull/1'), skip('https://github.com/x/y/pull/2')] });
   const scan = await t.msg({ type: 'nastycat:scan' });
