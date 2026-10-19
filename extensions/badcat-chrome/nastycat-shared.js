@@ -103,8 +103,16 @@
   }
 
   // Which tracked PRs still need a GitHub answer: everything during the baseline, then undone ones and new links.
+  // Unfinished PRs stay watched even when their anchors have left the DOM (virtualized or re-rendered messages).
+  function candidates(session, links) {
+    const seen = new Set(links.map((l) => prKey(l.repo, l.pr)));
+    const kept = Object.keys(session.prs).filter((k) => !session.prs[k].done && !seen.has(k))
+      .map((k) => ({ repo: session.prs[k].repo, pr: session.prs[k].pr }));
+    return links.concat(kept);
+  }
+
   function keysToCheck(session, links) {
-    return links.filter((l) => {
+    return candidates(session, links).filter((l) => {
       if (session.phase === 'baseline') return true;
       const known = session.prs[prKey(l.repo, l.pr)];
       return !known || !known.done;
@@ -130,7 +138,7 @@
       s.phase = 'watching';
       s.startup = links.every((l) => merged(prKey(l.repo, l.pr))) ? 'pending' : 'none';
     } else {
-      for (const l of links) {
+      for (const l of candidates(s, links)) {
         const key = prKey(l.repo, l.pr);
         const answer = results[key];
         if (!answer) continue; // unknown: look again next poll (a new link is registered only once answered)

@@ -173,3 +173,12 @@ test('discovery is lossless past any fixed cap: the newest link after thousands 
   assert.equal(links.length, N.MAX_LINKS + 1);
   assert.equal(links[links.length - 1].pr, N.MAX_LINKS + 1);
 });
+
+test('an open PR whose anchor disappears from the DOM is still checked and wakes when it merges', () => {
+  let s = step(fresh(), [link(957), link(954)], { [key(957)]: answer(false), [key(954)]: answer(true) }).session;
+  assert.deepEqual(N.keysToCheck(s, []).map((l) => l.pr), [957]); // 954 is settled history, 957 is unfinished
+  const out = step(s, [], { [key(957)]: answer(true) });
+  assert.deepEqual(out.send.keys, [key(957)]);
+  const done = N.settle(out.session, out.send.id, 'confirmed');
+  assert.deepEqual(N.keysToCheck(done, []), []);
+});
