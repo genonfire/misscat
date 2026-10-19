@@ -6,7 +6,7 @@
   const N = root.NastyCatShared;
   const EDITOR = '[data-testid="code-prompt-input"]';
   const SEND = '[data-testid="code-prompt-send"]';
-  const timing = { settleMs: 400, buttonWaitMs: 5000, confirmMs: 60000, pollMs: 100 };
+  const timing = { settleMs: 1500, buttonWaitMs: 10000, confirmMs: 60000, pollMs: 100 };
   const cancelled = new Set(); // deliveries the worker revoked (Watching turned OFF)
   // Links outside the agent's own output are not "PRs produced by this session": site navigation and session lists,
   // the composer, and the user's own messages (which may merely reference some other PR).
