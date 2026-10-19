@@ -1,0 +1,92 @@
+// NastyCat, Claude page side. Reads PR links from the conversation and submits the stored prompt once.
+// Never overwrites the user's draft and never retries a click: anything unclear is reported as uncertain.
+(function (root) {
+  'use strict';
+  if (root.NastyCatContent) return; // injected twice (manifest + on-demand): keep the first instance
+  const N = root.NastyCatShared;
+  const EDITOR = '[data-testid="code-prompt-input"]';
+  const SEND = '[data-testid="code-prompt-send"]';
+  const timing = { settleMs: 400, buttonWaitMs: 5000, confirmMs: 20000, pollMs: 100 };
+  const attempted = new Set(); // delivery ids already clicked in this page: a repeat is never submitted again
+
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const here = () => N.parseClaudeSession(root.location.href);
+  const textOf = (el) => (el.textContent || '').replace(/​/g, '').trim();
+  const sendButton = () => root.document.querySelector(SEND);
+  const sendReady = (b) => b !== null && !b.disabled && b.getAttribute('aria-disabled') !== 'true';
+
+  async function waitFor(test, limitMs) {
+    const end = Date.now() + limitMs;
+    for (;;) {
+      const value = test();
+      if (value) return value;
+      if (Date.now() >= end) return null;
+      await sleep(timing.pollMs);
+    }
+  }
+
+  function scan() {
+    const hrefs = Array.from(root.document.querySelectorAll('a[href]'), (a) => a.href);
+    return { ok: true, conversationId: here(), links: hrefs.filter((h) => N.parsePrUrl(h) !== null) };
+  }
+
+  // Remove only the text this script inserted (the editor was empty before).
+  function clearInserted(editor, prompt) {
+    if (textOf(editor) !== prompt.trim()) return;
+    editor.focus();
+    const selection = root.getSelection && root.getSelection();
+    if (selection && root.document.createRange) {
+      const range = root.document.createRange();
+      range.selectNodeContents(editor);
+      selection.removeAllRanges();
+      selection.addRange(range);
+    }
+    root.document.execCommand('delete', false);
+  }
+
+  async function deliver(message) {
+    const fail = (reason) => ({ ok: false, phase: 'not_sent', reason: reason });
+    if (message.conversationId !== here()) return fail('wrong-conversation');
+    if (typeof message.deliveryId !== 'string' || attempted.has(message.deliveryId)) {
+      return { ok: false, phase: 'uncertain', reason: 'duplicate-delivery' };
+    }
+    const prompt = N.normalizePrompt(message.prompt);
+    if (prompt === null) return fail('bad-prompt');
+    const editor = root.document.querySelector(EDITOR);
+    if (!editor) return fail('no-editor');
+    if (textOf(editor) !== '') return fail('busy-editor'); // a foreign draft: never overwritten
+    editor.focus();
+    if (!root.document.execCommand('insertText', false, prompt) || textOf(editor) !== prompt.trim()) {
+      clearInserted(editor, prompt);
+      return fail('insert-failed');
+    }
+    await sleep(timing.settleMs);
+    const button = await waitFor(() => { const b = sendButton(); return sendReady(b) ? b : null; }, timing.buttonWaitMs);
+    if (!button || message.conversationId !== here() || textOf(editor) !== prompt.trim()) {
+      clearInserted(editor, prompt);
+      return fail(button ? 'changed-before-send' : 'no-send-button');
+    }
+    attempted.add(message.deliveryId); // from here on nothing is ever resubmitted
+    button.click();
+    // Confirmed once the editor was consumed and the send control is gone; "Pending" may show meanwhile.
+    const done = await waitFor(() => textOf(editor) === '' && !sendReady(sendButton()), timing.confirmMs);
+    return done ? { ok: true, phase: 'confirmed' } : { ok: false, phase: 'uncertain', reason: 'unconfirmed' };
+  }
+
+  if (root.chrome && root.chrome.runtime && root.chrome.runtime.onMessage) {
+    root.chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+      if (sender.id !== root.chrome.runtime.id || !message || typeof message.type !== 'string' ||
+          !message.type.startsWith('nastycat:')) return false;
+      const run = async () => {
+        if (message.type === 'nastycat:ping') return { ok: true };
+        if (message.type === 'nastycat:scan') return scan();
+        if (message.type === 'nastycat:deliver') return deliver(message);
+        return { ok: false };
+      };
+      run().then(sendResponse, () => sendResponse({ ok: false, phase: 'uncertain', reason: 'exception' }));
+      return true;
+    });
+  }
+
+  root.NastyCatContent = { timing: timing, scan: scan, deliver: deliver };
+})(typeof self !== 'undefined' ? self : this);

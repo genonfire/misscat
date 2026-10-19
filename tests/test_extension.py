@@ -10,7 +10,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 EXT = ROOT / "extensions" / "badcat-chrome"
-SOURCES = ("shared.js", "background.js", "content.js", "popup.js")
+SOURCES = ("shared.js", "background.js", "content.js", "popup.js",
+           "nastycat-shared.js", "nastycat.js", "nastycat-content.js", "nastycat-popup.js")
 
 
 def extension_id(key_b64: str) -> str:
@@ -37,9 +38,12 @@ class ManifestTests(unittest.TestCase):
 
     def test_requests_only_the_needed_permissions(self):
         m = self.manifest
-        self.assertEqual(sorted(m["permissions"]), ["nativeMessaging", "scripting", "storage"])
-        self.assertEqual(m["host_permissions"], ["https://chatgpt.com/*"])
-        self.assertEqual([c["matches"] for c in m["content_scripts"]], [["https://chatgpt.com/*"]])
+        self.assertEqual(sorted(m["permissions"]), ["alarms", "nativeMessaging", "scripting", "storage"])
+        self.assertEqual(m["host_permissions"], ["https://chatgpt.com/*", "https://claude.ai/*"])
+        self.assertEqual([c["matches"] for c in m["content_scripts"]],
+                         [["https://chatgpt.com/*"], ["https://claude.ai/*"]])
+        # the ChatGPT content script is exactly what it was before NastyCat
+        self.assertEqual(m["content_scripts"][0]["js"], ["shared.js", "content.js"])
         self.assertNotIn("optional_permissions", m)
         self.assertNotIn("externally_connectable", m)
         self.assertNotIn("content_security_policy", m)  # keep the strict MV3 default
@@ -67,6 +71,12 @@ class SourceTests(unittest.TestCase):
         from badcat_host import host
 
         self.assertIn(f"'{host.HOST_NAME}'", (EXT / "shared.js").read_text())
+
+    def test_nastycat_host_name_matches_nastycat_host(self):
+        from nastycat_host import host
+
+        self.assertIn(f"'{host.HOST_NAME}'", (EXT / "nastycat-shared.js").read_text())
+        self.assertNotIn("nastycat", (EXT / "shared.js").read_text().lower())  # MissCat constants untouched
 
     def test_extension_is_not_in_the_wheel(self):
         pyproject = (ROOT / "pyproject.toml").read_text()

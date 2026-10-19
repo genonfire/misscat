@@ -1,6 +1,6 @@
 // Service worker: owns the Native Messaging connection and the target-tab binding.
 // The popup only asks it to start/stop; closing the popup changes nothing here.
-importScripts('shared.js');
+importScripts('shared.js', 'nastycat-shared.js', 'nastycat.js');
 
 const { HOST_NAME, normalizeRepo, isConversationUrl, isChatGptUrl, isNewChatUrl, urlShape, projectOf, inProject, parseEvent, eventKey } = self.BadCatShared;
 
@@ -494,6 +494,7 @@ async function deliverEvent(connection, message) {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (sender.id !== chrome.runtime.id || !message || typeof message !== 'object') return false;
+  if (typeof message.type === 'string' && message.type.startsWith('nastycat:')) return false; // nastycat.js answers these
   // A content script may only rebind itself to, or announce a rollover of, the session's own tab.
   if (sender.tab) {
     const types = ['badcat:hello', 'badcat:rollover', 'badcat:attempt', 'badcat:explicit-result'];
