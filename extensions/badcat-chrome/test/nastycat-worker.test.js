@@ -8,7 +8,7 @@ const crypto = require('node:crypto').webcrypto;
 
 const PR = (n, repo = 'o/r') => `https://github.com/${repo}/pull/${n}`;
 
-function boot({ tabs: tabUrls = { 7: 'https://claude.ai/code/session_A' } } = {}) {
+function boot({ hold = null, tabs: tabUrls = { 7: 'https://claude.ai/code/session_A' } } = {}) {
   const store = { local: {}, session: {} };
   const listeners = {};
   const hook = (name) => ({ addListener: (fn) => { listeners[name] = fn; } });
@@ -19,7 +19,10 @@ function boot({ tabs: tabUrls = { 7: 'https://claude.ai/code/session_A' } } = {}
   const alarms = { active: false };
   const area = (name) => ({
     async get(key) { return key in store[name] ? { [key]: JSON.parse(JSON.stringify(store[name][key])) } : {}; },
-    async set(obj) { Object.assign(store[name], JSON.parse(JSON.stringify(obj))); },
+    async set(obj) {
+      if (name === 'local' && hold && hold.when(obj)) await hold.promise;
+      Object.assign(store[name], JSON.parse(JSON.stringify(obj)));
+    },
   });
   const chrome = {
     runtime: {
@@ -55,6 +58,7 @@ function boot({ tabs: tabUrls = { 7: 'https://claude.ai/code/session_A' } } = {}
         const tab = tabs[id];
         if (!tab) throw new Error('No tab with id');
         if (m.type === 'nastycat:ping') return { ok: true };
+        if (m.type === 'nastycat:cancel') { tab.cancelled = (tab.cancelled || []).concat(m.deliveryId); return { ok: true }; }
         if (m.type === 'nastycat:scan') return { ok: true, conversationId: tab.conversationId || require('../nastycat-shared.js').parseClaudeSession(tab.url), links: tab.links };
         if (m.type === 'nastycat:deliver') {
           tab.delivered.push(m);
@@ -235,4 +239,50 @@ test('ignores MissCat messages and content-script senders', async () => {
   assert.equal(t.listeners.onMessage({ type: 'badcat:status' }, { id: 'me' }, () => {}), false);
   assert.equal(t.listeners.onMessage({ type: 'nastycat:start', prompt: 'x', tabId: 7 }, { id: 'me', tab: { id: 7 } }, () => {}), false);
   assert.equal(t.listeners.onMessage({ type: 'nastycat:stop' }, { id: 'evil' }, () => {}), false);
+});
+
+test('stopping between storing the send intent and dispatching sends nothing and revokes it in the page', async () => {
+  let release;
+  const hold = { promise: new Promise((r) => { release = r; }), when: (obj) => {
+    const list = obj['nastycat.debuglog.v1'] || [];
+    return list.length > 0 && list[list.length - 1].event === 'delivery-start';
+  } };
+  const t = boot({ hold });
+  await t.popup({ type: 'nastycat:start', prompt: 'go', tabId: 7 });
+  await new Promise((r) => setTimeout(r, 30)); // poll stored the intent; deliver() is parked in its debug write
+  assert.equal(t.sessions()[7].delivery.phase, 'sending');
+  const stopping = t.popup({ type: 'nastycat:stop', tabId: 7 }); // its disarm log queues behind the parked write
+  await new Promise((r) => setTimeout(r, 10));
+  release();
+  await stopping;
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(t.tabs[7].delivered.length, 0);
+  assert.equal(t.tabs[7].cancelled.length, 1);
+  assert.equal(t.sessions()[7], undefined);
+});
+
+test('re-arming during that gap does not let the old intent through', async () => {
+  let release;
+  let armed = false;
+  const hold = { promise: new Promise((r) => { release = r; }), when: (obj) => {
+    const list = obj['nastycat.debuglog.v1'] || [];
+    const last = list[list.length - 1];
+    if (armed || !last || last.event !== 'delivery-start') return false;
+    armed = true;
+    return true;
+  } };
+  const t = boot({ hold });
+  await t.popup({ type: 'nastycat:start', prompt: 'one', tabId: 7 });
+  await new Promise((r) => setTimeout(r, 30));
+  const stopping = t.popup({ type: 'nastycat:stop', tabId: 7 });
+  await new Promise((r) => setTimeout(r, 10));
+  t.tabs[7].links = [PR(1)];
+  t.hostState.merged = { 'o/r#1': open };
+  const restarting = t.popup({ type: 'nastycat:start', prompt: 'two', tabId: 7 });
+  await new Promise((r) => setTimeout(r, 10));
+  release();
+  await stopping;
+  await restarting;
+  await new Promise((r) => setTimeout(r, 50));
+  assert.deepEqual(t.tabs[7].delivered.map((m) => m.prompt), []);
 });

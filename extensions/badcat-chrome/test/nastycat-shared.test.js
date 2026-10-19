@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const N = require('../nastycat-shared.js');
 
+const PRURL = (n) => 'https://github.com/o/r/pull/' + n;
 const S0 = Date.parse('2026-06-01T00:00:00Z');
 const link = (pr, repo = 'o/r') => ({ repo, pr });
 const answer = (merged, at = null) => ({ merged, merged_at: merged ? at || '2026-06-01T00:00:10Z' : null });
@@ -149,4 +150,18 @@ test('two sessions are independent', () => {
   assert.equal(out.session.prompt, '#860 A 진행해');
   assert.equal(b.delivery, null);
   assert.equal(b.prompt, '#860 B 진행해');
+});
+
+test('a long conversation never loses discovery of a new PR behind 200+ historical links', () => {
+  const hrefs = [];
+  for (let i = 1; i <= 260; i++) hrefs.push(PRURL(i));
+  const links = N.collectLinks(hrefs);
+  assert.equal(links.length, 260);
+  const old = {};
+  for (const l of links.slice(0, 259)) old[N.prKey(l.repo, l.pr)] = answer(true, '2020-01-01T00:00:00Z');
+  let s = step(fresh(), links.slice(0, 259), old).session;
+  s = N.settle(s, s.delivery.id, 'confirmed');
+  assert.deepEqual(N.keysToCheck(s, links).map((l) => l.pr), [260]); // only the new one is asked
+  const out = step(s, links, { [key(260)]: answer(true, new Date(S0 + 9).toISOString()) }, S0 + 20);
+  assert.deepEqual(out.send.keys, [key(260)]);
 });

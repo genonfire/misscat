@@ -5,16 +5,28 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 
-function boot({ href = 'https://claude.ai/code/session_A', draft = '', anchors = [], sendAppears = true, consumeOnClick = true, insertWorks = true } = {}) {
-  const state = { text: draft, sendVisible: false, clicks: 0, href, deleted: 0 };
+function boot({ pendingMs = 0, shows = true, href = 'https://claude.ai/code/session_A', draft = '', anchors = [], sendAppears = true, consumeOnClick = true, insertWorks = true } = {}) {
+  const messages = [];
+  const state = { messages, text: draft, sendVisible: false, clicks: 0, href, deleted: 0 };
   const editor = {
     focus() {},
+    contains() { return false; },
     get textContent() { return state.text; },
   };
   const button = {
     disabled: false,
     getAttribute() { return null; },
-    click() { state.clicks++; if (consumeOnClick) { state.text = ''; state.sendVisible = false; } },
+    click() {
+      state.clicks++;
+      if (!consumeOnClick) return;
+      const sent = state.text;
+      state.text = ''; state.sendVisible = false;
+      if (!shows) return;
+      const parent = { textContent: sent + ' Pending', parentElement: null };
+      const node = { children: [], textContent: sent, parentElement: parent };
+      messages.push(node);
+      setTimeout(() => { parent.textContent = sent; }, pendingMs);
+    },
   };
   const document = {
     querySelector(sel) {
@@ -22,7 +34,7 @@ function boot({ href = 'https://claude.ai/code/session_A', draft = '', anchors =
       if (sel === '[data-testid="code-prompt-send"]') return state.sendVisible ? button : null;
       return null;
     },
-    querySelectorAll() { return anchors.map((h) => ({ href: h })); },
+    querySelectorAll(sel) { return sel === '*' ? messages : anchors.map((h) => ({ href: h })); },
     execCommand(cmd, _ui, value) {
       if (cmd === 'insertText') {
         if (!insertWorks) return false;
@@ -46,7 +58,7 @@ function boot({ href = 'https://claude.ai/code/session_A', draft = '', anchors =
   vm.createContext(root);
   vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'nastycat-content.js'), 'utf8'), root);
   const api = root.NastyCatContent;
-  Object.assign(api.timing, { settleMs: 1, buttonWaitMs: 60, confirmMs: 60, pollMs: 5 });
+  Object.assign(api.timing, { settleMs: 15, buttonWaitMs: 60, confirmMs: 60, pollMs: 5 });
   const msg = (message, sender = { id: 'me' }) => new Promise((resolve) => {
     const keep = listeners[0](message, sender, resolve);
     if (!keep) resolve(undefined);
@@ -97,6 +109,43 @@ test('a missing send button cleans up what it inserted and sends nothing', async
 test('a failed insertion is not_sent', async () => {
   const t = boot({ insertWorks: false });
   assert.equal((await t.msg(deliver())).reason, 'insert-failed');
+});
+
+test('Pending then success is confirmed only once the message is no longer Pending', async () => {
+  const t = boot({ pendingMs: 40 });
+  const started = Date.now();
+  const out = await t.msg(deliver());
+  assert.equal(out.phase, 'confirmed');
+  assert.ok(Date.now() - started >= 35);
+  assert.equal(t.state.clicks, 1);
+});
+
+test('Pending that never resolves, or no transcript message at all, is uncertain', async () => {
+  const stuck = boot({ pendingMs: 300 });
+  assert.equal((await stuck.msg(deliver())).phase, 'uncertain');
+  const none = boot({ shows: false });
+  assert.equal((await none.msg(deliver())).phase, 'uncertain');
+  assert.equal(none.state.clicks, 1);
+});
+
+test('an identical earlier message does not count as confirmation', async () => {
+  const t = boot({ shows: false });
+  t.state.messages.push({ children: [], textContent: '#860 A 진행해', parentElement: null });
+  assert.equal((await t.msg(deliver())).phase, 'uncertain');
+});
+
+test('a delivery cancelled before it was clicked is withdrawn and cleaned up', async () => {
+  const t = boot();
+  await t.msg({ type: 'nastycat:cancel', deliveryId: 'gone' });
+  const early = await t.msg(deliver('gone'));
+  assert.deepEqual([early.phase, early.reason], ['not_sent', 'cancelled']);
+  const racing = t.msg(deliver('late'));
+  await new Promise((r) => setTimeout(r, 3)); // inserted, waiting for the settle delay
+  await t.msg({ type: 'nastycat:cancel', deliveryId: 'late' });
+  const out = await racing;
+  assert.deepEqual([out.phase, out.reason], ['not_sent', 'cancelled']);
+  assert.equal(t.state.clicks, 0);
+  assert.equal(t.state.text, '');
 });
 
 test('a click whose result never shows is uncertain, not retried', async () => {

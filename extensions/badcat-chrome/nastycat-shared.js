@@ -5,8 +5,7 @@
 
   const HOST_NAME = 'com.genonfire.nastycat_host';
   const MAX_PROMPT = 2000;
-  const MAX_LINKS = 200;
-  const MAX_TRACKED = 500;
+  const MAX_LINKS = 5000; // a sanity bound far above any conversation; never truncates realistic history
   const OWNER_RE = /^[A-Za-z0-9-]+$/;
   const NAME_RE = /^[A-Za-z0-9_.-]+$/;
   const SESSION_PATH_RE = /^\/code\/([A-Za-z0-9_-]{1,128})\/?$/;
@@ -50,7 +49,8 @@
     return String(repo).toLowerCase() + '#' + pr;
   }
 
-  // Validated, deduplicated PR links (first spelling wins), capped.
+  // Validated, deduplicated PR links (first spelling wins). Old links are never dropped to make room for new ones:
+  // settled PRs are skipped later by keysToCheck, so cost stays bounded without losing discovery.
   function collectLinks(hrefs) {
     const seen = new Set();
     const out = [];
@@ -146,10 +146,6 @@
     }
     const due = Object.keys(s.prs).filter((k) => s.prs[k].merged && !s.prs[k].done).sort();
     const startup = s.startup === 'pending';
-    const tracked = Object.keys(s.prs);
-    if (tracked.length > MAX_TRACKED) { // forget the oldest settled entries only
-      for (const k of tracked.filter((k) => s.prs[k].done).slice(0, tracked.length - MAX_TRACKED)) delete s.prs[k];
-    }
     const open = Object.keys(s.prs).filter((k) => !s.prs[k].merged).length;
     s.note = open ? 'Watching ' + open + ' open PR' + (open === 1 ? '' : 's') + '.' : 'Watching for new PRs.';
     if (!startup && due.length === 0) return { session: s, send: null };

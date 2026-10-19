@@ -190,6 +190,12 @@
 
   async function deliver(tabId, armId, s, send) {
     await debugLog('delivery-start', tabId, { keys: send.keys, conversation: shortId(s.conversationId) });
+    // Watching may have been turned OFF (or re-armed) since the intent was stored: nothing is dispatched then.
+    const current = (await loadAll())[tabId];
+    if (!current || !current.active || current.armId !== armId || !current.delivery || current.delivery.id !== send.id) {
+      await debugLog('delivery-cancelled', tabId, { keys: send.keys });
+      return;
+    }
     let outcome;
     let reason = '';
     try {
@@ -259,11 +265,15 @@
   }
 
   async function stop(tabId) {
-    const had = await mutate((all) => {
-      const had = Boolean(all[tabId]);
+    const pending = await mutate((all) => {
+      const existed = Boolean(all[tabId]);
+      const delivery = all[tabId] && all[tabId].delivery;
       delete all[tabId];
-      return had;
+      return { existed: existed, id: delivery ? delivery.id : null };
     });
+    const had = pending.existed;
+    // Revoke an in-flight delivery in the page too; a click that already happened cannot be undone.
+    if (pending.id) chrome.tabs.sendMessage(tabId, { type: 'nastycat:cancel', deliveryId: pending.id }).catch(() => {});
     if (had) await debugLog('disarm', tabId, {});
     await syncAlarm();
     return { ok: true };
