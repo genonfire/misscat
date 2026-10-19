@@ -50,7 +50,7 @@ from urllib.parse import urlsplit
 
 import yaml
 
-__version__ = "1.5.1"
+__version__ = "1.5.0"
 
 log = logging.getLogger("misscat")
 
