@@ -126,6 +126,16 @@ misscat --help
 
 Repository names are canonicalized to lowercase, so `Genonfire/MissCat` and `genonfire/misscat` refer to the same local workspace and state.
 
+### Log output and `--loud`
+
+By default MissCat logs review status only: review start/done/failed with elapsed time and `[cat-N]`, reviewer progress and usage (`reviewer: working`, `reviewer: turn done (input=…, output=…)`, `reviewer: claude done (turns=…, cost=…)`), the `nothing to review …` polling lines, and every warning and error. Failed reviewer tool activity (`exec: failed`, a non-zero exit code, a failed MCP or Claude tool call) is a warning and is always shown.
+
+```bash
+misscat . sol --cat 2 --loud
+```
+
+`--loud` additionally shows successful reviewer tool activity (`exec: …`, `exec: completed (0)`, MCP calls, web searches, Claude `tool: …` lines, Gemini tool steps) and raw, non-JSON reviewer CLI output at `DEBUG`.
+
 ### Using `.` for the current repository
 
 `.` **always means the GitHub repository of the current Git checkout's `origin` remote**; `upstream` and other remotes are never used.
