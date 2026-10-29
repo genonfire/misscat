@@ -50,9 +50,12 @@ from urllib.parse import urlsplit
 
 import yaml
 
-__version__ = "1.5.0"
+__version__ = "1.5.1"
 
 log = logging.getLogger("misscat")
+# Reviewer tool activity (exec/MCP/tool/web search). Successful lines show only with --loud;
+# warnings and errors always show. Configured once in _configure_logging(), so cat threads agree.
+activity_log = logging.getLogger("misscat.activity")
 
 CONFIG_DIR = Path.home() / ".config" / "misscat"
 WORKSPACE_ROOT = Path.home() / ".cache" / "misscat" / "repos"  # control clones
@@ -757,12 +760,12 @@ def _log_codex_event(event: dict) -> None:
 
     if kind == "item.started":
         if item_type == "command_execution":
-            log.info("exec: %s", _short(item.get("command") or "command"))
+            activity_log.info("exec: %s", _short(item.get("command") or "command"))
         elif item_type == "mcp_tool_call":
-            log.info("mcp: %s started", _mcp_name(item))
+            activity_log.info("mcp: %s started", _mcp_name(item))
         elif item_type == "web_search":
             query = _short(item.get("query"))
-            log.info("web search: %s", query or "started")
+            activity_log.info("web search: %s", query or "started")
         return
 
     if item_type == "command_execution":
@@ -770,17 +773,17 @@ def _log_codex_event(event: dict) -> None:
         exit_code = item.get("exit_code")
         suffix = f" ({exit_code})" if exit_code is not None else ""
         if status == "failed" or (isinstance(exit_code, int) and exit_code != 0):
-            log.warning("exec: %s%s", status, suffix)
+            activity_log.warning("exec: %s%s", status, suffix)
         else:
-            log.info("exec: %s%s", status, suffix)
+            activity_log.info("exec: %s%s", status, suffix)
     elif item_type == "mcp_tool_call":
         status = item.get("status") or "completed"
         if status == "failed":
-            log.warning("mcp: %s failed", _mcp_name(item))
+            activity_log.warning("mcp: %s failed", _mcp_name(item))
         else:
-            log.info("mcp: %s %s", _mcp_name(item), status)
+            activity_log.info("mcp: %s %s", _mcp_name(item), status)
     elif item_type == "web_search":
-        log.info("web search: completed")
+        activity_log.info("web search: completed")
 
 
 def _claude_tool_label(name: str, tool_input) -> str:
@@ -813,7 +816,7 @@ def _log_claude_event(event: dict, tool_names: dict[str, str]) -> None:
             tool_id = block.get("id")
             if tool_id:
                 tool_names[str(tool_id)] = name
-            log.info("tool: %s", _claude_tool_label(name, block.get("input")))
+            activity_log.info("tool: %s", _claude_tool_label(name, block.get("input")))
         return
 
     if kind == "user":
@@ -824,9 +827,9 @@ def _log_claude_event(event: dict, tool_names: dict[str, str]) -> None:
             tool_id = str(block.get("tool_use_id") or "")
             name = tool_names.get(tool_id, "tool")
             if block.get("is_error"):
-                log.warning("tool: %s failed", name)
+                activity_log.warning("tool: %s failed", name)
             else:
-                log.info("tool: %s completed", name)
+                activity_log.info("tool: %s completed", name)
         return
 
     if kind == "result":
@@ -861,9 +864,9 @@ def _log_gemini_event(event: dict) -> None:
             command = params.get("CommandLine")
 
             if command:
-                log.info("reviewer: %s %s", tool, _short(command))
+                activity_log.info("reviewer: %s %s", tool, _short(command))
             else:
-                log.info("reviewer: %s", tool)
+                activity_log.info("reviewer: %s", tool)
             return
 
     if kind == "result":
@@ -1789,6 +1792,12 @@ def _positive_int(value: str) -> int:
     return number
 
 
+def _configure_logging(loud: bool) -> None:
+    """Default: review status plus every warning/error. --loud: also tool activity and DEBUG."""
+    log.setLevel(logging.DEBUG if loud else logging.INFO)
+    activity_log.setLevel(logging.NOTSET if loud else logging.WARNING)
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     parser = argparse.ArgumentParser(
@@ -1818,7 +1827,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--loud",
         action="store_true",
-        help="show detailed reviewer activity",
+        help="also show reviewer tool activity (exec/MCP/tool/web search) and raw CLI "
+        "debug output; warnings and errors are always shown",
     )
     parser.add_argument(
         "--cat",
@@ -1845,9 +1855,7 @@ def main(argv: list[str] | None = None) -> int:
         else "%(asctime)s %(levelname)s %(message)s",
         datefmt="%H:%M:%S",
     )
-
-    if args.loud:
-        log.setLevel(logging.DEBUG)
+    _configure_logging(args.loud)
 
     try:
         repo = resolve_repo_arg(args.repo)  # canonicalize once; everything below uses this form
