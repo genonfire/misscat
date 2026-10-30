@@ -573,8 +573,16 @@ def _run(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = N
     except OSError as exc:
         raise WorkspaceError(f"{cmd[0]}: {exc}") from exc
     if proc.returncode != 0:
-        raise WorkspaceError(f"{' '.join(cmd[:3])} failed: {proc.stderr.strip()[-300:]}")
+        raise WorkspaceError(_redact(f"{' '.join(cmd[:3])} failed: {proc.stderr.strip()[-300:]}"))
     return proc.stdout.strip()
+
+
+_USERINFO_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/@\s]*@")
+
+
+def _redact(text: str) -> str:
+    """Drop user:token@ from URLs (an HTTPS remote may carry credentials) before logging."""
+    return _USERINFO_RE.sub(r"\1", text)
 
 
 def _git(args: list[str], cwd: Path) -> str:

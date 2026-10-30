@@ -485,12 +485,65 @@ class WorkspaceTests(unittest.TestCase):
             ws.prepare(self.prs[1], 1)
         self.assertNotIn("fallback", str(caught.exception))
 
+    SECRET = "FAKE_SECRET_DO_NOT_USE"
+
+    def credential_origin(self, ws):
+        url = f"https://reviewer:{self.SECRET}@127.0.0.1:9/genonfire/typewriter.git"
+        git("remote", "set-url", "origin", url, cwd=ws.control)
+        return url
+
+    def test_fork_fetch_failure_never_logs_url_credentials(self):
+        ws = m.Workspaces(REPO, 1)
+        ws.sync()
+        self.credential_origin(ws)  # nothing listens on port 9: the fork fetch fails
+        meta = self.metadata(1, "feature", "forker/typewriter")
+        for _ in range(2):  # the retry on the next poll fails the same, still redacted
+            with mock.patch.object(m.GhDiscussion, "_api", return_value=meta), \
+                    self.assertRaisesRegex(m.WorkspaceError, "source branch fallback failed") as caught:
+                ws._fetch_source(self.prs[1])
+            self.assertNotIn(self.SECRET, str(caught.exception))
+            self.assertNotIn("reviewer", str(caught.exception))
+            self.assertIn("forker/typewriter:feature", str(caught.exception))
+
+    def test_fork_fetch_uses_origin_credentials_without_logging_them(self):
+        fork = self.root / "forker" / "typewriter.git"
+        git("init", "-q", "--bare", str(fork))
+        ws = m.Workspaces(REPO, 1)
+        ws.sync()
+        self.drop_pull_ref(2, "feature", remote=fork)
+        url = self.credential_origin(ws)
+        fetched = []
+        real_git = m._git
+
+        def fake_git(args, cwd):
+            if args[0] == "fetch":  # stand in for the authenticated HTTPS fork
+                fetched.append(args[1])
+                args = ["fetch", str(fork), *args[2:]]
+            return real_git(args, cwd)
+
+        with mock.patch.object(m.GhDiscussion, "_api",
+                               return_value=self.metadata(2, "feature", "forker/typewriter")), \
+                mock.patch.object(m, "_git", fake_git), self.assertLogs("misscat", "INFO") as logs:
+            ws._fetch_source(self.prs[2])
+        self.assertEqual(fetched, [url.replace("genonfire/typewriter", "forker/typewriter")])
+        self.assertEqual(git("rev-parse", "FETCH_HEAD", cwd=ws.control), self.prs[2].head)
+        self.assertNotIn(self.SECRET, "\n".join(logs.output))
+
+    def test_git_errors_redact_url_credentials(self):
+        with self.assertRaises(m.WorkspaceError) as caught:
+            m._git(["fetch", f"https://reviewer:{self.SECRET}@127.0.0.1:9/o/r.git", "main"], self.root)
+        self.assertNotIn(self.SECRET, str(caught.exception))
+        self.assertIn("https://127.0.0.1:9/o/r.git", str(caught.exception))
+        self.assertEqual(m._redact("'https://tok@github.com/o/r' git@github.com:o/r.git"),
+                         "'https://github.com/o/r' git@github.com:o/r.git")
+
     def test_sibling_url_keeps_host_and_protocol(self):
         cases = {
             "https://github.com/genonfire/typewriter.git": "https://github.com/forker/tw.git",
             "https://github.com/Genonfire/Typewriter": "https://github.com/forker/tw",
             "git@github.com:genonfire/typewriter.git": "git@github.com:forker/tw.git",
             "ssh://git@github.com/genonfire/typewriter.git/": "ssh://git@github.com/forker/tw.git",
+            "https://u:tok@github.com/genonfire/typewriter.git": "https://u:tok@github.com/forker/tw.git",
             "https://github.com/xgenonfire/typewriter.git": None,
             "https://github.com/other/repo.git": None,
         }
