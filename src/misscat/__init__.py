@@ -50,7 +50,7 @@ from urllib.parse import urlsplit
 
 import yaml
 
-__version__ = "1.5.1"
+__version__ = "1.5.2"
 
 log = logging.getLogger("misscat")
 # Reviewer tool activity (exec/MCP/tool/web search). Successful lines show only with --loud;
@@ -563,11 +563,12 @@ def blocking_review(reviews: list[GhReview], head: str) -> GhReview | None:
 # --------------------------------------------------------------------------- workspace
 
 
-def _run(cmd: list[str], cwd: Path | None = None) -> str:
+def _run(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = None) -> str:
     try:
         proc = subprocess.run(
             cmd, cwd=cwd, stdin=subprocess.DEVNULL, capture_output=True, text=True,
-            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},  # fail instead of waiting for a password
+            # fail instead of waiting for a password
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0", **(env or {})},
         )
     except OSError as exc:
         raise WorkspaceError(f"{cmd[0]}: {exc}") from exc
@@ -577,7 +578,24 @@ def _run(cmd: list[str], cwd: Path | None = None) -> str:
 
 
 def _git(args: list[str], cwd: Path) -> str:
-    return _run(["git", *args], cwd)
+    return _run(["git", *args], cwd, {"LC_ALL": "C"})  # untranslated errors, see _MISSING_REF
+
+
+# git's error when the requested ref does not exist on the remote (not auth/network/other)
+_MISSING_REF = "couldn't find remote ref"
+
+
+def _sibling_url(origin: str, repo: str, other: str) -> str | None:
+    """`origin`'s fetch URL with the `repo` path swapped for `other` (same host and protocol).
+
+    None when the URL does not end in `repo`, so a fork is never fetched from a guessed host.
+    """
+    base = origin.rstrip("/")
+    suffix = ".git" if base.endswith(".git") else ""
+    base = base[: len(base) - len(suffix)]
+    if len(base) <= len(repo) or base[-len(repo) - 1] not in "/:" or base[-len(repo):].lower() != repo.lower():
+        return None
+    return base[: -len(repo)] + other + suffix
 
 
 def _clone(repo: str, path: Path) -> None:
@@ -671,7 +689,12 @@ class Workspaces:
     def prepare(self, pr: PR, cat: int) -> Path:
         """Return cat-N cleaned and detached at exactly pr.head."""
         try:
-            _git(["fetch", "origin", f"refs/pull/{pr.number}/head"], self.control)  # fork PRs too
+            try:
+                _git(["fetch", "origin", f"refs/pull/{pr.number}/head"], self.control)  # fork PRs too
+            except WorkspaceError as exc:
+                if _MISSING_REF not in str(exc):
+                    raise
+                self._fetch_source(pr)
             fetched = _git(["rev-parse", "FETCH_HEAD^{commit}"], self.control)
             self._check_head(pr, fetched)
             path = self._ensure_cat(cat)
@@ -682,6 +705,35 @@ class Workspaces:
         except OSError as exc:
             raise WorkspaceError(str(exc)) from exc
         return path
+
+    def _fetch_source(self, pr: PR) -> None:
+        """Fetch the PR's source branch into FETCH_HEAD when GitHub has no refs/pull/N/head.
+
+        Runs only after that ref was reported missing: one PR metadata lookup, then the exact
+        branch from origin (same repository) or from the fork's URL, never a new remote.
+        """
+        failed = f"refs/pull/{pr.number}/head missing; source branch fallback failed"
+        try:
+            data = GhDiscussion._api(f"repos/{self.repo}/pulls/{pr.number}")
+            head = data["head"]
+            sha, ref = str(head["sha"]), str(head["ref"])
+            source = str((head.get("repo") or {}).get("full_name") or "")
+        except (GhError, KeyError, TypeError, AttributeError) as exc:
+            raise WorkspaceError(f"{failed}: PR metadata unavailable: {exc}") from exc
+        self._check_head(pr, sha)
+        try:
+            branch = _git(["check-ref-format", "--normalize", f"refs/heads/{ref}"], self.control)
+            if canonical_repo(source) == canonical_repo(self.repo):  # a deleted fork has no name
+                remote = "origin"
+            else:
+                remote = _sibling_url(_git(["remote", "get-url", "origin"], self.control), self.repo, source)
+                if remote is None:
+                    raise WorkspaceError(f"cannot derive the URL of {source} from origin")
+            _git(["fetch", remote, branch], self.control)
+        except (WorkspaceError, MissCatError) as exc:
+            raise WorkspaceError(f"{failed}: {source}:{ref}: {exc}") from exc
+        log.info("PR #%d: refs/pull/%d/head missing, fetched %s:%s instead",
+                 pr.number, pr.number, source, ref)
 
     @staticmethod
     def _check_head(pr: PR, head: str) -> None:
