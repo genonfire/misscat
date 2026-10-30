@@ -311,7 +311,8 @@ class WorkspaceTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         root = Path(tmp.name)
-        self.origin = root / "origin.git"
+        self.root = root
+        self.origin = root / "genonfire" / "typewriter.git"  # a URL ending in REPO, like GitHub's
         seed = root / "seed"
         git("init", "-q", "--bare", "-b", "main", str(self.origin))
         git("init", "-q", "-b", "main", str(seed))
@@ -401,6 +402,153 @@ class WorkspaceTests(unittest.TestCase):
         stale = m.PR(1, "0" * 40, False, "u", "t")
         with self.assertRaises(m.WorkspaceError):
             ws.prepare(stale, 1)
+
+    def drop_pull_ref(self, number, branch=None, remote=None):
+        """GitHub lost refs/pull/N/head; the PR's commit stays on `branch` of `remote`."""
+        remote = remote or self.origin
+        if branch:
+            git("push", "-q", str(remote), f"{self.prs[number].head}:refs/heads/{branch}", cwd=self.seed)
+        git("update-ref", "-d", f"refs/pull/{number}/head", cwd=self.origin)
+
+    def metadata(self, number, ref, source=REPO, sha=None):
+        return {"head": {"sha": sha or self.prs[number].head, "ref": ref,
+                         "repo": {"full_name": source} if source else None}}
+
+    def test_pull_ref_fast_path_does_not_look_up_metadata(self):
+        ws = m.Workspaces(REPO, 1)
+        ws.sync()
+        with mock.patch.object(m.GhDiscussion, "_api", side_effect=AssertionError("no lookup")):
+            path = ws.prepare(self.prs[1], 1)
+        self.assertEqual(git("rev-parse", "HEAD", cwd=path), self.prs[1].head)
+
+    def test_missing_pull_ref_falls_back_to_same_repo_branch(self):
+        ws = m.Workspaces(REPO, 1)
+        ws.sync()
+        self.drop_pull_ref(1, "a-codex-096-02")
+        with mock.patch.object(m.GhDiscussion, "_api", return_value=self.metadata(1, "a-codex-096-02")) as api, \
+                self.assertLogs("misscat", "INFO"):
+            path = ws.prepare(self.prs[1], 1)
+        api.assert_called_once_with(f"repos/{REPO}/pulls/1")
+        self.assertEqual(git("rev-parse", "HEAD", cwd=path), self.prs[1].head)
+        self.assertEqual(subprocess.run(["git", "symbolic-ref", "-q", "HEAD"], cwd=path).returncode, 1)
+        self.assertEqual(git("remote", cwd=ws.control), "origin")
+
+    def test_missing_pull_ref_falls_back_to_fork_branch(self):
+        fork = self.root / "forker" / "typewriter.git"
+        git("init", "-q", "--bare", str(fork))
+        ws = m.Workspaces(REPO, 1)
+        ws.sync()
+        self.drop_pull_ref(2, "feature", remote=fork)  # the branch exists only on the fork
+        with mock.patch.object(m.GhDiscussion, "_api",
+                               return_value=self.metadata(2, "feature", "forker/typewriter")), \
+                self.assertLogs("misscat", "INFO"):
+            path = ws.prepare(self.prs[2], 1)
+        self.assertEqual(git("rev-parse", "HEAD", cwd=path), self.prs[2].head)
+        self.assertEqual(git("remote", cwd=ws.control), "origin")  # no fork remote left behind
+        self.assertEqual(git("remote", "get-url", "origin", cwd=ws.control), str(self.origin))
+
+    def test_fallback_rejects_a_moved_head(self):
+        ws = m.Workspaces(REPO, 1)
+        ws.sync()
+        self.drop_pull_ref(1, "b1")
+        self.drop_pull_ref(2, "b2")
+        cases = (self.metadata(1, "b1", sha="f" * 40),  # GitHub already reports a newer HEAD
+                 self.metadata(1, "b2"))  # branch tip is not the listed HEAD
+        for meta in cases:
+            with mock.patch.object(m.GhDiscussion, "_api", return_value=meta), \
+                    self.assertRaisesRegex(m.WorkspaceError, "changed during preparation"):
+                ws.prepare(self.prs[1], 1)
+        self.assertNotEqual(git("rev-parse", "HEAD", cwd=ws.cat_path(1)), self.prs[1].head)
+
+    def test_fallback_failures_fail_closed(self):
+        ws = m.Workspaces(REPO, 1)
+        ws.sync()
+        self.drop_pull_ref(1)  # no source branch anywhere
+        cases = (
+            mock.patch.object(m.GhDiscussion, "_api", return_value=self.metadata(1, "gone")),
+            mock.patch.object(m.GhDiscussion, "_api", return_value=self.metadata(1, "x", source=None)),
+            mock.patch.object(m.GhDiscussion, "_api",
+                              return_value=self.metadata(1, "x", "nobody/typewriter")),  # no such fork
+            mock.patch.object(m.GhDiscussion, "_api", side_effect=m.GhError("HTTP 403")),
+            mock.patch.object(m.GhDiscussion, "_api", return_value={"head": None}),
+        )
+        for case in cases:
+            with case, self.assertRaisesRegex(m.WorkspaceError, "source branch fallback failed"):
+                ws.prepare(self.prs[1], 1)
+
+    def test_other_fetch_failures_do_not_fall_back(self):
+        ws = m.Workspaces(REPO, 1)
+        ws.sync()
+        git("remote", "set-url", "origin", str(self.root / "missing.git"), cwd=ws.control)
+        with mock.patch.object(m.GhDiscussion, "_api", side_effect=AssertionError("no lookup")), \
+                self.assertRaises(m.WorkspaceError) as caught:
+            ws.prepare(self.prs[1], 1)
+        self.assertNotIn("fallback", str(caught.exception))
+
+    SECRET = "FAKE_SECRET_DO_NOT_USE"
+
+    def credential_origin(self, ws):
+        url = f"https://reviewer:{self.SECRET}@127.0.0.1:9/genonfire/typewriter.git"
+        git("remote", "set-url", "origin", url, cwd=ws.control)
+        return url
+
+    def test_fork_fetch_failure_never_logs_url_credentials(self):
+        ws = m.Workspaces(REPO, 1)
+        ws.sync()
+        self.credential_origin(ws)  # nothing listens on port 9: the fork fetch fails
+        meta = self.metadata(1, "feature", "forker/typewriter")
+        for _ in range(2):  # the retry on the next poll fails the same, still redacted
+            with mock.patch.object(m.GhDiscussion, "_api", return_value=meta), \
+                    self.assertRaisesRegex(m.WorkspaceError, "source branch fallback failed") as caught:
+                ws._fetch_source(self.prs[1])
+            self.assertNotIn(self.SECRET, str(caught.exception))
+            self.assertNotIn("reviewer", str(caught.exception))
+            self.assertIn("forker/typewriter:feature", str(caught.exception))
+
+    def test_fork_fetch_uses_origin_credentials_without_logging_them(self):
+        fork = self.root / "forker" / "typewriter.git"
+        git("init", "-q", "--bare", str(fork))
+        ws = m.Workspaces(REPO, 1)
+        ws.sync()
+        self.drop_pull_ref(2, "feature", remote=fork)
+        url = self.credential_origin(ws)
+        fetched = []
+        real_git = m._git
+
+        def fake_git(args, cwd):
+            if args[0] == "fetch":  # stand in for the authenticated HTTPS fork
+                fetched.append(args[1])
+                args = ["fetch", str(fork), *args[2:]]
+            return real_git(args, cwd)
+
+        with mock.patch.object(m.GhDiscussion, "_api",
+                               return_value=self.metadata(2, "feature", "forker/typewriter")), \
+                mock.patch.object(m, "_git", fake_git), self.assertLogs("misscat", "INFO") as logs:
+            ws._fetch_source(self.prs[2])
+        self.assertEqual(fetched, [url.replace("genonfire/typewriter", "forker/typewriter")])
+        self.assertEqual(git("rev-parse", "FETCH_HEAD", cwd=ws.control), self.prs[2].head)
+        self.assertNotIn(self.SECRET, "\n".join(logs.output))
+
+    def test_git_errors_redact_url_credentials(self):
+        with self.assertRaises(m.WorkspaceError) as caught:
+            m._git(["fetch", f"https://reviewer:{self.SECRET}@127.0.0.1:9/o/r.git", "main"], self.root)
+        self.assertNotIn(self.SECRET, str(caught.exception))
+        self.assertIn("https://127.0.0.1:9/o/r.git", str(caught.exception))
+        self.assertEqual(m._redact("'https://tok@github.com/o/r' git@github.com:o/r.git"),
+                         "'https://github.com/o/r' git@github.com:o/r.git")
+
+    def test_sibling_url_keeps_host_and_protocol(self):
+        cases = {
+            "https://github.com/genonfire/typewriter.git": "https://github.com/forker/tw.git",
+            "https://github.com/Genonfire/Typewriter": "https://github.com/forker/tw",
+            "git@github.com:genonfire/typewriter.git": "git@github.com:forker/tw.git",
+            "ssh://git@github.com/genonfire/typewriter.git/": "ssh://git@github.com/forker/tw.git",
+            "https://u:tok@github.com/genonfire/typewriter.git": "https://u:tok@github.com/forker/tw.git",
+            "https://github.com/xgenonfire/typewriter.git": None,
+            "https://github.com/other/repo.git": None,
+        }
+        for origin, want in cases.items():
+            self.assertEqual(m._sibling_url(origin, REPO, "forker/tw"), want, origin)
 
     def test_broken_cat_is_recreated(self):
         ws = m.Workspaces(REPO, 1)
