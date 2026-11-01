@@ -360,8 +360,8 @@ def main(argv: Optional[list] = None) -> int:
         description="Watch GitHub PR review results; with --merge, squash-merge eligible PRs.",
         epilog=(
             "Default is notify only: BadCat never writes to GitHub without --merge.\n"
-            "With --merge (equivalent to --merge=2), require +1 then +2 (batch PRs: +1).\n"
-            "With --merge=1, require a valid +1; both modes still require no -1,\n"
+            "With --merge (equivalent to --merge=1), require a valid +1.\n"
+            "With --merge=2, require +1 then +2 (batch PRs: +1); both modes still require no -1,\n"
             "passing CI and a clean GitHub mergeability state.\n"
             "Trusted reviewers: --trusted-reviewer LOGIN (repeatable), default the `gh` user.\n"
             "CI is discovered automatically: every check run, workflow run and commit status on the\n"
@@ -373,9 +373,9 @@ def main(argv: Optional[list] = None) -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("repo", metavar="owner/repo|.")
-    parser.add_argument("--merge", nargs="?", const=2, default=None, type=int,
+    parser.add_argument("--merge", nargs="?", const=1, default=None, type=int,
                         choices=(1, 2), metavar="{1,2}",
-                        help="squash-merge after +1 or +2 (bare --merge defaults to 2; omitted: notify only)")
+                        help="squash-merge after +1 (1) or +1 then +2 (2); bare --merge means 1; omitted: notify only")
     parser.add_argument("--trusted-reviewer", action="append", default=[], metavar="LOGIN",
                         help="GitHub login whose review markers count (repeatable)")
     parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {__version__}")

@@ -286,8 +286,8 @@ In headless mode a denied permission can end the run without posting a review; u
 
 ```bash
 badcat owner/repo                          # report only, no GitHub writes
-badcat . --merge                           # merge after +1 then +2 (batch-labeled PRs at +1)
-badcat . --merge=1                         # merge after +1
+badcat . --merge                           # merge after +1 (same as --merge=1)
+badcat . --merge=2                         # merge after +1 then +2 (batch-labeled PRs at +1)
 badcat . --merge --trusted-reviewer luna   # trust reviews by this login (default: your gh user)
 ```
 
