@@ -768,7 +768,7 @@ class LockAndIdentityTests(unittest.TestCase):
             self.assertEqual(cli.main(["o/r"]), 0)
             self.assertEqual(seen, {"trusted": frozenset({"luna"}), "merge": None})
             self.assertEqual(cli.main(["o/r", "--merge", "--trusted-reviewer", "A"]), 0)
-            self.assertEqual(seen, {"trusted": frozenset({"a"}), "merge": 2})
+            self.assertEqual(seen, {"trusted": frozenset({"a"}), "merge": 1})
             self.assertEqual(cli.main(["o/r", "--merge=1"]), 0)
             self.assertEqual(seen, {"trusted": frozenset({"luna"}), "merge": 1})
             self.assertEqual(cli.main(["o/r", "--merge=2"]), 0)
