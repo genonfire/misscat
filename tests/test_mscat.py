@@ -67,7 +67,7 @@ class ConfigTest(unittest.TestCase):
     def test_template_defaults(self):
         mscat.ensure_config()
         s = mscat.load_settings()
-        self.assertEqual((s.provider, s.model, s.args), ("opencode", "openai/gpt-6-luna", ()))
+        self.assertEqual((s.provider, s.model, s.args), ("opencode", "openai/gpt-6-luna#xhigh", ()))
         self.assertTrue(s.include_drafts)
 
     def test_help_and_version_have_no_side_effects(self):
@@ -88,8 +88,8 @@ class RunnerTest(unittest.TestCase):
         self.bin.mkdir()
         self.work = self.root / "work"
         self.work.mkdir()
-        self.settings = m.Settings("opencode", "openai/gpt-6-luna", "PROMPT", (1.0,), (1.0,), True,
-                                   ("--variant", "high"))
+        self.settings = m.Settings("opencode", "openai/gpt-6-luna#xhigh", "PROMPT", (1.0,),
+                                   (1.0,), True, ("--foo",))
         self.pr = m.PR(7, HEAD, False, "u", "t", run_id="r1")
 
     def fake(self, lines, code=0):
@@ -103,8 +103,8 @@ class RunnerTest(unittest.TestCase):
 
     def test_command_shape(self):
         cmd = mscat.command(self.settings, "P")
-        self.assertEqual(cmd, ["opencode", "run", "--format", "json", "--variant", "high",
-                               "--model", "openai/gpt-6-luna", "P"])
+        self.assertEqual(cmd, ["opencode", "run", "--standalone", "--format", "json", "--foo",
+                               "--model", "openai/gpt-6-luna#xhigh", "P"])
 
     def test_runs_in_workspace_with_prompt_and_logs_usage(self):
         steps = [json.dumps(e) for e in (
@@ -120,13 +120,40 @@ class RunnerTest(unittest.TestCase):
         self.assertTrue(ok)
         lines = out.read_text().splitlines()
         self.assertEqual(Path(lines[0]).resolve(), self.work.resolve())
-        self.assertEqual(lines[1:7], ["run", "--format", "json", "--variant", "high", "--model"])
+        self.assertEqual(lines[1:8], ["run", "--standalone", "--format", "json", "--foo", "--model",
+                                      "openai/gpt-6-luna#xhigh"])
         self.assertIn("MissCat-Run: r1", "\n".join(lines))
         self.assertNotIn("--continue", lines)
         done = [r for r in logs.output if "opencode done" in r][0]
         self.assertIn("input=30", done)
         self.assertIn("output=6", done)
         self.assertIn("cost≈$0.0300 (CLI estimate)", done)
+
+    def test_child_pwd_is_the_worktree_not_the_callers(self):
+        script = self.bin / "opencode"  # no shell: nothing repairs PWD for us
+        script.write_text(f"#!{sys.executable}\nimport os\nopen(os.environ['FAKE_OUT'], 'w')"
+                          ".write(os.getcwd() + '\\n' + os.environ['PWD'])\n")
+        script.chmod(script.stat().st_mode | stat.S_IEXEC)
+        out = self.root / "out"
+        caller = self.root / "caller"
+        caller.mkdir()
+        env = {"PATH": f"{self.bin}:{os.environ['PATH']}", "FAKE_OUT": str(out), "PWD": str(caller)}
+        with mock.patch.dict(os.environ, env):
+            self.assertTrue(mscat.OpenCodeReviewer()(self.settings, REPO, self.pr, self.work))
+            self.assertEqual(os.environ["PWD"], str(caller))  # parent untouched
+        cwd, pwd = out.read_text().split("\n")
+        self.assertEqual(Path(cwd).resolve(), self.work.resolve())
+        self.assertEqual(pwd, str(self.work))
+
+    def test_no_route_is_fatal_and_pointed_at_the_config(self):
+        err = json.dumps({"type": "error", "error": {"type": "provider.no-route", "message": "x"}})
+        env, _ = self.fake([err])
+        reviewer = mscat.OpenCodeReviewer()
+        with env, self.assertLogs("misscat", "ERROR"):
+            self.assertFalse(reviewer(self.settings, REPO, self.pr, self.work))
+        with self.assertRaises(m.MissCatError) as ctx:
+            reviewer.check()
+        self.assertIn("reviewer.model", str(ctx.exception))
 
     def test_missing_usage_is_not_zero(self):
         env, _ = self.fake([json.dumps({"type": "step_start"})])
@@ -144,7 +171,7 @@ class RunnerTest(unittest.TestCase):
         self.assertNotIn("tok", logs.output[0])
 
     def test_error_event_fails_even_with_exit_zero(self):
-        err = json.dumps({"type": "error", "error": {"name": "APIError", "data": {"message": "boom"}}})
+        err = json.dumps({"type": "error", "error": {"type": "api", "message": "boom"}})
         env, _ = self.fake([err])
         reviewer = mscat.OpenCodeReviewer()
         with env, self.assertLogs("misscat", "ERROR"):
@@ -152,8 +179,7 @@ class RunnerTest(unittest.TestCase):
         reviewer.check()  # transient: no stop
 
     def test_fatal_error_stops_dispatch_with_advice(self):
-        err = json.dumps({"type": "error", "error": {"name": "ProviderAuthError",
-                                                     "data": {"message": "no key"}}})
+        err = json.dumps({"type": "error", "error": {"type": "provider.auth", "message": "no key"}})
         env, _ = self.fake([err])
         reviewer = mscat.OpenCodeReviewer()
         with env, self.assertLogs("misscat", "ERROR"):
@@ -272,14 +298,14 @@ class MainTest(unittest.TestCase):
             self.addCleanup(p.stop)
 
         def fail(self_, settings, repo, pr, ws):
-            self_.fatal = "opencode ProviderAuthError: nope"
+            self_.fatal = "opencode provider.auth: nope"
             return False
 
         with mock.patch.object(mscat.OpenCodeReviewer, "__call__", fail), \
                 mock.patch("sys.stderr") as err, mock.patch("time.sleep") as sleep:
             self.assertEqual(mscat.main([REPO]), 2)
         sleep.assert_not_called()
-        self.assertIn("ProviderAuthError", "".join(c.args[0] for c in err.write.call_args_list))
+        self.assertIn("provider.auth", "".join(c.args[0] for c in err.write.call_args_list))
 
 
 class WheelTest(unittest.TestCase):

@@ -1,4 +1,4 @@
-"""mscat - MissCat's reviewer watcher driven by the OpenCode CLI (v1.19.5 interface).
+"""mscat - MissCat's reviewer watcher driven by the OpenCode CLI (native V2, v2.0.32 interface).
 
 Reuses MissCat's watcher, exact-HEAD cat worktrees, review confirmation, recovery, State and
 repository lock. Configuration is always ~/.config/misscat/opencode.yml; completed reviews are
@@ -10,6 +10,7 @@ import argparse
 import importlib.resources
 import json
 import logging
+import os
 import shutil
 import subprocess
 import sys
@@ -31,10 +32,9 @@ CONFIG_NAME = "opencode.yml"
 PROFILE = "mscat/opencode"  # State identity; "/" keeps it apart from every MissCat profile name
 PROVIDERS = ("opencode",)
 # OpenCode error names that no retry can fix: stop dispatching and tell the owner what to do.
-FATAL_ERRORS = {
-    "ProviderAuthError": "authenticate the provider (`opencode auth login`)",
-    "ProviderModelNotFoundError": "check reviewer.model in {path}",
-    "ModelNotFoundError": "check reviewer.model in {path}",
+FATAL_ERRORS = {  # V2 structured error `type`
+    "provider.auth": "authenticate the provider (`opencode auth login`)",
+    "provider.no-route": "check reviewer.model in {path}",
 }
 
 
@@ -80,8 +80,12 @@ def load_settings() -> Settings:
 
 
 def command(settings: Settings, prompt: str) -> list[str]:
-    """V1 shape; native args go before the prompt, always a fresh session."""
-    return ["opencode", "run", "--format", "json", *settings.args, "--model", settings.model, prompt]
+    """V2 shape: a private per-run server, a fresh session, native args before the prompt.
+
+    The model is `provider/model[#variant]`, passed unchanged.
+    """
+    return ["opencode", "run", "--standalone", "--format", "json", *settings.args,
+            "--model", settings.model, prompt]
 
 
 def _tool_label(name: str, tool_input) -> str:
@@ -137,8 +141,9 @@ class OpenCodeReviewer:
         assert workspace is not None
         cmd = command(settings, build_prompt(settings, repo, pr))
         try:
+            # V2 picks its root from $PWD before the process cwd: point both at the worktree
             proc = subprocess.Popen(
-                cmd, cwd=workspace, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                cmd, cwd=workspace, env={**os.environ, "PWD": str(workspace)}, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT, text=True, bufsize=1,
             )
         except OSError as exc:
@@ -187,9 +192,8 @@ class OpenCodeReviewer:
                 activity_log.info("tool: %s", label)
         elif kind == "error":
             error = event.get("error") if isinstance(event.get("error"), dict) else {}
-            name = str(error.get("name") or "error")
-            data = error.get("data") if isinstance(error.get("data"), dict) else {}
-            message = misscat._short(data.get("message") or error.get("message") or name)
+            name = str(error.get("type") or error.get("name") or "error")
+            message = misscat._short(error.get("message") or name)
             log.error("reviewer: %s: %s", name, message)
             if name in FATAL_ERRORS and not self.fatal:
                 self.fatal = f"opencode {name}: {message}. Fix it: " + FATAL_ERRORS[name].format(
@@ -208,7 +212,7 @@ def main(argv: list[str] | None = None) -> int:
         description="Watch a GitHub repository and run an OpenCode review on every new PR HEAD.",
         epilog=(
             "Configuration is always ~/.config/misscat/opencode.yml (created from a bundled\n"
-            "template when missing, never overwritten). Targets OpenCode v1.19.5.\n"
+            "template when missing, never overwritten). Targets OpenCode native V2 v2.0.32.\n"
             "State, worktrees and the repository lock are shared with `misscat`; reviews are\n"
             "recorded under the profile 'mscat/opencode' (see `misscat state owner/repo`).\n"
             "'.' as the repository means the current Git repository's `origin` remote."

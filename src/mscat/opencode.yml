@@ -1,10 +1,10 @@
 # mscat configuration, read by `mscat` (not by OpenCode itself). mscat builds the command
-#   opencode run --format json <reviewer.args> --model <reviewer.model> <prompt>
-# Targets OpenCode v1.19.5. Edit freely: an existing file is never overwritten.
+#   opencode run --standalone --format json <reviewer.args> --model <reviewer.model> <prompt>
+# Targets OpenCode native V2 v2.0.32. Edit freely: an existing file is never overwritten.
 reviewer:
   provider: opencode
-  model: openai/gpt-6-luna   # passed to --model unchanged (provider/model)
-  args: []                   # extra native `opencode run` options, e.g. [--variant, high]
+  model: "openai/gpt-6-luna#xhigh"   # provider/model#variant, passed to --model unchanged
+  args: []                           # extra native `opencode run` options
 
 prompt: |
   Read REVIEW.md if exist and act as the 1st reviewer.
