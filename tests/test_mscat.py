@@ -128,7 +128,8 @@ class RunnerTest(unittest.TestCase):
         done = [r for r in logs.output if "opencode done" in r][0]
         self.assertIn("input=30", done)
         self.assertIn("output=6", done)
-        self.assertIn("cost≈$0.0300 (CLI estimate)", done)
+        self.assertIn("cost≈$0.0300", done)
+        self.assertNotIn("(CLI estimate)", done)
 
     def test_child_pwd_is_the_worktree_not_the_callers(self):
         script = self.bin / "opencode"  # no shell: nothing repairs PWD for us

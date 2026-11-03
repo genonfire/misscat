@@ -123,7 +123,7 @@ class Usage:
         details = [f"steps={self.steps}"]
         details += [f"{k}={self.tokens[k]}" for k in self.KEYS if k in self.tokens]
         if self.cost is not None:
-            details.append(f"cost≈${self.cost:.4f} (CLI estimate)")
+            details.append(f"cost≈${self.cost:.4f}")
         return ", ".join(details)
 
 
