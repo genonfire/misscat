@@ -280,6 +280,29 @@ reviewer:
 
 In headless mode a denied permission can end the run without posting a review; use `--loud` to inspect.
 
+## mscat (OpenCode)
+
+`pipx install misscat` also installs `mscat`, which runs the same watcher with your already configured [OpenCode](https://opencode.ai/docs/cli/) CLI as the reviewer. It targets the **OpenCode native V2 v2.0.32** interface (V1 flags and events are not supported).
+
+```bash
+mscat owner/repo
+mscat .
+mscat . --cat 2 --loud
+```
+
+There is no profile argument: `mscat` always reads `~/.config/misscat/opencode.yml`, a file read by mscat itself (not an OpenCode-native config). It has the usual `reviewer` (`provider: opencode`, `model`, `args`), `prompt`, `watch` and `review` fields, and mscat runs, inside the exact-HEAD `cat-N` worktree:
+
+```text
+opencode run --standalone --format json <reviewer.args> --model <reviewer.model> <prompt>
+```
+
+Every review starts a fresh OpenCode session, and ``--standalone` gives each run a private OpenCode server (never your managed background one), and the child gets `PWD` set to the worktree. `reviewer.model` is passed unchanged as `provider/model#variant` (default `openai/gpt-6-luna#xhigh`; the variant must exist in your OpenCode). Existing profiles such as `luna.yml` are never used or translated.
+
+- **Initialization:** a normal run keeps MissCat's first-run profile install, then adds a packaged `opencode.yml` only if that file is missing (also when the directory already exists). An existing file is never overwritten; invalid content is a configuration error. `--help`/`--version` touch nothing and need no OpenCode.
+- **State and workspaces:** shared with `misscat` (control clone, `cat-N` worktrees, repository lock), so `misscat` and `mscat` cannot watch the same repository at once. Completed reviews are recorded under the profile `mscat/opencode`, visible in `misscat state owner/repo`. Because that is a new profile, the first mscat run reviews already-open HEADs that were completed under another profile.
+- **Completion:** same as MissCat: a submitted `COMMENT` review with the verdict, the exact HEAD and the run's `MissCat-Run:` line, never exit status alone. A review submitted before OpenCode fails is still settled.
+- **Output:** compact progress, tool failures and, when OpenCode reports them, token usage and a cost estimate (summed per step; missing data is omitted, never shown as zero). Clearly non-retryable errors (`provider.auth`, `provider.no-route`) stop the watch with advice; other failures follow the normal retry wait.
+
 ## BadCat
 
 `pipx install misscat` also installs `badcat`, a deterministic watcher of submitted PR reviews (no AI). By default it only reports; it merges (squash) only with `--merge`.

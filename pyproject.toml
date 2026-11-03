@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "misscat"
-version = "1.5.3"
+version = "1.6.0"
 description = "Watch a GitHub repository and run an AI review on every new PR HEAD (plus BadCat, a review-state watcher with opt-in merge, and badcat-host, its read-only Native Messaging host)"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -38,6 +38,7 @@ Issues = "https://github.com/genonfire/misscat/issues"
 
 [project.scripts]
 misscat = "misscat:main"
+mscat = "mscat:main"
 badcat = "badcat.cli:main"
 badcat-host = "badcat_host.host:main"
 
@@ -46,3 +47,4 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 misscat = ["default.yml", "py.typed", "profiles/*.yml"]
+mscat = ["opencode.yml", "py.typed"]

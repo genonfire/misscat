@@ -50,7 +50,7 @@ from urllib.parse import urlsplit
 
 import yaml
 
-__version__ = "1.5.3"
+__version__ = "1.6.0"
 
 log = logging.getLogger("misscat")
 # Reviewer tool activity (exec/MCP/tool/web search). Successful lines show only with --loud;
@@ -144,7 +144,7 @@ def _schedule(value, name: str) -> tuple[float, ...]:
     return tuple(float(v) for v in value)
 
 
-def build_settings(cfg: dict) -> Settings:
+def build_settings(cfg: dict, providers: tuple[str, ...] = PROVIDERS) -> Settings:
     try:
         reviewer = cfg["reviewer"]
         provider, model = reviewer["provider"], reviewer["model"]
@@ -153,8 +153,8 @@ def build_settings(cfg: dict) -> Settings:
         idle, active = cfg["watch"]["idle"], cfg["watch"]["active"]
     except (KeyError, TypeError, AttributeError) as exc:
         raise ConfigError(f"missing or malformed config section: {exc}") from exc
-    if provider not in PROVIDERS:
-        raise ConfigError(f"reviewer.provider must be one of {', '.join(PROVIDERS)}")
+    if provider not in providers:
+        raise ConfigError(f"reviewer.provider must be one of {', '.join(providers)}")
     if not isinstance(model, str) or not model.strip():
         raise ConfigError("reviewer.model must be a non-empty string")
     if not isinstance(args, list) or not all(isinstance(a, str) and a for a in args):
