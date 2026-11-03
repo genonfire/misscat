@@ -51,7 +51,7 @@ class ActivityLogTests(unittest.TestCase):
         ]
         default, loud = self.both(lambda: [m._log_codex_event(e) for e in events])
         for out in (default, loud):
-            self.assertIn("INFO MainThread reviewer: working", out)
+            self.assertNotIn("reviewer: working", out)
             self.assertIn("WARNING MainThread exec: completed (2)", out)
             self.assertIn("WARNING MainThread mcp: gh.pr failed", out)
             self.assertIn("reviewer: turn done (input=10, output=3)", out)
@@ -98,7 +98,7 @@ class ActivityLogTests(unittest.TestCase):
         ]
         default, loud = self.both(lambda: [m._log_gemini_event(e) for e in events])
         for out in (default, loud):
-            self.assertIn("reviewer: working", out)
+            self.assertNotIn("reviewer: working", out)
             self.assertIn("reviewer: done (tokens=42)", out)
         for line in ("reviewer: run_command git log", "reviewer: view_file"):
             self.assertNotIn(line, default)
@@ -119,7 +119,7 @@ class ActivityLogTests(unittest.TestCase):
 
         default, loud = self.both(emit, thread_name="cat-2")
         for out in (default, loud):
-            self.assertIn("INFO cat-2 reviewer: working", out)
+            self.assertNotIn("reviewer: working", out)
             self.assertIn("WARNING cat-2 exec: failed", out)
         self.assertNotIn("exec: ls", default)
         self.assertIn("INFO cat-2 exec: ls", loud)

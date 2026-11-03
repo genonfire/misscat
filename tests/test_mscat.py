@@ -124,6 +124,7 @@ class RunnerTest(unittest.TestCase):
                                       "openai/gpt-6-luna#xhigh"])
         self.assertIn("MissCat-Run: r1", "\n".join(lines))
         self.assertNotIn("--continue", lines)
+        self.assertNotIn("reviewer: working", "\n".join(logs.output))
         done = [r for r in logs.output if "opencode done" in r][0]
         self.assertIn("input=30", done)
         self.assertIn("output=6", done)
