@@ -50,7 +50,7 @@ from urllib.parse import urlsplit
 
 import yaml
 
-__version__ = "1.6.0"
+__version__ = "1.6.1"
 
 log = logging.getLogger("misscat")
 # Reviewer tool activity (exec/MCP/tool/web search). Successful lines show only with --loud;
@@ -790,9 +790,6 @@ def _log_codex_event(event: dict) -> None:
     """Log progress from `codex exec --json` without dumping tool output."""
     kind = event.get("type")
 
-    if kind == "turn.started":
-        log.info("reviewer: working")
-        return
     if kind == "turn.failed":
         error = event.get("error") or {}
         log.error("reviewer: %s", _short(error.get("message") or "turn failed"))
@@ -913,10 +910,6 @@ def _log_gemini_event(event: dict) -> None:
         step = event.get("step_update") or {}
         step_type = step.get("step_type")
         state = step.get("state")
-
-        if step_type == "agent_response" and state == "DONE":
-            log.info("reviewer: working")
-            return
 
         if step_type == "tool" and state == "ACTIVE":
             tool = step.get("tool_name") or "tool"

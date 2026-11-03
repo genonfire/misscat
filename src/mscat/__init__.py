@@ -178,9 +178,7 @@ class OpenCodeReviewer:
         """Log compact progress; True when the event is a runner error."""
         kind = event.get("type")
         part = event.get("part") if isinstance(event.get("part"), dict) else {}
-        if kind == "step_start":
-            log.info("reviewer: working")
-        elif kind == "step_finish":
+        if kind == "step_finish":
             usage.add(part)
         elif kind == "tool_use":
             state = part.get("state") if isinstance(part.get("state"), dict) else {}
