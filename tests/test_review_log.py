@@ -36,7 +36,13 @@ class ReviewLogTests(unittest.TestCase):
         self.pr = m.PR(78, "e4e58fa1234", False, "https://github.com/example", "title")
         self.cfg = m.load_settings(None)
 
-    def run_review(self, reviewer, clock):
+    def run_review(self, reviewer, seconds):
+        now = [100.0]
+
+        def timed(*args):  # the reviewer "takes" `seconds` on the fake clock
+            now[0] += seconds
+            return reviewer(*args)
+
         stream = io.StringIO()
         handler = logging.StreamHandler(stream)
         handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
@@ -48,34 +54,34 @@ class ReviewLogTests(unittest.TestCase):
             with m.repository_lock(REPO):
                 state = m.State(self.path)
                 watcher = m.Watcher(REPO, "luna", self.cfg, state, lambda repo: [self.pr],
-                                    reviewer, sleep=lambda delay: None)
-                with mock.patch.object(m.time, "monotonic", side_effect=clock):
-                    result = watcher._review(self.pr)
-                return watcher, state, result, stream.getvalue()
+                                    timed, clock=lambda: now[0])
+                watcher.cycle()
+                return watcher, state, bool(state.reviewed()), stream.getvalue()
         finally:
             m.log.removeHandler(handler)
             m.log.setLevel(old_level)
             m.log.propagate = propagate
 
     def test_success_logs_separator_start_and_duration_in_order(self):
-        watcher, state, ok, out = self.run_review(lambda *a: True, [100.0, 1118.4])
+        watcher, state, ok, out = self.run_review(lambda *a: True, 1018.4)
         self.assertTrue(ok)
         self.assertEqual(out, f"\n{m.REVIEW_SEPARATOR}\n"
                               f"INFO PR #78: review start (e4e58fa)\n"
-                              f"INFO PR #78: review done in 16m 58s\n")
+                              f"INFO PR #78: review done in 16m 58s\n"
+                              f"INFO next check in 1m (0 running)\n")
         self.assertIn(m.Key(78, self.pr.head), state.reviewed())
 
     def test_failure_logs_elapsed_and_stays_eligible(self):
-        watcher, state, ok, out = self.run_review(lambda *a: False, [0.0, 42.0])
+        watcher, state, ok, out = self.run_review(lambda *a: False, 42)
         self.assertFalse(ok)
         self.assertIn("WARNING PR #78: review failed after 42s, HEAD stays eligible", out)
         self.assertEqual(state.reviewed(), set())
-        self.assertEqual(watcher.failed, {m.Key(78, self.pr.head)})
+        self.assertEqual(set(watcher.failed), {m.Key(78, self.pr.head)})
 
     def test_exception_is_failure_with_elapsed(self):
         def boom(*a):
             raise RuntimeError("x")
-        watcher, state, ok, out = self.run_review(boom, [0.0, 60.0])
+        watcher, state, ok, out = self.run_review(boom, 60)
         self.assertFalse(ok)
         self.assertIn("review failed after 1m 0s, HEAD stays eligible", out)
         self.assertEqual(state.reviewed(), set())

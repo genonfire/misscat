@@ -76,13 +76,11 @@ class ReplyBase(unittest.TestCase):
         self.state._records = [m.ReviewRecord(7, HEAD, "luna", ts(5), (1,))]
         self.pr = m.PR(7, HEAD, False, "https://example/pr/7", "t", author=AUTHOR, updated_at="u1")
         self.calls = []
-        self.sleeps = []
 
     def watcher(self, discussion, prs=None, reviewer=None, profile="luna"):
         prs = [self.pr] if prs is None else prs
         reviewer = reviewer or (lambda s, r, pr, ws: self.calls.append(pr) or True)
-        return m.Watcher(REPO, profile, self.cfg, self.state, lambda repo: prs, reviewer,
-                         sleep=self.sleeps.append, discussion=discussion)
+        return m.Watcher(REPO, profile, self.cfg, self.state, lambda repo: prs, reviewer, discussion=discussion)
 
     def blocked(self, **kw):
         return FakeDiscussion([review(1, 4)], [comment(10, 6)], **kw)
@@ -238,7 +236,7 @@ class AttributionTests(ReplyBase):
         with self.assertLogs("misscat", "ERROR"):
             w.cycle()
         self.assertEqual([r for r in self.state.records() if r.pr == 9], [])
-        self.assertEqual(self.sleeps, [m.FAILURE_WAIT])
+        self.assertEqual(set(w.failed), {m.Key(9, HEAD)})
         self.assertEqual(self.state.pending(), [])  # nothing pending: it is simply retried
 
     def test_prompt_carries_the_run_nonce(self):
@@ -395,6 +393,7 @@ class RecoveryTests(ReplyBase):
             w.cycle()
         self.assertEqual(self.state.pending(), [])
         self.assertEqual(self.state.handled(), set())
+        w.failed.clear()  # the 5m cooldown passed
         w.cycle()
         self.assertEqual(len(self.calls), 2)
 
@@ -507,7 +506,8 @@ class VerificationTests(ReplyBase):
         w = self.watcher(d)
         w.cycle()
         self.assertEqual(self.state.handled(), set())
-        self.assertEqual(self.sleeps, [m.FAILURE_WAIT])
+        self.assertEqual(set(w.failed), {self.key})
+        w.failed.clear()  # the 5m cooldown passed
         w.cycle()  # same updatedAt, but never cached as "no reply due"
         self.assertEqual(len(self.calls), 2)
 

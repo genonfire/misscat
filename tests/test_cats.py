@@ -1,9 +1,13 @@
-"""Backlog burst reviews: batches, the batch barrier, and persistent cat worktrees."""
+"""Independent cat workers: immediate settlement, one periodic poll, and persistent cat worktrees."""
+import collections
+import dataclasses
 import json
 import os
+import queue
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -23,16 +27,52 @@ def git(*args, cwd=None):
 
 class FakeWorkspaces:
     def __init__(self, fail=()):
-        self.fail, self.synced, self.prepared = set(fail), 0, []
+        self.fail, self.synced, self.prepared, self.skips = set(fail), 0, [], []
+        self.sync_error = None
+        self.on_prepare = None
 
-    def sync(self):
+    def sync(self, skip=frozenset()):
+        if self.sync_error:
+            raise self.sync_error
         self.synced += 1
+        self.skips.append(set(skip))
 
     def prepare(self, pr, cat):
         if pr.number in self.fail:
             raise m.WorkspaceError("boom")
+        if self.on_prepare:
+            self.on_prepare(pr, cat)
         self.prepared.append((pr.number, cat))
         return Path(f"/cat-{cat}")
+
+
+class FakeDiscussion:
+    """GitHub stand-in: a review carries the run nonce of every run that `submit`ted one."""
+
+    def __init__(self):
+        self.runs, self.calls = {}, 0
+
+    def submit(self, pr):
+        self.runs[pr.number] = (pr.head, pr.run_id)
+
+    def reviews(self, number):
+        self.calls += 1
+        if number not in self.runs:
+            return []
+        head, run = self.runs[number]
+        return [m.GhReview(number, "bot", "COMMENTED",
+                           f"+1\nHEAD: {head}\n\nok\n{m.run_line(run)}", head, "2026-01-01T00:00:00Z")]
+
+    def head(self, number):
+        return self.runs[number][0]
+
+
+def wait_until(cond, timeout=5.0):
+    end = time.monotonic() + timeout
+    while not cond():
+        if time.monotonic() > end:
+            raise AssertionError("timed out")
+        time.sleep(0.005)
 
 
 class WatcherBase(unittest.TestCase):
@@ -46,25 +86,53 @@ class WatcherBase(unittest.TestCase):
             self.addCleanup(patcher.stop)
         self.cfg = m.load_settings(None)
         self.state = m.State(m.state_path(REPO))
-        self.prs = [m.PR(n, f"sha{n}", False, "u", "t") for n in (101, 102, 103, 104)]
+        self.prs = [m.PR(n, f"{n:040x}", False, "u", "t") for n in (101, 102, 103, 104)]
+        self.now = 1000.0
+        self.list_calls = 0
+        self.gates = collections.defaultdict(threading.Event)  # PR number -> release
+        self.started = collections.defaultdict(threading.Event)
 
-    def watcher(self, reviewer, cats, prs=None, workspaces=None, sleeps=None):
+    def watcher(self, reviewer, cats, prs=None, workspaces=None, **kw):
         prs = self.prs if prs is None else prs
-        sleeps = [] if sleeps is None else sleeps
-        return m.Watcher(REPO, "luna", self.cfg, self.state, lambda repo: prs, reviewer,
-                         sleep=sleeps.append, cats=cats, workspaces=workspaces)
+        self.current = list(prs)
+
+        def list_prs(repo):
+            self.list_calls += 1
+            return list(self.current)
+
+        w = m.Watcher(REPO, "luna", self.cfg, self.state, list_prs, reviewer, cats=cats,
+                      workspaces=workspaces, clock=lambda: self.now, **kw)
+        self.addCleanup(self.release_all)
+        return w
+
+    def release_all(self):
+        for gate in list(self.gates.values()):
+            gate.set()
+
+    def gated(self, ok=True):
+        """A reviewer that blocks until `self.gates[pr.number]` is set."""
+        def reviewer(s, r, pr, ws):
+            self.started[pr.number].set()
+            self.gates[pr.number].wait(5)
+            return ok
+        return reviewer
+
+    def collect(self, w, n=1):
+        """Record `n` finished reviews the way run_forever does, one event at a time."""
+        for _ in range(n):
+            w._finish(w.events.get(timeout=5))
 
     def reviewed(self):
         return {k.pr for k in self.state.reviewed()}
 
 
 class BatchTests(WatcherBase):
-    def test_cat_1_reviews_one_pr_per_cycle_inline(self):
+    def test_cat_1_uses_one_worker_thread(self):
         threads = []
         w = self.watcher(lambda s, r, pr, ws: threads.append(threading.current_thread().name) or True, 1)
         w.cycle()
         self.assertEqual(self.reviewed(), {101})
-        self.assertEqual(threads, [threading.current_thread().name])
+        self.assertEqual(threads, ["cat-1"])
 
     def test_backlog_smaller_than_cats_launches_only_needed(self):
         calls = []
@@ -95,40 +163,11 @@ class BatchTests(WatcherBase):
         self.assertEqual(seen, {101: Path("/cat-1"), 102: Path("/cat-2"), 103: Path("/cat-3")})
         self.assertEqual(ws.synced, 1)
 
-    def test_next_pr_waits_for_whole_batch(self):
-        release = threading.Event()
-        started = []
-        lock = threading.Lock()
-
-        def reviewer(s, r, pr, ws):
-            with lock:
-                started.append(pr.number)
-            if pr.number == 102:
-                release.wait(5)  # slow cat; the fast one must not pick up another PR
-            return True
-
-        w = self.watcher(reviewer, 2)
-        t = threading.Thread(target=w.cycle)
-        t.start()
-        for _ in range(100):
-            with lock:
-                if len(started) == 2:
-                    break
-            threading.Event().wait(0.02)
-        threading.Event().wait(0.2)
-        self.assertEqual(sorted(started), [101, 102])
-        self.assertEqual(self.reviewed(), set())  # nothing recorded before the barrier
-        release.set()
-        t.join(5)
-        self.assertEqual(self.reviewed(), {101, 102})
-        self.assertEqual(sorted(started), [101, 102])  # 103 not launched in this cycle
-
     def test_partial_failure_still_records_successes(self):
         w = self.watcher(lambda s, r, pr, ws: pr.number != 102, 3)
         w.cycle()
         self.assertEqual(self.reviewed(), {101, 103})
-        self.assertEqual(w.failed, {m.Key(102, "sha102")})
-        self.assertEqual(w.mode, m.ACTIVE)  # something succeeded: re-list right away
+        self.assertEqual(w.failed, {m.Key(102, self.prs[1].head): self.now})
 
     def test_crash_in_one_cat_is_a_failure_only_for_that_pr(self):
         def reviewer(s, r, pr, ws):
@@ -140,109 +179,385 @@ class BatchTests(WatcherBase):
         with self.assertLogs("misscat", "ERROR"):
             w.cycle()
         self.assertEqual(self.reviewed(), {102})
+        self.assertEqual(set(w.failed), {m.Key(101, self.prs[0].head)})
 
-    def test_all_failed_waits_failure_wait(self):
-        sleeps = []
-        w = self.watcher(lambda *a: False, 2, sleeps=sleeps)
-        w.cycle()
-        self.assertEqual(sleeps, [m.FAILURE_WAIT])
-        self.assertEqual(self.reviewed(), set())
+    # ---- immediate settlement, no barrier
 
-    def test_failed_head_goes_last_in_next_batch(self):
-        calls = []
-        w = self.watcher(lambda s, r, pr, ws: calls.append(pr.number) or pr.number != 101, 2)
-        w.cycle()  # 101 fails, 102 ok
-        calls.clear()
-        w.cycle()  # 103, 104 are ahead of the failed 101
-        self.assertEqual(sorted(calls), [103, 104])
-
-    def urgent_prs(self, *urgent):
-        return [m.PR(n, f"sha{n}", False, "u", "t", n in urgent) for n in (101, 102, 103, 104)]
-
-    def selected(self, cats, prs, w=None):
-        w = w or self.watcher(lambda s, r, pr, ws: True, cats, prs)
-        return [p.number for p in w._next_batch(prs)]
-
-    def test_no_urgent_keeps_oldest_first(self):
-        self.assertEqual(self.selected(2, self.urgent_prs()), [101, 102])
-
-    def test_urgent_jumps_ahead_and_fills_remaining_with_normal(self):
-        self.assertEqual(self.selected(2, self.urgent_prs(103)), [103, 101])
-
-    def test_multiple_urgent_oldest_first(self):
-        self.assertEqual(self.selected(3, self.urgent_prs(104, 102)), [102, 104, 101])
-
-    def test_more_urgent_than_cats_only_urgent(self):
-        self.assertEqual(self.selected(2, self.urgent_prs(102, 103, 104)), [102, 103])
-
-    def test_urgent_added_mid_batch_observed_only_on_next_listing(self):
-        current = [self.urgent_prs()]
-        started = []
-
-        def reviewer(s, r, pr, ws):
-            current[0] = self.urgent_prs(104)  # label added while the batch is running
-            started.append(pr.number)
-            return True
-
-        w = m.Watcher(REPO, "luna", self.cfg, self.state, lambda repo: current[0], reviewer,
-                      sleep=lambda s: None, cats=2)
-        w.cycle()
-        self.assertEqual(sorted(started), [101, 102])  # running batch unchanged
-        started.clear()
-        w.cycle()
-        self.assertEqual(sorted(started), [103, 104])
-        self.assertEqual(self.reviewed(), {101, 102, 103, 104})
-
-    def labeled_prs(self, urgent=(), no_review=()):
-        return [m.PR(n, f"sha{n}", False, "u", "t", n in urgent, n in no_review)
-                for n in (101, 102, 103, 104)]
-
-    def test_no_review_pr_is_excluded(self):
-        self.assertEqual(self.selected(4, self.labeled_prs(no_review=(102,))), [101, 103, 104])
-
-    def test_no_review_beats_urgent(self):
-        self.assertEqual(self.selected(2, self.labeled_prs(urgent=(103,), no_review=(103,))), [101, 102])
-
-    def test_no_review_does_not_consume_a_cat_slot(self):
-        self.assertEqual(self.selected(2, self.labeled_prs(no_review=(101,))), [102, 103])
-
-    def test_no_review_is_not_recorded_and_label_removal_restores_eligibility(self):
-        started = []
-        current = [self.labeled_prs(no_review=(101, 102, 103, 104))]
-        w = m.Watcher(REPO, "luna", self.cfg, self.state, lambda repo: current[0],
-                      lambda s, r, pr, ws: started.append(pr.number) or True,
-                      sleep=lambda s: None, cats=2)
-        w.cycle()
-        self.assertEqual(started, [])
-        self.assertEqual(self.reviewed(), set())
-        current[0] = self.labeled_prs(no_review=(102, 103, 104))  # label removed from 101
-        w.cycle()
-        self.assertEqual(started, [101])
+    def test_fast_cat_is_recorded_before_the_slow_one_and_waits_for_the_next_poll(self):
+        w = self.watcher(self.gated(), 2, self.prs[:2])
+        w.poll()
+        wait_until(lambda: all(self.started[n].is_set() for n in (101, 102)))
+        self.gates[101].set()
+        with self.assertLogs("misscat", "INFO") as logs:
+            self.collect(w)
+        self.assertEqual(self.reviewed(), {101})  # 102 is still running
+        self.assertTrue(any("PR #101: review done" in line and "[cat-1]" in line for line in logs.output))
+        self.assertEqual(set(w.running), {2})
+        self.assertEqual(w.idle, [1])
+        self.current = self.prs  # more work appears: cat-1 only takes it at the next poll
+        self.assertFalse(self.started[103].is_set())
+        w.poll()
+        wait_until(lambda: self.started[103].is_set())
+        self.assertEqual(w.running[1].pr.number, 103)
         self.assertEqual(self.reviewed(), {101})
 
-    def test_no_review_added_mid_batch_observed_only_on_next_listing(self):
-        current = [self.labeled_prs()]
-        started = []
+    def test_completion_order_may_differ_from_start_order(self):
+        w = self.watcher(self.gated(), 2, self.prs[:2])
+        w.poll()
+        self.gates[102].set()
+        self.collect(w)
+        self.assertEqual(self.reviewed(), {102})
+        self.gates[101].set()
+        self.collect(w)
+        self.assertEqual(self.reviewed(), {101, 102})
+        self.assertEqual((w.running, w.idle), ({}, [1, 2]))
+
+    def test_state_is_written_only_from_the_main_thread(self):
+        writers = []
+        original = self.state.add
+
+        def add(key, *ids):
+            writers.append(threading.current_thread())
+            original(key, *ids)
+
+        self.state.add = add
+        ws = mock.Mock(prepare=lambda pr, cat: Path("/c"))
+        ws.sync.side_effect = lambda skip=frozenset(): writers.append(threading.current_thread())
+        self.watcher(lambda *a: True, 3, workspaces=ws).cycle()
+        self.assertEqual(len(writers), 4)  # sync + three records
+        self.assertTrue(all(t is threading.main_thread() for t in writers))
+
+    # ---- polling
+
+    def test_completions_do_not_poll_and_do_not_move_the_deadline(self):
+        cfg = dataclasses.replace(self.cfg, idle=(60.0,) * 5, active=(60.0,) * 5)
+        self.cfg = cfg
+        w = self.watcher(self.gated(), 2, self.prs[:2])
+        timeouts, polls = [], []
+
+        class Stop(BaseException):
+            pass
+
+        class Queue(queue.Queue):
+            n = 0
+
+            def get(q, block=True, timeout=None):
+                if not block:
+                    return super().get(False)
+                timeouts.append(timeout)
+                q.n += 1
+                if q.n == 2:
+                    self.gates[101].set()
+                    wait_until(lambda: not q.empty())  # cat-1 finishes during the interval
+                try:
+                    return super().get(False)
+                except queue.Empty:
+                    self.now += timeout  # the interval elapses
+                    raise
+
+        w.events = Queue()
+        original = w.list_prs
+
+        def list_prs(repo):
+            polls.append((self.now, self.reviewed()))
+            if len(polls) == 3:
+                raise Stop
+            return original(repo)
+
+        w.list_prs = list_prs
+        try:
+            with self.assertRaises(Stop):
+                w.run_forever()
+        finally:
+            self.gates[102].set()
+        # first poll at once, the next one exactly 60s later; cat-1's completion in between
+        # was recorded without a listing and left the deadline alone
+        self.assertEqual([t for t, _ in polls[:2]], [1000.0, 1060.0])
+        self.assertEqual(polls[1][1], {101})
+        self.assertEqual(self.list_calls, 2)
+        self.assertEqual(timeouts[:4], [0.0, 60.0, 60.0, 60.0])
+
+    def test_one_listing_per_poll_however_many_cats_finish(self):
+        w = self.watcher(lambda *a: True, 3)
+        w.cycle()
+        self.assertEqual(self.list_calls, 1)
+
+    def test_idle_cats_are_assigned_from_a_single_listing(self):
+        w = self.watcher(self.gated(), 3, self.prs[:1])
+        w.poll()
+        self.current = self.prs
+        w.poll()
+        self.assertEqual(self.list_calls, 2)
+        self.assertEqual(sorted(r.pr.number for r in w.running.values()), [101, 102, 103])
+
+    # ---- inflight PRs
+
+    def test_inflight_pr_gets_no_second_run_when_its_head_changes(self):
+        disc = FakeDiscussion()
+        calls = []
 
         def reviewer(s, r, pr, ws):
-            current[0] = self.labeled_prs(no_review=(101, 103))  # label added while running
-            started.append(pr.number)
+            calls.append((pr.number, pr.head))
+            disc.submit(pr)
+            self.gates[pr.number].wait(5)
             return True
 
-        w = m.Watcher(REPO, "luna", self.cfg, self.state, lambda repo: current[0], reviewer,
-                      sleep=lambda s: None, cats=2)
-        w.cycle()
-        self.assertEqual(sorted(started), [101, 102])  # in-flight review not cancelled
-        self.assertEqual(self.reviewed(), {101, 102})
-        started.clear()
-        w.cycle()
-        self.assertEqual(started, [104])
+        w = self.watcher(reviewer, 2, self.prs[:1], discussion=disc)
+        w.poll()
+        wait_until(lambda: calls)
+        live = [r.run_id for r in self.state.pending()]
+        self.current = [m.PR(101, "f" * 40, False, "u", "t")]
+        w.poll()
+        self.assertEqual(calls, [(101, self.prs[0].head)])  # nothing assigned
+        self.assertEqual([r.run_id for r in self.state.pending()], live)  # live pending preserved
+        self.gates[101].set()
+        self.collect(w)
+        self.assertEqual(self.state.reviewed(), {m.Key(101, self.prs[0].head)})
+        self.assertEqual(self.state.pending(), [])
+        w.poll()  # the new HEAD is picked up at the next poll
+        while w.running:
+            self.collect(w)
+        self.assertEqual(calls[-1], (101, "f" * 40))
 
-    def test_failed_head_fairness_within_each_priority_class(self):
-        prs = self.urgent_prs(101, 102)
-        w = self.watcher(lambda s, r, pr, ws: True, 4, prs)
-        w.failed = {w._key(prs[0]), w._key(prs[2])}  # urgent 101 and normal 103 failed
-        self.assertEqual(self.selected(4, prs, w), [102, 101, 104, 103])
+    def test_inflight_pr_is_not_looked_up_for_replies(self):
+        w = self.watcher(self.gated(), 2, self.prs[:1])
+        w.poll()
+        w.discussion = mock.Mock()
+        self.state.add(m.Key(101, self.prs[0].head), "luna")  # reviewed HEAD of a running PR (re-review)
+        self.current = [m.PR(101, self.prs[0].head, False, "u", "t", author="a", updated_at="u1")]
+        self.assertEqual(w._next_batch(self.current, 1, {101}), [])
+        w.discussion.reviews.assert_not_called()
+
+    # ---- ACTIVE / IDLE
+
+    def test_mode_follows_running_cats_and_restarts_the_schedule(self):
+        self.cfg = dataclasses.replace(self.cfg, idle=(10.0, 20.0, 30.0), active=(60.0,) * 5)
+        w = self.watcher(self.gated(), 9, self.prs[:1])
+        self.assertEqual(w.poll(), 60.0)
+        self.assertEqual(w.mode, m.ACTIVE)  # one of nine cats is enough
+        self.assertEqual(w.poll(), 60.0)
+        self.gates[101].set()
+        self.collect(w)
+        self.assertEqual(w.poll(), 10.0)  # nothing running: idle schedule from its start
+        self.assertEqual(w.mode, m.IDLE)
+        self.assertEqual(w.poll(), 20.0)
+
+    def test_listing_failure_keeps_running_cats_and_assigns_nothing(self):
+        w = self.watcher(self.gated(), 2, self.prs[:1])
+        w.poll()
+        w.list_prs = mock.Mock(side_effect=m.GhError("down"))
+        with self.assertLogs("misscat", "WARNING"):
+            w.poll()
+        self.assertEqual(set(w.running), {1})
+
+    # ---- cat assignment
+
+    def test_free_cat_number_is_reused_and_running_cats_are_skipped(self):
+        ws = FakeWorkspaces()
+        w = self.watcher(self.gated(), 2, self.prs[:2], workspaces=ws)
+        w.poll()
+        self.gates[101].set()
+        self.collect(w)
+        self.current = self.prs
+        w.poll()
+        self.assertEqual(ws.prepared, [(101, 1), (102, 2), (103, 1)])
+        self.assertEqual(ws.skips, [set(), {2}])  # cat-2 still runs: never inspected
+
+    # ---- preparation comes before pending
+
+    def test_prepare_failure_leaves_no_pending_and_no_settle(self):
+        disc = FakeDiscussion()
+        ws = FakeWorkspaces(fail={101})
+        w = self.watcher(lambda *a: True, 2, self.prs[:1], workspaces=ws, discussion=disc)
+        with self.assertLogs("misscat", "ERROR"):
+            w.cycle()
+        self.assertEqual(self.state.pending(), [])
+        self.assertEqual(disc.calls, 0)  # _settle never ran
+        self.assertEqual(w.failed, {m.Key(101, self.prs[0].head): self.now})
+        self.assertEqual((w.running, w.idle), ({}, [1, 2]))
+
+    def test_workspace_failure_fails_only_that_pr(self):
+        ws = FakeWorkspaces(fail={102})
+        w = self.watcher(lambda *a: True, 3, workspaces=ws)
+        with self.assertLogs("misscat", "ERROR"):
+            w.cycle()
+        self.assertEqual(self.reviewed(), {101, 103})
+
+    def test_pending_is_written_only_for_prepared_prs(self):
+        ws = FakeWorkspaces(fail={102})
+        disc = FakeDiscussion()
+        w = self.watcher(self.gated(), 3, self.prs[:3], workspaces=ws, discussion=disc)
+        with self.assertLogs("misscat", "ERROR"):
+            w.poll()
+        self.assertEqual(sorted(r.pr for r in self.state.pending()), [101, 103])
+
+    # ---- FAILURE_WAIT
+
+    def test_failed_head_cools_down_then_retries_but_others_still_run(self):
+        calls = []
+        w = self.watcher(lambda s, r, pr, ws: calls.append(pr.number) or pr.number != 101, 1,
+                         self.prs[:2])
+        w.cycle()  # 101 fails
+        w.cycle()  # in cooldown: 102 goes instead
+        self.assertEqual(calls, [101, 102])
+        self.now += m.FAILURE_WAIT - 1
+        self.current = self.prs[:1]
+        w.cycle()
+        self.assertEqual(calls, [101, 102])  # still cooling down
+        self.now += 1
+        w.cycle()
+        self.assertEqual(calls, [101, 102, 101])
+
+    def test_failed_head_goes_last_after_its_cooldown(self):
+        calls = []
+        w = self.watcher(lambda s, r, pr, ws: calls.append(pr.number) or pr.number != 101, 2,
+                         self.prs[:3])
+        w.cycle()  # 101 fails, 102 ok
+        calls.clear()
+        self.now += m.FAILURE_WAIT
+        w.cycle()  # 103 is ahead of the failed 101
+        self.assertEqual(calls, [103, 101] if calls[0] == 103 else calls)
+        self.assertEqual(calls[0], 103)
+
+    def test_failed_entries_of_vanished_heads_are_dropped(self):
+        w = self.watcher(lambda *a: False, 1, self.prs[:1])
+        w.cycle()
+        self.assertEqual(set(w.failed), {m.Key(101, self.prs[0].head)})
+        self.current = [m.PR(101, "f" * 40, False, "u", "t")]
+        w.poll()
+        self.assertNotIn(m.Key(101, self.prs[0].head), w.failed)
+
+    def test_sync_failure_is_a_global_delay_without_head_cooldown(self):
+        disc = FakeDiscussion()
+        ws = FakeWorkspaces()
+        ws.sync_error = m.WorkspaceError("offline")
+        w = self.watcher(lambda *a: self.fail("must not run"), 2, workspaces=ws, discussion=disc)
+        with self.assertLogs("misscat", "ERROR"):
+            delay = w.cycle()
+        self.assertGreaterEqual(delay, m.FAILURE_WAIT)
+        self.assertEqual(w.failed, {})
+        self.assertEqual(self.state.pending(), [])
+        self.assertEqual(disc.calls, 0)
+        ws.sync_error = None  # recovered: the same HEADs, in normal order
+        w.reviewer = lambda *a: True
+        w.poll()
+        self.assertEqual([p for p, _ in ws.prepared], [101, 102])
+
+    def test_sync_failure_leaves_running_cats_and_their_completion_alone(self):
+        ws = FakeWorkspaces()
+        w = self.watcher(self.gated(), 2, self.prs[:1], workspaces=ws)
+        w.poll()
+        self.current = self.prs[:3]
+        ws.sync_error = m.WorkspaceError("offline")
+        with self.assertLogs("misscat", "ERROR"):
+            delay = w.poll()
+        self.assertGreaterEqual(delay, m.FAILURE_WAIT)
+        self.assertEqual(set(w.running), {1})
+        self.assertEqual(w.failed, {})
+        self.gates[101].set()
+        calls = self.list_calls
+        self.collect(w)  # recorded at once, with no extra listing
+        self.assertEqual(self.reviewed(), {101})
+        self.assertEqual(self.list_calls, calls)
+
+    # ---- fatal reviewer errors
+
+    def test_fatal_stops_assignment_and_records_the_other_running_cat(self):
+        fatal = []
+
+        def reviewer(s, r, pr, ws):
+            self.started[pr.number].set()
+            if pr.number == 101:
+                self.started[102].wait(5)  # both cats are running before the error shows
+                fatal.append("auth")
+                return False
+            self.gates[102].wait(5)
+            return True
+
+        w = self.watcher(reviewer, 2, self.prs[:2], fatal=lambda: fatal[0] if fatal else None)
+        w.poll()
+        wait_until(lambda: fatal)
+        self.current = self.prs
+        threading.Timer(0.1, self.gates[102].set).start()
+        with self.assertRaises(m.MissCatError) as ctx, self.assertLogs("misscat", "ERROR"):
+            w.run_forever()
+        self.assertEqual(str(ctx.exception), "auth")
+        self.assertEqual(self.reviewed(), {102})  # the running cat was recorded first
+        self.assertEqual(self.list_calls, 1)  # no more assignment
+        self.assertFalse(self.started[103].is_set())
+
+    def test_fatal_raised_inside_prepare_does_not_start_that_pr(self):
+        fatal = []
+        disc = FakeDiscussion()
+
+        def reviewer(s, r, pr, ws):
+            disc.submit(pr)
+            self.gates[pr.number].wait(5)
+            return True
+
+        ws = FakeWorkspaces()
+        w = self.watcher(reviewer, 2, self.prs[:1], workspaces=ws, discussion=disc,
+                         fatal=lambda: fatal[0] if fatal else None)
+        w.poll()
+        wait_until(lambda: 101 in disc.runs)
+        added = []
+        original = self.state.add_pending
+        self.state.add_pending = lambda run: added.append(run.pr) or original(run)
+
+        def on_prepare(pr, cat):  # while 102 is being prepared, cat-1 finds a fatal error
+            fatal.append("auth")
+            self.gates[101].set()
+            wait_until(lambda: not w.events.empty())
+
+        ws.on_prepare = on_prepare
+        self.current = self.prs[:2]
+        w.poll()
+        self.assertEqual(added, [])  # no pending for 102
+        self.assertEqual(set(w.running), set())  # nothing is running; 101 was recorded
+        self.assertEqual(w.failed, {})  # not the HEAD's fault
+        self.assertEqual(ws.prepared, [(101, 1), (102, 2)])  # 102's prepared worktree stays
+        self.assertEqual(self.reviewed(), {101})
+        with self.assertRaises(m.MissCatError), self.assertLogs("misscat", "ERROR"):
+            w._check_fatal()
+
+    # ---- completions arriving while dispatching
+
+    def test_completion_during_dispatch_is_recorded_before_the_next_prepare(self):
+        ws = FakeWorkspaces()
+        w = self.watcher(self.gated(), 3, self.prs[:1], workspaces=ws)
+        w.poll()  # cat-1 runs 101
+        order = []
+
+        def on_prepare(pr, cat):
+            if pr.number == 102:
+                self.gates[101].set()
+                wait_until(lambda: not w.events.empty())
+            if pr.number == 103:
+                order.append(("prepare 103", self.reviewed()))
+
+        ws.on_prepare = on_prepare
+        self.current = self.prs[:3]
+        calls = self.list_calls
+        with self.assertLogs("misscat", "INFO") as logs:
+            w.poll()
+        self.assertEqual(order, [("prepare 103", {101})])  # recorded before the second prepare
+        self.assertTrue(any("PR #101: review done" in line for line in logs.output))
+        self.assertEqual(self.list_calls, calls + 1)
+        # the cat freed meanwhile took nothing in this dispatch (idle snapshot: cats 2 and 3)
+        self.assertEqual(ws.prepared, [(101, 1), (102, 2), (103, 3)])
+        self.assertEqual(w.idle, [1])
+
+    def test_state_is_not_written_by_workers(self):
+        names = []
+        original = self.state.add
+
+        def add(*a):
+            names.append(threading.current_thread().name)
+            original(*a)
+
+        self.state.add = add
+        self.watcher(lambda *a: True, 2).cycle()
+        self.assertEqual(names, ["MainThread"] * 2)
 
     def test_labels_parsed_from_single_gh_listing(self):
         out = json.dumps([
@@ -262,41 +577,6 @@ class BatchTests(WatcherBase):
         self.assertEqual([p.urgent for p in prs], [True, False, False, True])
         self.assertEqual([p.no_review for p in prs], [False, False, False, True])
 
-    def test_workspace_failure_fails_only_that_pr(self):
-        ws = FakeWorkspaces(fail={102})
-        w = self.watcher(lambda *a: True, 3, workspaces=ws)
-        with self.assertLogs("misscat", "ERROR"):
-            w.cycle()
-        self.assertEqual(self.reviewed(), {101, 103})
-
-    def test_sync_failure_fails_whole_batch(self):
-        ws = FakeWorkspaces()
-        ws.sync = mock.Mock(side_effect=m.WorkspaceError("offline"))
-        sleeps = []
-        w = self.watcher(lambda *a: self.fail("must not run"), 2, workspaces=ws, sleeps=sleeps)
-        with self.assertLogs("misscat", "ERROR"):
-            w.cycle()
-        self.assertEqual(sleeps, [m.FAILURE_WAIT])
-        self.assertEqual(self.reviewed(), set())
-
-    def test_state_is_written_only_from_the_main_thread_after_reviewers_finish(self):
-        writers, finished = [], []
-        original = self.state.add
-
-        def add(key, *ids):
-            writers.append(threading.current_thread())
-            self.assertEqual(len(finished), 3)
-            original(key, *ids)
-
-        self.state.add = add
-
-        def reviewer(s, r, pr, ws):
-            finished.append(pr.number)
-            return True
-
-        self.watcher(reviewer, 3).cycle()
-        self.assertEqual(len(writers), 3)
-        self.assertTrue(all(t is threading.main_thread() for t in writers))
 
 
 class CliTests(unittest.TestCase):
