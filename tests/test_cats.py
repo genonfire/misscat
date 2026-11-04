@@ -520,6 +520,73 @@ class BatchTests(WatcherBase):
         with self.assertRaises(m.MissCatError), self.assertLogs("misscat", "ERROR"):
             w._check_fatal()
 
+    def test_worker_start_failure_cleans_up_and_other_cats_go_on(self):
+        disc = FakeDiscussion()
+        w = self.watcher(self.gated(), 3, self.prs[:1], discussion=disc)
+        w.poll()  # cat-1 runs 101
+        self.current = self.prs[:3]
+        real = threading.Thread
+
+        class Boom(real):
+            def start(t):
+                if t.name == "cat-2":
+                    raise RuntimeError("can't start new thread")
+                super().start()
+
+        with mock.patch.object(m.threading, "Thread", Boom), self.assertLogs("misscat", "ERROR"):
+            w.poll()
+        self.assertEqual(sorted(w.running), [1, 3])  # 103 took cat-3
+        self.assertEqual(w.idle, [2])
+        self.assertEqual(set(w.failed), {m.Key(102, self.prs[1].head)})
+        self.assertEqual(sorted(r.pr for r in self.state.pending()), [101, 103])
+
+    def test_verified_recovery_of_pending_clears_the_cooldown(self):
+        disc = FakeDiscussion()
+        w = self.watcher(lambda s, r, pr, ws: disc.submit(pr) or True, 1, self.prs[:1], discussion=disc)
+        real = disc.reviews
+        down = [True]
+
+        def reviews(number):
+            if down[0] and disc.runs:
+                raise m.GhError("down")
+            return real(number)
+
+        disc.reviews = reviews
+        with self.assertLogs("misscat", "ERROR"):
+            w.cycle()
+        self.assertEqual(len(self.state.pending()), 1)  # unsettled stays pending
+        self.assertIn(m.Key(101, self.prs[0].head), w.failed)
+        w.poll()  # still down: still unsettled, cooldown kept
+        self.assertIn(m.Key(101, self.prs[0].head), w.failed)
+        self.assertEqual(len(self.state.pending()), 1)
+        down[0] = False
+        w.poll()  # the submitted review is found: done, no cooldown left
+        self.assertEqual(self.reviewed(), {101})
+        self.assertEqual(w.failed, {})
+        self.assertEqual(self.state.pending(), [])
+
+    def test_fatal_drained_inside_poll_ends_without_waiting_for_the_timer(self):
+        fatal = []
+        ws = FakeWorkspaces()
+        w = self.watcher(self.gated(), 2, self.prs[:1], workspaces=ws,
+                         fatal=lambda: fatal[0] if fatal else None)
+        w.poll()
+
+        def on_prepare(pr, cat):
+            fatal.append("auth")
+            self.gates[101].set()
+            wait_until(lambda: not w.events.empty())
+
+        ws.on_prepare = on_prepare
+        self.current = self.prs[:2]
+        timeouts = []
+        original = w.events.get
+        w.events.get = lambda *a, **k: timeouts.append(k) or original(*a, **k)
+        with self.assertRaises(m.MissCatError), self.assertLogs("misscat", "ERROR"):
+            w.run_forever()
+        self.assertEqual(self.reviewed(), {101})
+        self.assertTrue(all(not k.get("timeout") for k in timeouts))  # never waited on the timer
+
     # ---- completions arriving while dispatching
 
     def test_completion_during_dispatch_is_recorded_before_the_next_prepare(self):

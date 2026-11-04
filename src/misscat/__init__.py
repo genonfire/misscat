@@ -1636,6 +1636,7 @@ class Watcher:
                 continue
             self._check_fatal()
             delay = self.poll()
+            self._check_fatal()  # a fatal error that poll() itself drained must not wait for the timer
             deadline = self.clock() + delay
 
     def cycle(self) -> float:
@@ -1790,12 +1791,14 @@ class Watcher:
                 if review_id is not None:
                     log.info("PR #%d: settled a re-review submitted earlier", run.pr)
                     self._record_reply(run, review_id)
+                    self.failed.pop(run.key(), None)
                     continue
             else:
                 found = submitted_by_run(reviews, run.head, run.run_id)
                 if found:
                     self.state.add(run.key(), run.profile, tuple(sorted(r.id for r in found)))
                     self.state.drop_pending(run.run_id)
+                    self.failed.pop(run.key(), None)  # verified after all: no cooldown
                     continue
             self.state.drop_pending(run.run_id)  # nothing was submitted: eligible again
 
@@ -1915,8 +1918,19 @@ class Watcher:
             self.idle.remove(cat)
             self.running[cat] = Run(pr, started)
             self._started += 1
-            threading.Thread(target=self._work, args=(cat, pr, path, started),
-                             name=f"cat-{cat}", daemon=True).start()
+            try:
+                threading.Thread(target=self._work, args=(cat, pr, path, started),
+                                 name=f"cat-{cat}", daemon=True).start()
+            except (RuntimeError, OSError) as exc:  # no worker will ever report: undo the start
+                log.error("PR #%d: cannot start the cat worker: %s", pr.number, exc)
+                del self.running[cat]
+                self.idle.append(cat)
+                self.idle.sort()
+                self._started -= 1
+                if self.discussion is not None:
+                    self.state.drop_pending(pr.run_id)
+                self.failed[self._key(pr)] = self.clock()
+                continue
         self._drain_nowait()
         return False
 
