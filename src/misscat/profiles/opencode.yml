@@ -1,4 +1,4 @@
-# mscat configuration, read by `mscat` (not by OpenCode itself). mscat builds the command
+# OpenCode profile: run with `misscat . opencode [--cat N]`. MissCat builds the command
 #   opencode run --standalone --format json <reviewer.args> --model <reviewer.model> <prompt>
 # Targets OpenCode native V2 v2.0.32. Edit freely: an existing file is never overwritten.
 reviewer:
@@ -9,10 +9,3 @@ reviewer:
 prompt: |
   Read REVIEW.md if exist and act as the 1st reviewer.
   Use the gh CLI for GitHub operations, including posting the review.
-
-watch:
-  idle: [60, 120, 180, 240, 300]     # seconds; used while nothing has been reviewed yet
-  active: [300, 240, 180, 120, 60]   # seconds; used after a PR HEAD has been reviewed
-
-review:
-  include_drafts: true

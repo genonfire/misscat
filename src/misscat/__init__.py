@@ -6,14 +6,14 @@ One repository = one MissCat process = one workspace = one state file.
 One review at a time by default (`--cat=N` reviews up to N waiting PR HEADs in a batch, one
 persistent worktree per cat, and waits for the whole batch); then an immediate re-check.
 
-Each review runs the reviewer CLI (Claude Code, Codex, or Gemini via Antigravity CLI)
+Each review runs the reviewer CLI (Claude Code, Codex, Gemini via Antigravity CLI, or OpenCode)
 from the root of a MissCat-owned worktree of the exact PR HEAD, so the CLI finds the
 repository's own instruction files (REVIEW.md, CLAUDE.md, AGENTS.md) by itself. MissCat
 never parses them and never touches your own working tree.
 
 Local layout (repository names are canonicalized to lowercase)
   ~/.config/misscat/<profile>.yml          reviewer profiles (bundled ones installed by `misscat init`)
-  ~/.config/misscat/<owner>__<repo>.json   reviewed HEADs of one repository (PR + HEAD + profile)
+  ~/.config/misscat/<owner>__<repo>.json   reviewed HEADs of one repository (PR + HEAD)
   ~/.cache/misscat/repos/<owner>/<repo>/   control clone (default branch, never reviewed in)
   ~/.cache/misscat/cats/<owner>/<repo>/cat-N/   persistent review worktrees
 
@@ -50,7 +50,7 @@ from urllib.parse import urlsplit
 
 import yaml
 
-__version__ = "1.6.2"
+__version__ = "1.7.0"
 
 log = logging.getLogger("misscat")
 # Reviewer tool activity (exec/MCP/tool/web search). Successful lines show only with --loud;
@@ -64,8 +64,8 @@ LOCK_ROOT = Path.home() / ".cache" / "misscat" / "locks"  # outside CONFIG_DIR: 
 # create it, or a state-only command would make the first watcher run skip profile initialization
 OWNER_RE = re.compile(r"^[A-Za-z0-9-]+$")  # no "_": keeps the "__" in state filenames unambiguous
 NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
-PROVIDERS = ("claude", "codex", "gemini")
-EXECUTABLES = {"claude": "claude", "codex": "codex", "gemini": "agy"}  # provider -> CLI binary
+PROVIDERS = ("claude", "codex", "gemini", "opencode")
+EXECUTABLES = {"claude": "claude", "codex": "codex", "gemini": "agy", "opencode": "opencode"}  # provider -> CLI binary
 FAILURE_WAIT = 300.0  # seconds to wait after a failed review before checking again
 
 
@@ -120,7 +120,8 @@ def profile_path(name: str) -> Path:
         raise ConfigError(f"invalid profile name {name!r}: use a plain name such as 'sol'")
     path = CONFIG_DIR / f"{name}.yml"
     if not path.is_file():
-        raise ConfigError(f"profile {name!r} not found: {path}")
+        raise ConfigError(
+            f"profile {name!r} not found: {path} (run `misscat init` to install bundled profiles)")
     return path
 
 
@@ -769,6 +770,11 @@ COMMANDS: dict[str, Callable[[str, str, list[str]], list[str]]] = {
     # flag, --model included, must come before it. Plain text output: its JSON event schema
     # is not relied on.
     "gemini": lambda model, prompt, args: ["agy", *args, "--model", model, "-p", prompt],
+    # OpenCode native V2: a private per-run server and a fresh session (no --continue); the
+    # model is `provider/model[#variant]`, passed unchanged.
+    "opencode": lambda model, prompt, args: [
+        "opencode", "run", "--standalone", "--format", "json", *args, "--model", model, prompt,
+    ],
 }
 
 
@@ -981,6 +987,114 @@ def _run_structured_reviewer(provider: str, cmd: list[str], workspace: Path) -> 
     return True
 
 
+# OpenCode error types that no retry can fix: stop dispatching and tell the owner what to do.
+FATAL_ERRORS = {  # V2 structured error `type`
+    "provider.auth": "authenticate the provider (`opencode auth login`)",
+    "provider.no-route": "check reviewer.model in {path}",
+}
+
+
+def _opencode_tool_label(name: str, tool_input) -> str:
+    if isinstance(tool_input, dict):
+        for key in ("command", "filePath", "file_path", "path", "pattern", "query", "url"):
+            if tool_input.get(key):
+                return f"{name}: {_short(tool_input[key])}"
+    return name
+
+
+class Usage:
+    """Sums per-step OpenCode `step_finish` figures (each step is reported, not a running total).
+
+    A figure that never appears stays None rather than becoming a fabricated zero.
+    """
+    KEYS = ("input", "output", "reasoning")
+
+    def __init__(self) -> None:
+        self.steps = 0
+        self.tokens: dict[str, int] = {}
+        self.cost: float | None = None
+
+    def add(self, part: dict) -> None:
+        self.steps += 1
+        tokens = part.get("tokens")
+        if isinstance(tokens, dict):
+            for key in self.KEYS:
+                if type(tokens.get(key)) is int:
+                    self.tokens[key] = self.tokens.get(key, 0) + tokens[key]
+        cost = part.get("cost")
+        if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+            self.cost = (self.cost or 0.0) + cost
+
+    def summary(self) -> str:
+        details = [f"steps={self.steps}"]
+        details += [f"{k}={self.tokens[k]}" for k in self.KEYS if k in self.tokens]
+        if self.cost is not None:
+            details.append(f"cost≈${self.cost:.4f}")
+        return ", ".join(details)
+
+
+def _log_opencode_event(event: dict, usage: Usage, on_fatal: Callable[[str, str], None]) -> bool:
+    """Log compact OpenCode progress; True when the event is a runner error."""
+    kind = event.get("type")
+    part = event.get("part") if isinstance(event.get("part"), dict) else {}
+    if kind == "step_finish":
+        usage.add(part)
+    elif kind == "tool_use":
+        state = part.get("state") if isinstance(part.get("state"), dict) else {}
+        label = _opencode_tool_label(str(part.get("tool") or "tool"), state.get("input"))
+        if state.get("status") == "error":
+            activity_log.warning("tool: %s failed: %s", label, _short(state.get("error")))
+        else:
+            activity_log.info("tool: %s", label)
+    elif kind == "error":
+        error = event.get("error") if isinstance(event.get("error"), dict) else {}
+        name = str(error.get("type") or error.get("name") or "error")
+        message = _short(error.get("message") or name)
+        log.error("reviewer: %s: %s", name, message)
+        if name in FATAL_ERRORS:
+            on_fatal(name, message)
+        return True
+    return False
+
+
+def _run_opencode(cmd: list[str], workspace: Path, on_fatal: Callable[[str, str], None]) -> bool:
+    """Run `opencode run` in the cat worktree, streaming its JSONL. True only on a clean run."""
+    try:
+        # V2 picks its root from $PWD before the process cwd: point both at the worktree
+        proc = subprocess.Popen(
+            cmd, cwd=workspace, env={**os.environ, "PWD": str(workspace)},
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1,
+        )
+    except OSError as exc:
+        log.error("cannot start %s: %s", cmd[0], exc)
+        return False
+    assert proc.stdout is not None
+    usage, tail, failed = Usage(), [], False
+    for raw in proc.stdout:
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            event = None
+        if not isinstance(event, dict):
+            tail = [*tail, _redact(line)][-20:]
+            log.debug("opencode: %s", _short(line, 200))
+            continue
+        failed |= _log_opencode_event(event, usage, on_fatal)
+    returncode = proc.wait()
+    if returncode != 0:
+        detail = " | ".join(tail)[-500:]
+        log.error("opencode exited %d%s", returncode, f": {detail}" if detail else "")
+        return False
+    if failed:
+        return False
+    log.info("reviewer: opencode done (%s)", usage.summary())
+    return True
+
+
 def build_prompt(settings: Settings, repo: str, pr: PR) -> str:
     context = (
         f"Repository: {repo}\n"
@@ -1022,19 +1136,43 @@ def run_cli_reviewer(settings: Settings, repo: str, pr: PR, workspace: Path) -> 
     return _run_structured_reviewer(settings.provider, cmd, workspace)
 
 
+class CliReviewer:
+    """Watcher reviewer callback. Dispatches by provider and records a non-retryable OpenCode
+    error (auth / no route) so the next cycle stops instead of retrying forever."""
+
+    def __init__(self, config_path: Path | str) -> None:
+        self.config_path = config_path
+        self.fatal: str | None = None
+
+    def check(self) -> None:
+        if self.fatal:
+            raise MissCatError(self.fatal)
+
+    def _on_fatal(self, name: str, message: str) -> None:
+        if not self.fatal:
+            self.fatal = f"opencode {name}: {message}. Fix it: " + FATAL_ERRORS[name].format(
+                path=self.config_path)
+
+    def __call__(self, settings: Settings, repo: str, pr: PR, workspace: Path | None) -> bool:
+        assert workspace is not None
+        if settings.provider != "opencode":
+            return run_cli_reviewer(settings, repo, pr, workspace)
+        cmd = COMMANDS["opencode"](settings.model, build_prompt(settings, repo, pr), list(settings.args))
+        return _run_opencode(cmd, workspace, self._on_fatal)
+
+
 # --------------------------------------------------------------------------- state
 
 
 class Key(NamedTuple):
+    """Completion identity of a review: profile-independent."""
     pr: int
     head: str
-    profile: str | None  # None = bundled default, different from profile "default"
 
 
 class ReplyKey(NamedTuple):
     pr: int
     head: str
-    profile: str | None
     comment_id: int  # immutable GitHub id of the author's conversation comment
 
 
@@ -1042,13 +1180,14 @@ class ReplyKey(NamedTuple):
 class ReplyRecord:
     pr: int
     head: str
-    profile: str | None
+    profile: str | None  # diagnostic metadata: who recorded it, never part of the identity
     comment_id: int
     handled_at: str  # UTC ISO 8601, recorded when the triggered review was verified
     review_id: int = 0  # the verified review that answered it
+    extra_review_ids: tuple[int, ...] = ()  # further verified reviews kept for the same comment
 
     def key(self) -> ReplyKey:
-        return ReplyKey(self.pr, self.head, self.profile, self.comment_id)
+        return ReplyKey(self.pr, self.head, self.comment_id)
 
 
 @dataclass(frozen=True)
@@ -1062,7 +1201,7 @@ class PendingRun:
     ok: bool = False  # the reviewer CLI exited cleanly but GitHub could not be checked yet
 
     def key(self) -> Key:
-        return Key(self.pr, self.head, self.profile)
+        return Key(self.pr, self.head)
 
 
 @dataclass(frozen=True)
@@ -1074,7 +1213,7 @@ class ReviewRecord:
     review_ids: tuple[int, ...] = ()  # GitHub reviews this run submitted (empty: not attributed)
 
     def key(self) -> Key:
-        return Key(self.pr, self.head, self.profile)
+        return Key(self.pr, self.head)
 
 
 def _instant(timestamp: str) -> datetime:
@@ -1083,7 +1222,7 @@ def _instant(timestamp: str) -> datetime:
 
 
 class State:
-    """State v2: completed reviews by repository, PR, HEAD and profile.
+    """State v2: completed reviews by repository, PR and HEAD (the row `profile` is metadata only).
 
     An optional `replies` list (absent in files written by older versions, which stay valid)
     holds the author comment ids already answered by a same-HEAD re-review, and an optional
@@ -1098,12 +1237,13 @@ class State:
         self._replies: list[ReplyRecord] = []
         self._pending: list[PendingRun] = []
         self._records = self._load()
-        self._reviewed = {row.key() for row in self._records}
-        if len(self._records) != len(self._reviewed):
+        # corruption is judged on the full stored identity; the logical sets drop the profile
+        if len(self._records) != len({(r.pr, r.head, r.profile) for r in self._records}):
             raise StateError(f"duplicate review records in {path}")
-        self._handled = {row.key() for row in self._replies}
-        if len(self._replies) != len(self._handled):
+        self._reviewed = {row.key() for row in self._records}
+        if len(self._replies) != len({(r.pr, r.head, r.profile, r.comment_id) for r in self._replies}):
             raise StateError(f"duplicate reply records in {path}")
+        self._handled = {row.key() for row in self._replies}
 
     def _load(self) -> list[ReviewRecord]:
         if not self.path.exists():
@@ -1157,9 +1297,12 @@ class State:
                 parsed = datetime.fromisoformat(item["handled_at"].replace("Z", "+00:00"))
                 if parsed.tzinfo is None or parsed.utcoffset() is None:
                     raise ValueError("handled_at must have a timezone")
+                extra = item.get("extra_review_ids", [])
+                if not isinstance(extra, list) or not all(type(i) is int and i > 0 for i in extra):
+                    raise ValueError("extra_review_ids must be a list of ids")
                 self._replies.append(ReplyRecord(item["pr"], item["head"], item["profile"],
                                                  item["comment_id"], item["handled_at"],
-                                                 item.get("review_id", 0)))
+                                                 item.get("review_id", 0), tuple(extra)))
             pending = raw.get("pending", [])
             if not isinstance(pending, list):
                 raise ValueError("pending must be a list")
@@ -1193,7 +1336,8 @@ class State:
         if replies:
             data["replies"] = [
                 {"pr": r.pr, "head": r.head, "profile": r.profile, "comment_id": r.comment_id,
-                 "handled_at": r.handled_at, "review_id": r.review_id}
+                 "handled_at": r.handled_at, "review_id": r.review_id,
+                 **({"extra_review_ids": list(r.extra_review_ids)} if r.extra_review_ids else {})}
                 for r in sorted(replies, key=lambda r: (r.pr, r.head, r.profile or "", r.comment_id))
             ]
         if pending:
@@ -1210,11 +1354,39 @@ class State:
     def records(self) -> list[ReviewRecord]:
         return list(self._records)
 
-    def add(self, key: Key, review_ids: tuple[int, ...] = ()) -> None:
-        if key in self._reviewed:
+    @staticmethod
+    def _now() -> str:
+        return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+    def _with_ids(self, pr: int, head: str, profile: str | None,
+                  ids: tuple[int, ...]) -> list[ReviewRecord]:
+        """Records with verified review ids kept for (pr, head); unchanged if all are known.
+
+        Only for a HEAD that is already complete. Ids merge into this profile's existing row
+        (its reviewed_at stays) or form a new row that takes the HEAD's latest existing
+        reviewed_at, so late evidence never changes the logical completion order of HEADs.
+        """
+        new = tuple(sorted(set(ids) - self.review_ids(Key(pr, head))))
+        if not new:
+            return self._records
+        for n, r in enumerate(self._records):
+            if (r.pr, r.head, r.profile) == (pr, head, profile):
+                merged = replace(r, review_ids=tuple(sorted({*r.review_ids, *new})))
+                return [*self._records[:n], merged, *self._records[n + 1:]]
+        logical = max((r.reviewed_at for r in self._records if r.key() == Key(pr, head)), key=_instant)
+        return [*self._records, ReviewRecord(pr, head, profile, logical, new)]
+
+    def _keep_ids(self, pr: int, head: str, profile: str | None, ids: tuple[int, ...]) -> None:
+        records = self._with_ids(pr, head, profile, ids)
+        if records is not self._records:
+            self._write(records, self._replies, self._pending)
+            self._records = records
+
+    def add(self, key: Key, profile: str | None, review_ids: tuple[int, ...] = ()) -> None:
+        if key in self._reviewed:  # already complete: never re-record, but keep verified evidence
+            self._keep_ids(key.pr, key.head, profile, review_ids)
             return
-        timestamp = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
-        records = [*self._records, ReviewRecord(*key, timestamp, review_ids)]
+        records = [*self._records, ReviewRecord(key.pr, key.head, profile, self._now(), review_ids)]
         self._write(records, self._replies, self._pending)
         self._records = records
         self._reviewed.add(key)
@@ -1242,32 +1414,65 @@ class State:
         return self._handled
 
     def review_ids(self, key: Key) -> set[int]:
-        """GitHub reviews known to have been submitted by this profile for this PR HEAD."""
+        """GitHub reviews known to have been submitted for this PR HEAD, by any profile."""
         ids = {i for r in self._records if r.key() == key for i in r.review_ids}
-        ids.update(r.review_id for r in self._replies
-                   if (r.pr, r.head, r.profile) == key and r.review_id)
+        for r in self._replies:
+            if (r.pr, r.head) == (key.pr, key.head):
+                ids.update(i for i in (r.review_id, *r.extra_review_ids) if i)
         return ids
 
-    def add_replies(self, keys: list[ReplyKey], review_id: int) -> None:
-        """Record author comments as answered by one verified same-HEAD review."""
-        new = [k for k in keys if k not in self._handled]
-        if not new:
+    def add_replies(self, keys: list[ReplyKey], profile: str | None, review_id: int) -> None:
+        """Record author comments as answered by one verified same-HEAD review.
+
+        Comments already handled (by any profile) are not recorded again, but the verified
+        review id is still kept. One write covers both.
+        """
+        new = [k for k in dict.fromkeys(keys) if k not in self._handled]
+        timestamp = self._now()
+        replies = [*self._replies, *(ReplyRecord(k.pr, k.head, profile, k.comment_id, timestamp,
+                                                 review_id) for k in new)]
+        records = self._records
+        if not new and keys and review_id:
+            pr, head = keys[0].pr, keys[0].head
+            if Key(pr, head) in self._reviewed:
+                records = self._with_ids(pr, head, profile, (review_id,))
+            elif review_id not in self.review_ids(Key(pr, head)):
+                # The HEAD's completion was deleted by the user: do not bring it back. Keep the
+                # verified id on a reply row of this profile (reply rows survive deletion and
+                # count in review_ids): a new row, or the existing one's extra ids.
+                same = next((n for n, r in enumerate(replies) if (r.pr, r.head, r.profile) ==
+                             (pr, head, profile) and r.comment_id in {k.comment_id for k in keys}), None)
+                if same is not None:
+                    r = replies[same]
+                    replies = [*replies[:same], replace(r, extra_review_ids=tuple(sorted(
+                        {*r.extra_review_ids, review_id}))), *replies[same + 1:]]
+                else:
+                    k = keys[0]
+                    replies = [*replies, ReplyRecord(k.pr, k.head, profile, k.comment_id, timestamp,
+                                                     review_id)]
+        if not new and records is self._records and replies == self._replies:
             return
-        timestamp = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
-        replies = [*self._replies, *(ReplyRecord(*k, timestamp, review_id) for k in new)]
-        self._write(self._records, replies, self._pending)
-        self._replies = replies
+        self._write(records, replies, self._pending)
+        self._records, self._replies = records, replies
         self._handled.update(new)
 
     def is_latest(self, key: Key) -> bool:
-        group = [r for r in self._records if (r.pr, r.profile) == (key.pr, key.profile)]
+        """The HEAD of this PR whose newest record is the most recent across the PR."""
+        group = [r for r in self._records if r.pr == key.pr]
         if not group:
             return False
         return max(group, key=lambda r: _instant(r.reviewed_at)).key() == key
 
+    def has_pending(self, key: Key) -> bool:
+        return any(r.key() == key for r in self._pending)
+
     def remove_latest(self, key: Key) -> bool:
-        """Only remove the most recent successful review for a PR+profile."""
-        if not self.is_latest(key):
+        """Remove every profile's record of the PR's most recently reviewed HEAD.
+
+        Refused while an unsettled review attempt exists for that HEAD: the watcher would
+        settle it into a fresh completion and silently undo the deletion.
+        """
+        if not self.is_latest(key) or self.has_pending(key):
             return False
         records = [r for r in self._records if r.key() != key]
         self._write(records, self._replies, self._pending)
@@ -1350,7 +1555,8 @@ def _log_review_separator() -> None:
 
 
 class Watcher:
-    """One watcher, one polling timer per repository.
+    """One watcher, one polling timer per repository. A review is complete per PR + HEAD,
+    whichever profile ran it (`profile` is recorded as metadata only).
 
     Timer: starts idle (1m -> 5m). A successful review switches it to active (5m -> 1m)
     from the start of the sequence. When no PR is open any more it falls back to idle.
@@ -1410,7 +1616,7 @@ class Watcher:
             self.sleep(FAILURE_WAIT)
 
     def _key(self, pr: PR) -> Key:
-        return Key(pr.number, pr.head, self.profile)
+        return Key(pr.number, pr.head)  # self.profile is only recorded as metadata
 
     def _next_batch(self, prs: list[PR]) -> list[PR]:
         done = self.state.reviewed()
@@ -1461,15 +1667,15 @@ class Watcher:
         block = blocking_review(reviews, pr.head)
         if block is None:
             return None
-        # Only the `-1` that one of this profile's own runs submitted is answered (proved by the
-        # run nonce, stored as a review id). A record without ids (made before attribution
+        # Only a `-1` that one of MissCat's own runs submitted, under any profile, is answered
+        # (proved by the run nonce, stored as a review id). A record without ids (made before attribution
         # existed, or whose reviewer omitted the nonce) is never guessed at: no trigger.
         if block.id not in self.state.review_ids(self._key(pr)):
             return None
         blocked_at = _instant(block.submitted_at)
         new = [c for c in self.discussion.comments(pr.number)
                if c.login.lower() == pr.author.lower() and _instant(c.created_at) > blocked_at
-               and ReplyKey(pr.number, pr.head, self.profile, c.id) not in self.state.handled()]
+               and ReplyKey(pr.number, pr.head, c.id) not in self.state.handled()]
         if not new:
             return None
         new.sort(key=lambda c: (_instant(c.created_at), c.id))
@@ -1482,7 +1688,7 @@ class Watcher:
 
     def _record_reply(self, run: PendingRun, review_id: int) -> None:
         self.state.add_replies(
-            [ReplyKey(run.pr, run.head, run.profile, c) for c in run.comment_ids], review_id)
+            [ReplyKey(run.pr, run.head, c) for c in run.comment_ids], run.profile, review_id)
         self.state.drop_pending(run.run_id)
 
     def _reconcile_pending(self) -> None:
@@ -1496,8 +1702,6 @@ class Watcher:
         if self.discussion is None:
             return
         for run in self.state.pending():
-            if run.profile != self.profile:
-                continue
             try:
                 reviews = self.discussion.reviews(run.pr)
                 head = self.discussion.head(run.pr) if run.comment_ids else run.head
@@ -1517,7 +1721,7 @@ class Watcher:
             else:
                 found = submitted_by_run(reviews, run.head, run.run_id)
                 if found:
-                    self.state.add(run.key(), tuple(sorted(r.id for r in found)))
+                    self.state.add(run.key(), run.profile, tuple(sorted(r.id for r in found)))
                     self.state.drop_pending(run.run_id)
                     continue
             self.state.drop_pending(run.run_id)  # nothing was submitted: eligible again
@@ -1555,7 +1759,7 @@ class Watcher:
             log.error("PR #%d: review of %s has no submitted review carrying this run's id; "
                       "it will be retried", pr.number, pr.head[:7])
             return False
-        self.state.add(self._key(pr), tuple(sorted(r.id for r in found)))
+        self.state.add(self._key(pr), self.profile, tuple(sorted(r.id for r in found)))
         self.state.drop_pending(pr.run_id)
         return True
 
@@ -1626,7 +1830,7 @@ class Watcher:
         for n, (pr, ok) in enumerate(zip(batch, results), 1):
             if ok:
                 if self.discussion is None:  # no GitHub check available: a clean exit is the record
-                    self.state.add(self._key(pr))
+                    self.state.add(self._key(pr), self.profile)
                 log.info("PR #%d: review done in %s%s", pr.number, _fmt_elapsed(elapsed[n - 1]),
                          tag(n))
             else:
@@ -1678,6 +1882,9 @@ def run_state_ui(state: State, repo: str) -> int:
     def current() -> ReviewRecord | None:
         return rows[index] if rows else None
 
+    def siblings(r: ReviewRecord) -> list[ReviewRecord]:
+        return [x for x in state.records() if x.key() == r.key()]
+
     def local_time(value: str) -> str:
         return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone().strftime(
             "%Y-%m-%d %H:%M:%S %Z"
@@ -1717,8 +1924,11 @@ def run_state_ui(state: State, repo: str) -> int:
             result += [("", "\n"), ("class:muted",
                 "↑↓ Move   Enter Details   Del/BS Remove latest   Q/Esc Quit\n")]
             if mode == "confirm" and r:
+                group = siblings(r)
+                profiles = ", ".join(sorted(x.profile or "default" for x in group))
                 result.append(("class:warning",
-                    f"\nDelete PR #{r.pr} / {r.head[:10]} / {r.profile or 'default'}? [y/N] "))
+                    f"\nDelete PR #{r.pr} / {r.head[:10]}: removes {len(group)} record(s) "
+                    f"(profiles: {profiles}) and makes this HEAD eligible again? [y/N] "))
         if message:
             result += [("", "\n"), ("class:warning", message + "\n")]
         return result
@@ -1756,7 +1966,10 @@ def run_state_ui(state: State, repo: str) -> int:
         if mode != "list" or r is None:
             return
         if not state.is_latest(r.key()):
-            message = "Only the most recently reviewed HEAD for this PR/profile can be removed."
+            message = "Only the most recently reviewed HEAD of this PR can be removed."
+        elif state.has_pending(r.key()):
+            message = ("This HEAD has an unsettled review attempt. Run the watcher once to settle "
+                       "it, then remove the HEAD.")
         else:
             message = ""
             mode = "confirm"
@@ -1771,10 +1984,12 @@ def run_state_ui(state: State, repo: str) -> int:
             return
         r = current()
         try:
+            count = len(siblings(r)) if r is not None else 0
             if r is not None and state.remove_latest(r.key()):
                 rows = ordered()
                 index = max(0, min(index, len(rows) - 1))
-                message = "Deleted one completed review. Only a matching current PR HEAD is re-reviewed."
+                message = (f"Deleted {count} record(s) for PR #{r.pr} / {r.head[:10]}. "
+                           "Only a matching current PR HEAD is re-reviewed.")
             else:
                 message = "No eligible record selected."
         except (OSError, StateError) as exc:
@@ -1860,6 +2075,8 @@ def main(argv: list[str] | None = None) -> int:
             "profile is a name: 'sol' loads ~/.config/misscat/sol.yml over the defaults.\n"
             "`misscat init [--force]` installs bundled profiles.\n"
             "`misscat state owner/repo` opens the state manager.\n"
+            "A review is complete per PR + HEAD whatever profile ran it, e.g. `misscat . opencode`\n"
+            "(OpenCode: reviewer.provider: opencode in ~/.config/misscat/opencode.yml).\n"
             "'.' as the repository always means the current Git repository's `origin` remote\n"
             "(github.com only), e.g. `misscat .`, `misscat . luna`, `misscat state .`.\n\n"
             "Requirements and limits:\n"
@@ -1926,7 +2143,17 @@ def main(argv: list[str] | None = None) -> int:
                 workspaces.sync()
             except WorkspaceError as exc:  # retried before every batch, like a failed review
                 log.warning("workspace not ready yet: %s", exc)
-            Watcher(repo, args.profile, settings, state, gh_open_prs, run_cli_reviewer,
+            reviewer = CliReviewer(profile_path(args.profile) if args.profile else "the bundled defaults")
+
+            def list_prs(name: str) -> list[PR]:
+                reviewer.check()  # a non-retryable reviewer error ends the watch
+                return gh_open_prs(name)
+
+            def sleep(seconds: float) -> None:
+                reviewer.check()
+                time.sleep(seconds)
+
+            Watcher(repo, args.profile, settings, state, list_prs, reviewer, sleep=sleep,
                     cats=args.cat, workspaces=workspaces,
                     discussion=GhDiscussion(repo)).run_forever()
     except MissCatError as exc:

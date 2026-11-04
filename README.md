@@ -92,7 +92,7 @@ Releases are published to PyPI by `.github/workflows/publish.yml` when a `vMAJOR
 
 ## Quick Start / First Run
 
-On the first normal run, if `~/.config/misscat/` does not exist, MissCat creates it and copies the bundled reviewer profiles (`luna.yml`, `sol.yml`, `sonnet.yml`, `opus.yml`, `gemini.yml`) into it before loading your profile. Edit them freely. If the directory already exists, nothing is copied automatically, so existing configs are preserved across upgrades. `--help` and `--version` never touch the filesystem.
+On the first normal run, if `~/.config/misscat/` does not exist, MissCat creates it and copies the bundled reviewer profiles (`luna.yml`, `sol.yml`, `sonnet.yml`, `opus.yml`, `gemini.yml`, `opencode.yml`) into it before loading your profile. Edit them freely. If the directory already exists, nothing is copied automatically, so existing configs are preserved across upgrades. `--help` and `--version` never touch the filesystem.
 
 Watch a repository and review new PRs using the default profile:
 
@@ -155,7 +155,7 @@ misscat init          # create the config dir if needed; copy only missing bundl
 misscat init --force  # overwrite files named like bundled profiles with fresh copies
 ```
 
-- `init` never modifies existing files. `init --force` replaces only `luna.yml`, `sol.yml`, `sonnet.yml`, `opus.yml` and `gemini.yml`; custom profiles, per-repository state JSONs and the review cache are never touched.
+- `init` never modifies existing files. `init --force` replaces only `luna.yml`, `sol.yml`, `sonnet.yml`, `opus.yml`, `gemini.yml` and `opencode.yml`; custom profiles, per-repository state JSONs and the review cache are never touched.
 - After upgrading MissCat, new or updated bundled profiles are not applied automatically: run `misscat init` for new ones, or `misscat init --force` to reset the bundled ones (this discards your edits to them).
 - If the automatic first-run copy is interrupted, `misscat init` restores the missing profiles.
 - `default.yml` is the internal base configuration and is not copied. Each bundled profile carries its own editable copy of the default `prompt`, so you can customize a reviewer's prompt in place; `default.yml` remains the fallback.
@@ -168,13 +168,13 @@ Stop the watcher before opening the terminal state manager:
 misscat state genonfire/typewriter
 ```
 
-The list shows the most recently completed reviews first, across all PRs and profiles (sorted by `reviewed_at`; the stored State order is unchanged). Use **↑/↓** to select any completed review, **Enter** for its full HEAD SHA, profile, and local review completion time, and **Esc/Q** to exit. **Delete** or **Backspace** only operates on the *most recently reviewed entry for that PR and profile* (by `reviewed_at`), with a `[y/N]` prompt. Older entries are read-only until newer entries in that PR/profile group have been removed. Nothing is deleted on Enter or when you decline confirmation.
+The list shows the most recently completed reviews first, across all PRs and profiles (sorted by `reviewed_at`; the stored State order is unchanged). Use **↑/↓** to select any completed review, **Enter** for its full HEAD SHA, profile, and local review completion time, and **Esc/Q** to exit. **Delete** or **Backspace** only operates on the *most recently reviewed HEAD of that PR* (by `reviewed_at`), with a `[y/N]` prompt that names how many records (one per profile that recorded the HEAD) are removed; reply history is kept. A HEAD with an unsettled review attempt cannot be removed until the watcher has settled it. Older HEADs are read-only until newer ones in that PR have been removed. Nothing is deleted on Enter or when you decline confirmation.
 
-The manager works from local State JSON; it does not call GitHub. Removing a record makes that PR/HEAD/profile combination eligible for review again, **but only when the HEAD is the PR's current open HEAD** at the next watcher run. Removing historical HEADs does not trigger review of historical commits.
+The manager works from local State JSON; it does not call GitHub. Removing a HEAD's records (all profiles) makes that PR/HEAD eligible for review again, **but only when the HEAD is the PR's current open HEAD** at the next watcher run. Removing historical HEADs does not trigger review of historical commits.
 
 ### State v2 and process safety
 
-- Every successful review now stores `reviewed_at` as an ISO 8601 UTC timestamp. Display uses local time. Existing PR/HEAD/profile identity and the JSON sorting convention remain unchanged.
+- Every successful review now stores `reviewed_at` as an ISO 8601 UTC timestamp. Display uses local time. The review identity is PR + HEAD (the row `profile` is metadata only); the JSON sorting convention is unchanged.
 - **Breaking state reset:** **stop all previously running MissCat watchers before upgrading to this version**; older watchers do not participate in the new OS locking scheme and may restore v1 records from memory. On first State access after upgrade, any **v1** reviewed history is intentionally discarded and the file is rewritten as an empty **v2** State. Consequently, open PR HEADs previously marked complete become eligible for a new AI review. This may consume additional reviewer tokens. Unknown versions and corrupt State files cause errors instead of being discarded.
 - A per-repository OS file lock prevents a watcher and a state manager—or two watchers—from running on the same repository simultaneously, even with different profiles. Stop the watcher before editing state. The lock file lives under `~/.cache/misscat/locks/` (never in the config directory) and may remain on disk after exit; the OS releases its lock when the process exits. Do not use the file's existence as an indication of an active watcher.
 - State manager needs an interactive TTY. It does not touch profile YAML files or cache workspaces.
@@ -257,7 +257,7 @@ When creating a local profile, use `default.yml` as the reference and specify `p
 
 The `args` field under `reviewer` is passed to the selected reviewer CLI unchanged.
 
-Reviewed state is stored per repository and keyed by PR, HEAD SHA, and profile. The same HEAD can therefore be reviewed again with a different profile.
+Reviewed state is stored per repository and keyed by PR and HEAD SHA, whichever profile ran the review (the profile is kept in each record as metadata only). A HEAD reviewed with `luna` is therefore not reviewed again by `sol` or `opencode`; a new HEAD is.
 
 ### Gemini (Antigravity CLI)
 
@@ -280,28 +280,31 @@ reviewer:
 
 In headless mode a denied permission can end the run without posting a review; use `--loud` to inspect.
 
-## mscat (OpenCode)
+### OpenCode
 
-`pipx install misscat` also installs `mscat`, which runs the same watcher with your already configured [OpenCode](https://opencode.ai/docs/cli/) CLI as the reviewer. It targets the **OpenCode native V2 v2.0.32** interface (V1 flags and events are not supported).
+`opencode` is a regular provider. Run it with your already configured [OpenCode](https://opencode.ai/docs/cli/) CLI like any other profile (`opencode.yml` is bundled and installed by `misscat init`). It targets the **OpenCode native V2 v2.0.32** interface (V1 flags and events are not supported).
 
 ```bash
-mscat owner/repo
-mscat .
-mscat . --cat 2 --loud
+misscat . opencode
+misscat owner/repo opencode --cat 2 --loud
 ```
 
-There is no profile argument: `mscat` always reads `~/.config/misscat/opencode.yml`, a file read by mscat itself (not an OpenCode-native config). It has the usual `reviewer` (`provider: opencode`, `model`, `args`), `prompt`, `watch` and `review` fields, and mscat runs, inside the exact-HEAD `cat-N` worktree:
+`~/.config/misscat/opencode.yml` is read by MissCat itself (not an OpenCode-native config); it has the usual `reviewer` (`provider: opencode`, `model`, `args`) and `prompt` fields, and MissCat runs, inside the exact-HEAD `cat-N` worktree:
 
 ```text
 opencode run --standalone --format json <reviewer.args> --model <reviewer.model> <prompt>
 ```
 
-Every review starts a fresh OpenCode session, and ``--standalone` gives each run a private OpenCode server (never your managed background one), and the child gets `PWD` set to the worktree. `reviewer.model` is passed unchanged as `provider/model#variant` (default `openai/gpt-6-luna#xhigh`; the variant must exist in your OpenCode). Existing profiles such as `luna.yml` are never used or translated.
+Every review starts a fresh OpenCode session, `--standalone` gives each run a private OpenCode server (never your managed background one), and the child gets `PWD` set to the worktree. `reviewer.model` is passed unchanged as `provider/model#variant` (default `openai/gpt-6-luna#xhigh`; the variant must exist in your OpenCode).
 
-- **Initialization:** a normal run keeps MissCat's first-run profile install, then adds a packaged `opencode.yml` only if that file is missing (also when the directory already exists). An existing file is never overwritten; invalid content is a configuration error. `--help`/`--version` touch nothing and need no OpenCode.
-- **State and workspaces:** shared with `misscat` (control clone, `cat-N` worktrees, repository lock), so `misscat` and `mscat` cannot watch the same repository at once. Completed reviews are recorded under the profile `mscat/opencode`, visible in `misscat state owner/repo`. Because that is a new profile, the first mscat run reviews already-open HEADs that were completed under another profile.
-- **Completion:** same as MissCat: a submitted `COMMENT` review with the verdict, the exact HEAD and the run's `MissCat-Run:` line, never exit status alone. A review submitted before OpenCode fails is still settled.
-- **Output:** compact progress, tool failures and, when OpenCode reports them, token usage and a cost estimate (summed per step; missing data is omitted, never shown as zero). Clearly non-retryable errors (`provider.auth`, `provider.no-route`) stop the watch with advice; other failures follow the normal retry wait.
+- **Completion:** same as every provider: a submitted `COMMENT` review with the verdict, the exact HEAD and the run's `MissCat-Run:` line, never exit status alone. A review submitted before OpenCode fails is still settled.
+- **Output:** compact progress, tool failures and, when OpenCode reports them, token usage and a cost estimate (summed per step; missing data is omitted, never shown as zero).
+- **Fatal errors:** clearly non-retryable errors (`provider.auth`, `provider.no-route`) let the current batch finish and be recorded, then stop the watch with exit code 2 and advice (`opencode auth login`, or check `reviewer.model` in the profile). Other failures follow the normal retry wait.
+
+### Upgrading to 1.7
+
+- The separate `mscat` command is gone: use `misscat . opencode`. Run `misscat init` once to install `opencode.yml` (an existing file is never overwritten). Your edited `~/.config/misscat/opencode.yml` keeps working unchanged.
+- A review is now complete per PR + HEAD, not per profile. Existing State v2 files are read as they are: records written under any profile (including `mscat/opencode`) count, so switching profiles does not review the same HEAD again. Nothing in the files is rewritten or discarded.
 
 ## BadCat
 
@@ -330,7 +333,7 @@ HEAD: <40-hex sha of the PR's current HEAD>
 - Watches all open PRs in a repository
 - Discovers PRs created after MissCat starts
 - Detects changes by PR HEAD SHA
-- Reviews every new PR HEAD once per profile
+- Reviews every new PR HEAD once, whichever profile ran it
 - Avoids duplicate reviews
 - Remembers reviewed commits across restarts
 - Uses an isolated persistent review workspace
