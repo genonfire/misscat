@@ -78,8 +78,8 @@ class StateManagerTests(unittest.TestCase):
         ])
         with misscat.repository_lock(REPO):
             state = misscat.State(self.path)
-            self.assertFalse(state.remove_latest(misscat.Key(213, "early", "luna")))
-            self.assertTrue(state.remove_latest(misscat.Key(213, "late", "luna")))
+            self.assertFalse(state.remove_latest(misscat.Key(213, "early")))
+            self.assertTrue(state.remove_latest(misscat.Key(213, "late")))
 
     def test_lock_does_not_create_config_dir(self):
         with misscat.repository_lock(REPO):
@@ -100,18 +100,18 @@ class StateManagerTests(unittest.TestCase):
             row("zzz", "2026-10-02T09:00:00Z"),
             row("aaa", "2026-10-02T10:00:00Z"),
             row("mmm", "2026-10-02T08:00:00Z"),
-            row("bbb", "2026-10-02T12:00:00Z", profile="sol"),
+            row("bbb", "2026-10-02T12:00:00Z", profile="sol", pr=214),
         ])
         with misscat.repository_lock(REPO):
             state = misscat.State(self.path)
-            self.assertFalse(state.is_latest(misscat.Key(213, "zzz", "luna")))
-            self.assertTrue(state.is_latest(misscat.Key(213, "aaa", "luna")))
-            self.assertFalse(state.remove_latest(misscat.Key(213, "zzz", "luna")))
-            self.assertTrue(state.remove_latest(misscat.Key(213, "aaa", "luna")))
-            self.assertTrue(state.is_latest(misscat.Key(213, "zzz", "luna")))
-            self.assertTrue(state.remove_latest(misscat.Key(213, "zzz", "luna")))
-            self.assertTrue(state.is_latest(misscat.Key(213, "mmm", "luna")))
-            self.assertTrue(state.is_latest(misscat.Key(213, "bbb", "sol")))
+            self.assertFalse(state.is_latest(misscat.Key(213, "zzz")))
+            self.assertTrue(state.is_latest(misscat.Key(213, "aaa")))
+            self.assertFalse(state.remove_latest(misscat.Key(213, "zzz")))
+            self.assertTrue(state.remove_latest(misscat.Key(213, "aaa")))
+            self.assertTrue(state.is_latest(misscat.Key(213, "zzz")))
+            self.assertTrue(state.remove_latest(misscat.Key(213, "zzz")))
+            self.assertTrue(state.is_latest(misscat.Key(213, "mmm")))
+            self.assertTrue(state.is_latest(misscat.Key(214, "bbb")))
             self.assertEqual(json.loads(self.path.read_text())["version"], 2)
             self.assertEqual(len(state.records()), 2)
 
@@ -151,9 +151,9 @@ class StateManagerTests(unittest.TestCase):
     def test_successful_review_gets_utc_timestamp(self):
         with misscat.repository_lock(REPO):
             state = misscat.State(self.path)
-            key = misscat.Key(215, "fedcba", None)
-            state.add(key)
-            state.add(key)  # no duplicate timestamps/records
+            key = misscat.Key(215, "fedcba")
+            state.add(key, None)
+            state.add(key, None)  # no duplicate timestamps/records
             records = state.records()
             self.assertEqual(len(records), 1)
             timestamp = records[0].reviewed_at
@@ -178,9 +178,9 @@ class StateManagerTests(unittest.TestCase):
         pr = m.PR(213, "current", False, "https://github.com/example", "title")
         with m.repository_lock(REPO):
             state = m.State(self.path)
-            state.add(m.Key(pr.number, pr.head, "luna"))
-            state.add(m.Key(213, "older", "luna"))
-            self.assertTrue(state.remove_latest(m.Key(213, "older", "luna")))
+            state.add(m.Key(pr.number, pr.head), "luna")
+            state.add(m.Key(213, "older"), "luna")
+            self.assertTrue(state.remove_latest(m.Key(213, "older")))
             # Deleting an older HEAD in storage doesn't make an already reviewed HEAD eligible
             calls = []
             watcher = m.Watcher(REPO, "luna", cfg, state,
@@ -189,7 +189,7 @@ class StateManagerTests(unittest.TestCase):
                                 sleep=lambda delay: None)
             watcher.cycle()
             self.assertEqual(calls, [])
-            self.assertTrue(state.remove_latest(m.Key(213, "current", "luna")))
+            self.assertTrue(state.remove_latest(m.Key(213, "current")))
         with m.repository_lock(REPO):
             reloaded = m.State(self.path)
             calls = []
@@ -199,7 +199,7 @@ class StateManagerTests(unittest.TestCase):
                                 sleep=lambda delay: None)
             watcher.cycle()
             self.assertEqual(calls, ["current"])
-            self.assertIn(m.Key(213, "current", "luna"), reloaded.reviewed())
+            self.assertIn(m.Key(213, "current"), reloaded.reviewed())
 
 
 if __name__ == "__main__":

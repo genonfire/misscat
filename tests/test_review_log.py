@@ -63,14 +63,14 @@ class ReviewLogTests(unittest.TestCase):
         self.assertEqual(out, f"\n{m.REVIEW_SEPARATOR}\n"
                               f"INFO PR #78: review start (e4e58fa)\n"
                               f"INFO PR #78: review done in 16m 58s\n")
-        self.assertIn(m.Key(78, self.pr.head, "luna"), state.reviewed())
+        self.assertIn(m.Key(78, self.pr.head), state.reviewed())
 
     def test_failure_logs_elapsed_and_stays_eligible(self):
         watcher, state, ok, out = self.run_review(lambda *a: False, [0.0, 42.0])
         self.assertFalse(ok)
         self.assertIn("WARNING PR #78: review failed after 42s, HEAD stays eligible", out)
         self.assertEqual(state.reviewed(), set())
-        self.assertEqual(watcher.failed, {m.Key(78, self.pr.head, "luna")})
+        self.assertEqual(watcher.failed, {m.Key(78, self.pr.head)})
 
     def test_exception_is_failure_with_elapsed(self):
         def boom(*a):

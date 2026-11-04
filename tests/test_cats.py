@@ -127,7 +127,7 @@ class BatchTests(WatcherBase):
         w = self.watcher(lambda s, r, pr, ws: pr.number != 102, 3)
         w.cycle()
         self.assertEqual(self.reviewed(), {101, 103})
-        self.assertEqual(w.failed, {m.Key(102, "sha102", "luna")})
+        self.assertEqual(w.failed, {m.Key(102, "sha102")})
         self.assertEqual(w.mode, m.ACTIVE)  # something succeeded: re-list right away
 
     def test_crash_in_one_cat_is_a_failure_only_for_that_pr(self):

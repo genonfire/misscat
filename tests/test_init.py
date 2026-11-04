@@ -11,7 +11,7 @@ from unittest import mock
 import misscat
 
 ROOT = Path(__file__).resolve().parent.parent
-BUNDLED = {"luna.yml", "sol.yml", "sonnet.yml", "opus.yml", "gemini.yml"}
+BUNDLED = {"luna.yml", "sol.yml", "sonnet.yml", "opus.yml", "gemini.yml", "opencode.yml"}
 
 
 DEFAULT_PROMPT = (

@@ -1,4 +1,4 @@
-"""mscat: OpenCode-driven reviewer reusing MissCat's watcher, State and lock."""
+"""OpenCode provider: `misscat . opencode` runner, profile and packaging."""
 import json
 import os
 import stat
@@ -11,7 +11,6 @@ from pathlib import Path
 from unittest import mock
 
 import misscat as m
-import mscat
 
 ROOT = Path(__file__).resolve().parent.parent
 REPO = "genonfire/typewriter"
@@ -28,45 +27,37 @@ class ConfigTest(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def test_fresh_install_has_profiles_and_opencode(self):
-        mscat.ensure_config()
+        m.ensure_initial_profiles()
         names = {p.name for p in self.cfg.iterdir()}
         self.assertEqual(names, {"luna.yml", "sol.yml", "sonnet.yml", "opus.yml", "gemini.yml",
                                  "opencode.yml"})
 
-    def test_existing_dir_gets_only_opencode(self):
+    def test_existing_dir_is_not_auto_extended(self):
         self.cfg.mkdir(parents=True)
         (self.cfg / "custom.yml").write_text("x: 1\n")
-        mscat.ensure_config()
-        self.assertEqual({p.name for p in self.cfg.iterdir()}, {"custom.yml", "opencode.yml"})
+        m.ensure_initial_profiles()
+        self.assertEqual({p.name for p in self.cfg.iterdir()}, {"custom.yml"})
+        with self.assertRaises(m.ConfigError) as ctx:
+            m.load_settings("opencode")
+        self.assertIn("misscat init", str(ctx.exception))
+        self.assertEqual(m.run_init([]), 0)
+        self.assertTrue((self.cfg / "opencode.yml").exists())
 
     def test_existing_opencode_never_overwritten(self):
         self.cfg.mkdir(parents=True)
         (self.cfg / "opencode.yml").write_text("reviewer: {model: mine/x}\n")
-        mscat.ensure_config()
-        self.assertEqual((self.cfg / "opencode.yml").read_text(), "reviewer: {model: mine/x}\n")
-        self.assertEqual(mscat.load_settings().model, "mine/x")
-
-    def test_invalid_user_file_is_a_config_error_and_kept(self):
-        self.cfg.mkdir(parents=True)
-        (self.cfg / "opencode.yml").write_text("reviewer: {provider: codex}\n")
-        mscat.ensure_config()
-        with self.assertRaises(m.ConfigError):
-            mscat.load_settings()
-        (self.cfg / "opencode.yml").write_text("- a list\n")
-        with self.assertRaises(m.ConfigError):
-            mscat.load_settings()
-        self.assertEqual((self.cfg / "opencode.yml").read_text(), "- a list\n")
-
-    def test_later_misscat_init_still_installs_profiles(self):
-        mscat.ensure_config()
-        (self.cfg / "luna.yml").unlink()
         self.assertEqual(m.run_init([]), 0)
-        self.assertTrue((self.cfg / "luna.yml").exists())
-        self.assertNotIn("opencode.yml", m.bundled_profiles())
+        self.assertEqual((self.cfg / "opencode.yml").read_text(), "reviewer: {model: mine/x}\n")
+        self.assertEqual(m.load_settings("opencode").model, "mine/x")
+
+    def test_bundled_profile_is_regular(self):
+        text = m.bundled_profiles()["opencode.yml"]
+        self.assertNotIn("watch:", text)
+        self.assertNotIn("mscat", text)
 
     def test_template_defaults(self):
-        mscat.ensure_config()
-        s = mscat.load_settings()
+        m.ensure_initial_profiles()
+        s = m.load_settings("opencode")
         self.assertEqual((s.provider, s.model, s.args), ("opencode", "openai/gpt-6-luna#xhigh", ()))
         self.assertTrue(s.include_drafts)
 
@@ -74,7 +65,7 @@ class ConfigTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as home:
             env = {**os.environ, "HOME": home}
             for flag in ("--help", "--version"):
-                subprocess.run([sys.executable, "-m", "mscat", flag], env=env,
+                subprocess.run([sys.executable, "-m", "misscat", flag], env=env,
                                cwd=ROOT / "src", capture_output=True, check=True)
             self.assertFalse((Path(home) / ".config").exists())
 
@@ -102,7 +93,7 @@ class RunnerTest(unittest.TestCase):
                                             "FAKE_OUT": str(out)}), out
 
     def test_command_shape(self):
-        cmd = mscat.command(self.settings, "P")
+        cmd = m.COMMANDS["opencode"](self.settings.model, "P", list(self.settings.args))
         self.assertEqual(cmd, ["opencode", "run", "--standalone", "--format", "json", "--foo",
                                "--model", "openai/gpt-6-luna#xhigh", "P"])
 
@@ -116,7 +107,7 @@ class RunnerTest(unittest.TestCase):
         )]
         env, out = self.fake(steps)
         with env, self.assertLogs("misscat", "INFO") as logs:
-            ok = mscat.OpenCodeReviewer()(self.settings, REPO, self.pr, self.work)
+            ok = m.CliReviewer("/cfg/opencode.yml")(self.settings, REPO, self.pr, self.work)
         self.assertTrue(ok)
         lines = out.read_text().splitlines()
         self.assertEqual(Path(lines[0]).resolve(), self.work.resolve())
@@ -141,7 +132,7 @@ class RunnerTest(unittest.TestCase):
         caller.mkdir()
         env = {"PATH": f"{self.bin}:{os.environ['PATH']}", "FAKE_OUT": str(out), "PWD": str(caller)}
         with mock.patch.dict(os.environ, env):
-            self.assertTrue(mscat.OpenCodeReviewer()(self.settings, REPO, self.pr, self.work))
+            self.assertTrue(m.CliReviewer("/cfg/opencode.yml")(self.settings, REPO, self.pr, self.work))
             self.assertEqual(os.environ["PWD"], str(caller))  # parent untouched
         cwd, pwd = out.read_text().split("\n")
         self.assertEqual(Path(cwd).resolve(), self.work.resolve())
@@ -150,17 +141,17 @@ class RunnerTest(unittest.TestCase):
     def test_no_route_is_fatal_and_pointed_at_the_config(self):
         err = json.dumps({"type": "error", "error": {"type": "provider.no-route", "message": "x"}})
         env, _ = self.fake([err])
-        reviewer = mscat.OpenCodeReviewer()
+        reviewer = m.CliReviewer("/cfg/opencode.yml")
         with env, self.assertLogs("misscat", "ERROR"):
             self.assertFalse(reviewer(self.settings, REPO, self.pr, self.work))
         with self.assertRaises(m.MissCatError) as ctx:
             reviewer.check()
-        self.assertIn("reviewer.model", str(ctx.exception))
+        self.assertIn("reviewer.model in /cfg/opencode.yml", str(ctx.exception))
 
     def test_missing_usage_is_not_zero(self):
         env, _ = self.fake([json.dumps({"type": "step_start"})])
         with env, self.assertLogs("misscat", "INFO") as logs:
-            self.assertTrue(mscat.OpenCodeReviewer()(self.settings, REPO, self.pr, self.work))
+            self.assertTrue(m.CliReviewer("/cfg/opencode.yml")(self.settings, REPO, self.pr, self.work))
         done = [r for r in logs.output if "opencode done" in r][0]
         self.assertNotIn("input", done)
         self.assertNotIn("cost", done)
@@ -168,14 +159,14 @@ class RunnerTest(unittest.TestCase):
     def test_nonzero_exit_fails_and_redacts(self):
         env, _ = self.fake(["see https://user:tok@github.com/x"], code=3)
         with env, self.assertLogs("misscat", "ERROR") as logs:
-            self.assertFalse(mscat.OpenCodeReviewer()(self.settings, REPO, self.pr, self.work))
+            self.assertFalse(m.CliReviewer("/cfg/opencode.yml")(self.settings, REPO, self.pr, self.work))
         self.assertIn("exited 3", logs.output[0])
         self.assertNotIn("tok", logs.output[0])
 
     def test_error_event_fails_even_with_exit_zero(self):
         err = json.dumps({"type": "error", "error": {"type": "api", "message": "boom"}})
         env, _ = self.fake([err])
-        reviewer = mscat.OpenCodeReviewer()
+        reviewer = m.CliReviewer("/cfg/opencode.yml")
         with env, self.assertLogs("misscat", "ERROR"):
             self.assertFalse(reviewer(self.settings, REPO, self.pr, self.work))
         reviewer.check()  # transient: no stop
@@ -183,7 +174,7 @@ class RunnerTest(unittest.TestCase):
     def test_fatal_error_stops_dispatch_with_advice(self):
         err = json.dumps({"type": "error", "error": {"type": "provider.auth", "message": "no key"}})
         env, _ = self.fake([err])
-        reviewer = mscat.OpenCodeReviewer()
+        reviewer = m.CliReviewer("/cfg/opencode.yml")
         with env, self.assertLogs("misscat", "ERROR"):
             self.assertFalse(reviewer(self.settings, REPO, self.pr, self.work))
         with self.assertRaises(m.MissCatError) as ctx:
@@ -195,16 +186,22 @@ class RunnerTest(unittest.TestCase):
             "status": "error", "error": "permission rejected", "input": {"command": "rm x"}}}})
         env, _ = self.fake([ev])
         with env, self.assertLogs("misscat.activity", "WARNING") as logs:
-            self.assertTrue(mscat.OpenCodeReviewer()(self.settings, REPO, self.pr, self.work))
+            self.assertTrue(m.CliReviewer("/cfg/opencode.yml")(self.settings, REPO, self.pr, self.work))
         self.assertIn("permission rejected", logs.output[0])
+
+    def test_other_providers_use_the_structured_runner(self):
+        s = m.Settings("codex", "x", "P", (1.0,), (1.0,), True, ())
+        with mock.patch.object(m, "run_cli_reviewer", return_value=True) as run:
+            self.assertTrue(m.CliReviewer("cfg")(s, REPO, self.pr, self.work))
+        run.assert_called_once()
 
     def test_missing_executable(self):
         with mock.patch.dict(os.environ, {"PATH": str(self.bin)}), self.assertLogs("misscat", "ERROR"):
-            self.assertFalse(mscat.OpenCodeReviewer()(self.settings, REPO, self.pr, self.work))
+            self.assertFalse(m.CliReviewer("/cfg/opencode.yml")(self.settings, REPO, self.pr, self.work))
 
 
 class WatcherIntegrationTest(unittest.TestCase):
-    """mscat's profile identity: confirmation, recovery and coexistence with MissCat profiles."""
+    """Profile-independent completion: confirmation, recovery and profile switching."""
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -214,12 +211,12 @@ class WatcherIntegrationTest(unittest.TestCase):
             patcher = mock.patch.object(m, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
-        mscat.ensure_config()
-        self.settings = mscat.load_settings()
+        m.ensure_initial_profiles()
+        self.settings = m.load_settings("opencode")
         self.state = m.State(m.state_path(REPO))
         self.pr = m.PR(5, HEAD, False, "u", "t")
 
-    def run_watcher(self, reviewer, reviews, profile=mscat.PROFILE):
+    def run_watcher(self, reviewer, reviews, profile="opencode"):
         disc = mock.Mock()
         disc.reviews.side_effect = lambda n: reviews()
         disc.head.return_value = HEAD
@@ -229,7 +226,7 @@ class WatcherIntegrationTest(unittest.TestCase):
         w.cycle()
         return w
 
-    def test_valid_review_records_namespaced_profile(self):
+    def test_valid_review_records_profile_as_metadata(self):
         seen = {}
 
         def reviewer(settings, repo, pr, ws):
@@ -238,7 +235,8 @@ class WatcherIntegrationTest(unittest.TestCase):
 
         body = lambda: f"+1\nHEAD: {HEAD}\n\nevidence\nMissCat-Run: {seen['run']}"
         self.run_watcher(reviewer, lambda: [m.GhReview(9, "me", "COMMENTED", body(), HEAD, "2026-01-01T00:00:00Z")])
-        self.assertEqual(self.state.reviewed(), {m.Key(5, HEAD, "mscat/opencode")})
+        self.assertEqual(self.state.reviewed(), {m.Key(5, HEAD)})
+        self.assertEqual([r.profile for r in self.state.records()], ["opencode"])
 
     def test_exit_zero_without_review_is_not_recorded(self):
         self.run_watcher(lambda *a: True, lambda: [])
@@ -267,11 +265,16 @@ class WatcherIntegrationTest(unittest.TestCase):
         self.run_watcher(reviewer, lambda: [m.GhReview(9, "me", "COMMENTED", body(), "b" * 40, "2026-01-01T00:00:00Z")])
         self.assertEqual(self.state.reviewed(), set())
 
-    def test_misscat_profile_does_not_suppress_mscat(self):
-        self.state.add(m.Key(5, HEAD, "luna"))
-        w = m.Watcher(REPO, mscat.PROFILE, self.settings, self.state, lambda r: [self.pr],
+    def test_luna_opencode_sol_switch_does_not_rereview_same_head(self):
+        self.state.add(m.Key(5, HEAD), "luna")
+        for profile in ("opencode", "sol"):
+            w = m.Watcher(REPO, profile, self.settings, self.state, lambda r: [self.pr],
+                          lambda *a: True, sleep=lambda s: None)
+            self.assertEqual(w._next_batch([self.pr]), [])
+        newer = m.PR(5, "c" * 40, False, "u", "t")
+        w = m.Watcher(REPO, "sol", self.settings, self.state, lambda r: [newer],
                       lambda *a: True, sleep=lambda s: None)
-        self.assertEqual(w._next_batch([self.pr]), [self.pr])
+        self.assertEqual(w._next_batch([newer]), [newer])
 
     def test_shared_lock_blocks_second_process(self):
         with m.repository_lock(REPO):
@@ -292,7 +295,7 @@ class MainTest(unittest.TestCase):
                    mock.patch("shutil.which", return_value="/x"),
                    mock.patch.object(m.Workspaces, "sync"),
                    mock.patch.object(m.Workspaces, "prepare", return_value=root),
-                   mock.patch.object(mscat, "gh_open_prs", return_value=[m.PR(1, HEAD, False, "u", "t")]),
+                   mock.patch.object(m, "gh_open_prs", return_value=[m.PR(1, HEAD, False, "u", "t")]),
                    mock.patch.object(m.GhDiscussion, "reviews", return_value=[]),
                    mock.patch.object(m.GhDiscussion, "head", return_value=HEAD)]
         for p in patches:
@@ -303,15 +306,15 @@ class MainTest(unittest.TestCase):
             self_.fatal = "opencode provider.auth: nope"
             return False
 
-        with mock.patch.object(mscat.OpenCodeReviewer, "__call__", fail), \
+        with mock.patch.object(m.CliReviewer, "__call__", fail), \
                 mock.patch("sys.stderr") as err, mock.patch("time.sleep") as sleep:
-            self.assertEqual(mscat.main([REPO]), 2)
+            self.assertEqual(m.main([REPO, "opencode"]), 2)
         sleep.assert_not_called()
         self.assertIn("provider.auth", "".join(c.args[0] for c in err.write.call_args_list))
 
 
 class WheelTest(unittest.TestCase):
-    def test_wheel_exposes_mscat(self):
+    def test_wheel_ships_opencode_profile_and_no_mscat(self):
         with tempfile.TemporaryDirectory() as tmp:
             build = subprocess.run([sys.executable, "-m", "pip", "wheel", "--no-deps", "-w", tmp, str(ROOT)],
                                    capture_output=True, text=True)
@@ -322,9 +325,9 @@ class WheelTest(unittest.TestCase):
             with zipfile.ZipFile(wheel) as z:
                 names = set(z.namelist())
                 entry = next(n for n in names if n.endswith("entry_points.txt"))
-                self.assertIn("mscat = mscat:main", z.read(entry).decode())
-            self.assertIn("mscat/opencode.yml", names)
-            self.assertNotIn("misscat/profiles/opencode.yml", names)
+                self.assertNotIn("mscat", z.read(entry).decode())
+            self.assertIn("misscat/profiles/opencode.yml", names)
+            self.assertFalse([n for n in names if n.startswith("mscat/")])
 
 
 if __name__ == "__main__":

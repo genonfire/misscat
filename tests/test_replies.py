@@ -70,8 +70,8 @@ class ReplyBase(unittest.TestCase):
             self.addCleanup(patcher.stop)
         self.cfg = m.load_settings(None)
         self.state = m.State(m.state_path(REPO))
-        self.key = m.Key(7, HEAD, "luna")
-        self.state.add(self.key)
+        self.key = m.Key(7, HEAD)
+        self.state.add(self.key, "luna")
         # reviewed_at is "now"; pin it next to the fake timeline
         self.state._records = [m.ReviewRecord(7, HEAD, "luna", ts(5), (1,))]
         self.pr = m.PR(7, HEAD, False, "https://example/pr/7", "t", author=AUTHOR, updated_at="u1")
@@ -110,7 +110,7 @@ class TriggerTests(ReplyBase):
         w = self.watcher(d)
         self.run_verified(d, w)
         self.assertEqual(len(self.calls), 1)
-        self.assertIn(m.ReplyKey(7, HEAD, "luna", 10), self.state.handled())
+        self.assertIn(m.ReplyKey(7, HEAD, 10), self.state.handled())
         self.pr = m.PR(7, HEAD, False, "u", "t", author=AUTHOR, updated_at="u2")
         w2 = self.watcher(d, [self.pr])
         w2.cycle()
@@ -183,7 +183,7 @@ class TriggerTests(ReplyBase):
         self.assertEqual(d.review_calls, 0)
 
     def test_urgent_reply_goes_first(self):
-        self.state.add(m.Key(8, "d" * 40, "luna"))
+        self.state.add(m.Key(8, "d" * 40), "luna")
         d = self.blocked()
         w = self.watcher(d)
         w.cats = 2
@@ -269,13 +269,13 @@ class AttributionTests(ReplyBase):
                 w.reviewer = reviewer
                 with self.assertLogs("misscat", "ERROR"):
                     w.cycle()
-                self.assertNotIn(m.Key(9, HEAD, "luna"), self.state.reviewed())
+                self.assertNotIn(m.Key(9, HEAD), self.state.reviewed())
                 self.assertEqual(self.state.pending(), [])
                 # Recovery uses the same validation, including after a clean exit.
                 self.state.add_pending(m.PendingRun(9, HEAD, "luna", "abcd", (), True))
                 d.review_list = [review(5, 0, run="abcd", **kwargs)]
                 w._reconcile_pending()
-                self.assertNotIn(m.Key(9, HEAD, "luna"), self.state.reviewed())
+                self.assertNotIn(m.Key(9, HEAD), self.state.reviewed())
                 self.assertEqual(self.state.pending(), [])
 
 
@@ -406,7 +406,7 @@ class RecoveryTests(ReplyBase):
         self.state = m.State(m.state_path(REPO))
         w = self.watcher(d, [self.normal_pr()], reviewer=lambda *a: self.fail("must not rerun"))
         w.cycle()
-        self.assertEqual(self.state.review_ids(m.Key(9, HEAD, "luna")), {5})
+        self.assertEqual(self.state.review_ids(m.Key(9, HEAD)), {5})
         self.assertEqual(self.state.pending(), [])
 
     def test_normal_submission_survives_cli_failure_and_api_error(self):
@@ -426,7 +426,7 @@ class RecoveryTests(ReplyBase):
                 d.fail = False
                 self.state = m.State(m.state_path(REPO))
                 self.watcher(d, [pr], reviewer=lambda *a: self.fail("must not rerun")).cycle()
-                self.assertEqual(self.state.review_ids(m.Key(pr.number, HEAD, "luna")), {5})
+                self.assertEqual(self.state.review_ids(m.Key(pr.number, HEAD)), {5})
                 self.assertEqual(self.state.pending(), [])
 
     def test_crash_between_completion_and_pending_removal_does_not_rerun(self):
@@ -442,7 +442,7 @@ class RecoveryTests(ReplyBase):
             with self.assertRaises(RuntimeError):
                 w.cycle()
         self.state = m.State(m.state_path(REPO))
-        self.assertEqual(self.state.review_ids(m.Key(9, HEAD, "luna")), {5})
+        self.assertEqual(self.state.review_ids(m.Key(9, HEAD)), {5})
         self.assertEqual(len(self.state.pending()), 1)
         self.watcher(d, [pr], reviewer=lambda *a: self.fail("must not rerun")).cycle()
         self.assertEqual(self.state.pending(), [])
@@ -455,7 +455,7 @@ class RecoveryTests(ReplyBase):
             self.watcher(d, [self.normal_pr()]).cycle()
         self.assertEqual(len(self.calls), 1)
         self.assertEqual(self.state.pending(), [])
-        self.assertNotIn(m.Key(9, HEAD, "luna"), self.state.reviewed())
+        self.assertNotIn(m.Key(9, HEAD), self.state.reviewed())
 
     def test_pending_state_round_trips_and_rejects_garbage(self):
         run = m.PendingRun(9, HEAD, "luna", "abcd", (3, 4), True)
@@ -590,9 +590,9 @@ class PollingTests(ReplyBase):
 
 class StateTests(ReplyBase):
     def test_replies_persist_and_old_v2_files_load(self):
-        self.state.add_replies([m.ReplyKey(7, HEAD, "luna", 10)], 2)
+        self.state.add_replies([m.ReplyKey(7, HEAD, 10)], "luna", 2)
         again = m.State(m.state_path(REPO))
-        self.assertEqual(again.handled(), {m.ReplyKey(7, HEAD, "luna", 10)})
+        self.assertEqual(again.handled(), {m.ReplyKey(7, HEAD, 10)})
         self.assertEqual(again.review_ids(self.key), {1, 2})
         data = json.loads(m.state_path(REPO).read_text())
         data.pop("replies")
@@ -611,7 +611,7 @@ class StateTests(ReplyBase):
             m.State(path)
 
     def test_removing_a_review_keeps_replies(self):
-        self.state.add_replies([m.ReplyKey(7, HEAD, "luna", 10)], 2)
+        self.state.add_replies([m.ReplyKey(7, HEAD, 10)], "luna", 2)
         self.state._records = [m.ReviewRecord(7, HEAD, "luna", ts(5))]
         self.assertTrue(self.state.remove_latest(self.key))
         self.assertEqual(len(m.State(m.state_path(REPO)).handled()), 1)
