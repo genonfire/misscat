@@ -315,11 +315,9 @@ Every review starts a fresh OpenCode session, `--standalone` gives each run a pr
 - **Output:** compact progress, tool failures and, when OpenCode reports them, token usage and a cost estimate (summed per step; missing data is omitted, never shown as zero).
 - **Fatal errors:** clearly non-retryable errors (`provider.auth`, `provider.no-route`) assign nothing more, let the reviews already running finish and be recorded, then stop the watch with exit code 2 and advice (`opencode auth login`, or check `reviewer.model` in the profile). Other failures follow the normal retry wait.
 
-### Upgrading to 1.8
+### Upgrading to 1.7.0
 
-- `--cat N` no longer works in batches: there is no batch barrier any more (see [Concurrent reviews](#concurrent-reviews---cat-n)). Profiles, state files, locks and worktree paths are unchanged.
-
-### Upgrading to 1.7
+- `--cat N` still runs up to N reviews concurrently, but reviews are now independent: each result is recorded as soon as it finishes, and idle cats receive new work at the next regular poll. The batch barrier has been removed (see [Concurrent reviews](#concurrent-reviews---cat-n)). Profiles, state files, locks and worktree paths are unchanged.
 
 - The separate `mscat` command is gone: use `misscat . opencode`. Run `misscat init` once to install `opencode.yml` (an existing file is never overwritten). Your edited `~/.config/misscat/opencode.yml` keeps working unchanged.
 - A review is now complete per PR + HEAD, not per profile. Existing State v2 files are read as they are: records written under any profile (including `mscat/opencode`) count, so switching profiles does not review the same HEAD again. Nothing in the files is rewritten or discarded.
