@@ -221,7 +221,7 @@ class WatcherIntegrationTest(unittest.TestCase):
         disc.reviews.side_effect = lambda n: reviews()
         disc.head.return_value = HEAD
         w = m.Watcher(REPO, profile, self.settings, self.state, lambda r: [self.pr], reviewer,
-                      sleep=lambda s: None, discussion=disc, workspaces=mock.Mock(
+                      discussion=disc, workspaces=mock.Mock(
                           prepare=lambda pr, cat: Path("/cat")))
         w.cycle()
         return w
@@ -269,11 +269,11 @@ class WatcherIntegrationTest(unittest.TestCase):
         self.state.add(m.Key(5, HEAD), "luna")
         for profile in ("opencode", "sol"):
             w = m.Watcher(REPO, profile, self.settings, self.state, lambda r: [self.pr],
-                          lambda *a: True, sleep=lambda s: None)
+                          lambda *a: True)
             self.assertEqual(w._next_batch([self.pr]), [])
         newer = m.PR(5, "c" * 40, False, "u", "t")
         w = m.Watcher(REPO, "sol", self.settings, self.state, lambda r: [newer],
-                      lambda *a: True, sleep=lambda s: None)
+                      lambda *a: True)
         self.assertEqual(w._next_batch([newer]), [newer])
 
     def test_shared_lock_blocks_second_process(self):
@@ -307,9 +307,8 @@ class MainTest(unittest.TestCase):
             return False
 
         with mock.patch.object(m.CliReviewer, "__call__", fail), \
-                mock.patch("sys.stderr") as err, mock.patch("time.sleep") as sleep:
+                mock.patch("sys.stderr") as err:
             self.assertEqual(m.main([REPO, "opencode"]), 2)
-        sleep.assert_not_called()
         self.assertIn("provider.auth", "".join(c.args[0] for c in err.write.call_args_list))
 
 

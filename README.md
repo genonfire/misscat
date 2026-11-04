@@ -136,6 +136,20 @@ misscat . sol --cat 2 --loud
 
 `--loud` additionally shows successful reviewer tool activity (`exec: …`, `exec: completed (0)`, MCP calls, web searches, Claude `tool: …` lines, Gemini tool steps) and raw, non-JSON reviewer CLI output at `DEBUG`.
 
+### Concurrent reviews: `--cat N`
+
+```bash
+misscat . sol --cat 3
+```
+
+`--cat N` (default 1) runs up to **N** reviews at the same time, each in its own persistent `cat-N` worktree. The cats are independent:
+
+- A finished review is verified against GitHub and recorded **immediately**, without waiting for the other cats (`review done in … [cat-K]`).
+- New work is assigned **only at the regular poll**. A cat that just finished stays idle until the next poll; a completion neither lists PRs nor moves the next poll time.
+- The poll uses the `active` schedule while at least one cat is reviewing and the `idle` schedule when none is; changing between the two restarts the schedule.
+- A PR that is being reviewed is not assigned again, even if its HEAD changes meanwhile; the new HEAD is picked up by the first poll after the run was recorded.
+- A HEAD whose review failed is not retried for 5 minutes, and then goes after the other waiting PRs of its priority. A failed workspace sync delays the next poll by at least 5 minutes without penalizing any HEAD; running cats are unaffected.
+
 ### Using `.` for the current repository
 
 `.` **always means the GitHub repository of the current Git checkout's `origin` remote**; `upstream` and other remotes are never used.
@@ -299,7 +313,11 @@ Every review starts a fresh OpenCode session, `--standalone` gives each run a pr
 
 - **Completion:** same as every provider: a submitted `COMMENT` review with the verdict, the exact HEAD and the run's `MissCat-Run:` line, never exit status alone. A review submitted before OpenCode fails is still settled.
 - **Output:** compact progress, tool failures and, when OpenCode reports them, token usage and a cost estimate (summed per step; missing data is omitted, never shown as zero).
-- **Fatal errors:** clearly non-retryable errors (`provider.auth`, `provider.no-route`) let the current batch finish and be recorded, then stop the watch with exit code 2 and advice (`opencode auth login`, or check `reviewer.model` in the profile). Other failures follow the normal retry wait.
+- **Fatal errors:** clearly non-retryable errors (`provider.auth`, `provider.no-route`) assign nothing more, let the reviews already running finish and be recorded, then stop the watch with exit code 2 and advice (`opencode auth login`, or check `reviewer.model` in the profile). Other failures follow the normal retry wait.
+
+### Upgrading to 1.8
+
+- `--cat N` no longer works in batches: there is no batch barrier any more (see [Concurrent reviews](#concurrent-reviews---cat-n)). Profiles, state files, locks and worktree paths are unchanged.
 
 ### Upgrading to 1.7
 

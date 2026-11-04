@@ -3,8 +3,9 @@
 
 Watches a GitHub repository and runs an AI review once for every new PR HEAD.
 One repository = one MissCat process = one workspace = one state file.
-One review at a time by default (`--cat=N` reviews up to N waiting PR HEADs in a batch, one
-persistent worktree per cat, and waits for the whole batch); then an immediate re-check.
+One review at a time by default. `--cat=N` runs up to N independent cats at once, one
+persistent worktree each: a finished review is recorded immediately, and idle cats take new
+PR HEADs only at the next regular poll.
 
 Each review runs the reviewer CLI (Claude Code, Codex, Gemini via Antigravity CLI, or OpenCode)
 from the root of a MissCat-owned worktree of the exact PR HEAD, so the CLI finds the
@@ -37,6 +38,7 @@ import threading
 import json
 import logging
 import os
+import queue
 import re
 import secrets
 import shutil
@@ -50,7 +52,7 @@ from urllib.parse import urlsplit
 
 import yaml
 
-__version__ = "1.7.0"
+__version__ = "1.8.0"
 
 log = logging.getLogger("misscat")
 # Reviewer tool activity (exec/MCP/tool/web search). Successful lines show only with --loud;
@@ -654,10 +656,11 @@ class Workspaces:
     def cat_path(self, cat: int) -> Path:
         return self.root / f"cat-{cat}"
 
-    def sync(self) -> None:
+    def sync(self, skip: frozenset[int] | set[int] = frozenset()) -> None:
         """Ensure the control clone and cat-1..cat-N exist; leave control on the default HEAD.
 
-        Only missing pieces are created. Cats beyond `cats` stay on disk untouched.
+        Only missing pieces are created. Cats beyond `cats` stay on disk untouched, and so
+        do the cats in `skip` (running reviews): their worktrees are never inspected.
         """
         path = self.control
         try:
@@ -679,7 +682,8 @@ class Workspaces:
             _git(["clean", "-ffdx"], path)
             _git(["checkout", "-f", "-B", remote_head.split("/", 1)[1], remote_head], path)
             for cat in range(1, self.cats + 1):
-                self._ensure_cat(cat)
+                if cat not in skip:
+                    self._ensure_cat(cat)
         except OSError as exc:
             raise WorkspaceError(str(exc)) from exc
 
@@ -1554,17 +1558,38 @@ def _log_review_separator() -> None:
     stream.flush()
 
 
+class Run(NamedTuple):
+    """A review running in one cat (MainThread bookkeeping)."""
+    pr: PR
+    started: float
+
+
+class Done(NamedTuple):
+    """A worker's report: the reviewer finished (ok) or failed. State is decided from it."""
+    cat: int
+    pr: PR
+    ok: bool
+    elapsed: float
+
+
 class Watcher:
     """One watcher, one polling timer per repository. A review is complete per PR + HEAD,
     whichever profile ran it (`profile` is recorded as metadata only).
 
-    Timer: starts idle (1m -> 5m). A successful review switches it to active (5m -> 1m)
-    from the start of the sequence. When no PR is open any more it falls back to idle.
-    A batch in which every review failed waits FAILURE_WAIT and does not advance the timer.
+    The MainThread is the only scheduler and the only writer of State and Git. Up to `cats`
+    independent cat workers each run one reviewer in their own worktree. A worker only runs
+    the reviewer and reports `Done`; the MainThread verifies and records it at once, without
+    waiting for the other cats, but a finished cat gets no new PR until the next regular poll.
 
-    Reviews run in batches of at most `cats` PR HEADs, one cat worktree each, concurrently.
-    The batch is a barrier: nothing new starts until every reviewer of the batch has
-    finished; only then are successes recorded (here, sequentially) and PRs listed again.
+    Timer: one poll per interval. New work is assigned only at a poll, to the cats that were
+    idle then. The mode is ACTIVE while any cat is running (active schedule, 5m -> 1m) and
+    IDLE otherwise (idle schedule, 1m -> 5m); a change of mode restarts the schedule.
+    A completion neither triggers a poll nor moves the next deadline.
+
+    A PR with a running review is never assigned again, whatever its HEAD; a changed HEAD
+    is picked up by the first poll after the run is recorded. A failed HEAD cools down for
+    FAILURE_WAIT and then goes last in its priority. A failed workspace sync postpones the
+    next poll by at least FAILURE_WAIT without penalizing any HEAD.
 
     An already-reviewed HEAD is reviewed once more when the PR author adds a top-level
     conversation comment after a submitted `-1` of that HEAD (see `_find_reply`).
@@ -1578,63 +1603,109 @@ class Watcher:
         state: State,
         list_prs: Callable[[str], list[PR]],
         reviewer: Callable[[Settings, str, PR, Path | None], bool],
-        sleep: Callable[[float], None] = time.sleep,
         cats: int = 1,
         workspaces: Workspaces | None = None,
         discussion: GhDiscussion | None = None,
+        clock: Callable[[], float] = time.monotonic,
+        fatal: Callable[[], str | None] = lambda: None,
     ):
         self.repo, self.profile, self.s, self.state = repo, profile, settings, state
         self.discussion = discussion  # None disables same-HEAD reply re-reviews
         self._checked: dict[tuple[int, str], str] = {}  # (PR, HEAD) -> updated_at with no reply due
-        self.list_prs, self.reviewer, self.sleep = list_prs, reviewer, sleep
+        self.list_prs, self.reviewer, self.clock, self.fatal = list_prs, reviewer, clock, fatal
         self.cats, self.workspaces = cats, workspaces
         self.mode, self.step = IDLE, 0
-        self.failed: set[Key] = set()  # failed in the previous batch: they go last next time
+        # MainThread only from here on
+        self.idle: list[int] = list(range(1, cats + 1))
+        self.running: dict[int, Run] = {}
+        self.events: queue.Queue[Done] = queue.Queue()
+        self.failed: dict[Key, float] = {}  # failed HEAD -> when: cooling down, then last
+        self._stop: str | None = None  # first unrecoverable reviewer error seen
+        self._started = 0  # reviews started by the current poll
 
     def run_forever(self) -> None:
+        deadline = self.clock()  # first poll right away
         while True:
-            self.cycle()
+            try:
+                event = self.events.get(timeout=max(0.0, deadline - self.clock()))
+            except queue.Empty:
+                event = None
+            if event is not None:
+                self._finish(event)  # the deadline is neither advanced nor reset
+                self._check_fatal()
+                continue
+            self._check_fatal()
+            delay = self.poll()
+            self._check_fatal()  # a fatal error that poll() itself drained must not wait for the timer
+            deadline = self.clock() + delay
 
-    def cycle(self) -> None:
-        """One iteration: review a batch of waiting PR HEADs if any, otherwise sleep."""
+    def cycle(self) -> float:
+        """One poll, then wait for everything it started and record it. Returns the delay
+        until the next poll. A one-shot driver for tests; `run_forever` never waits like this."""
+        delay = self.poll()
+        while self.running:
+            self._finish(self.events.get())
+        return delay
+
+    def poll(self) -> float:
+        """One regular poll: list PRs once, settle stale attempts, assign idle cats.
+        Returns the delay until the next poll."""
+        self._started = 0
+        sync_failed = False
         try:
             prs = self.list_prs(self.repo)
         except GhError as exc:
             log.warning("cannot list PRs: %s", exc)
-            self._sleep_adaptive()
-            return
-        if not prs and self.mode == ACTIVE:
-            self.mode, self.step = IDLE, 0
-        self._reconcile_pending()
-        batch = self._next_batch(prs)
-        if not batch:
-            self._sleep_adaptive()
-        elif any(self._review_batch(batch)):
-            self.mode, self.step = ACTIVE, 0  # then straight back to a fresh listing, no sleep
         else:
-            log.warning("checking again in %s", _fmt(FAILURE_WAIT))
-            self.sleep(FAILURE_WAIT)
+            self._reconcile_pending({r.pr.run_id for r in self.running.values()})
+            listed = {self._key(p) for p in prs}
+            self.failed = {k: t for k, t in self.failed.items() if k in listed}
+            if self.idle:
+                busy = {r.pr.number for r in self.running.values()}
+                batch = self._next_batch(prs, len(self.idle), busy)
+                if batch:
+                    sync_failed = self._dispatch(batch)
+        mode = ACTIVE if self.running else IDLE
+        if mode != self.mode:
+            self.mode, self.step = mode, 0
+        seq = self.s.active if self.mode == ACTIVE else self.s.idle
+        delay = seq[min(self.step, len(seq) - 1)]
+        self.step = min(self.step + 1, len(seq) - 1)
+        if sync_failed:
+            delay = max(delay, FAILURE_WAIT)
+        if self._started:
+            log.info("next check in %s (%d running)", _fmt(delay), len(self.running))
+        else:
+            log.info("nothing to review (%s), next check in %s", self.mode, _fmt(delay))
+        return delay
 
     def _key(self, pr: PR) -> Key:
         return Key(pr.number, pr.head)  # self.profile is only recorded as metadata
 
-    def _next_batch(self, prs: list[PR]) -> list[PR]:
+    def _next_batch(self, prs: list[PR], limit: int | None = None,
+                    exclude: frozenset[int] | set[int] = frozenset()) -> list[PR]:
+        """Up to `limit` PRs to review now. PRs in `exclude` (running reviews) are skipped
+        entirely, without any GitHub lookup."""
+        limit = self.cats if limit is None else limit
+        now = self.clock()
         done = self.state.reviewed()
         unsettled = {r.key() for r in self.state.pending()}  # outcome not known yet: do not rerun
         eligible = [
             p for p in sorted(prs, key=lambda p: p.number)  # oldest PR first
-            if (self.s.include_drafts or not p.draft) and not p.no_review
+            if p.number not in exclude
+            and (self.s.include_drafts or not p.draft) and not p.no_review
             and self._key(p) not in unsettled
+            and now - self.failed.get(self._key(p), -FAILURE_WAIT) >= FAILURE_WAIT
         ]
         waiting = [p for p in eligible if self._key(p) not in done]
         waiting += self._reply_candidates([p for p in eligible if self._key(p) in done])
         waiting.sort(key=lambda p: p.number)
         # `no-review` PRs are never eligible, even if also `urgent`. `urgent` PRs are picked
-        # first; within each priority class, HEADs that just failed go last so they cannot
+        # first; within each priority class, HEADs that failed before go last so they cannot
         # starve the others
         ordered = [p for urgent in (True, False) for failed in (False, True) for p in waiting
                    if p.urgent == urgent and (self._key(p) in self.failed) == failed]
-        return ordered[: self.cats]
+        return ordered[:limit]
 
     def _reply_candidates(self, reviewed: list[PR]) -> list[PR]:
         """Reviewed current HEADs whose author answered a blocking `-1`, marked with their trigger.
@@ -1691,8 +1762,9 @@ class Watcher:
             [ReplyKey(run.pr, run.head, c) for c in run.comment_ids], run.profile, review_id)
         self.state.drop_pending(run.run_id)
 
-    def _reconcile_pending(self) -> None:
+    def _reconcile_pending(self, live: set[str] = frozenset()) -> None:
         """Settle attempts left over by a crash, restart or earlier GitHub error.
+        Attempts of running reviews (`live` run ids) are not left over: they are skipped.
 
         A valid review submitted by this run counts even if its CLI died afterwards.
         A lookup failure keeps the attempt pending, and its HEAD is not rerun until it
@@ -1702,6 +1774,8 @@ class Watcher:
         if self.discussion is None:
             return
         for run in self.state.pending():
+            if run.run_id in live:
+                continue
             try:
                 reviews = self.discussion.reviews(run.pr)
                 head = self.discussion.head(run.pr) if run.comment_ids else run.head
@@ -1717,12 +1791,14 @@ class Watcher:
                 if review_id is not None:
                     log.info("PR #%d: settled a re-review submitted earlier", run.pr)
                     self._record_reply(run, review_id)
+                    self.failed.pop(run.key(), None)
                     continue
             else:
                 found = submitted_by_run(reviews, run.head, run.run_id)
                 if found:
                     self.state.add(run.key(), run.profile, tuple(sorted(r.id for r in found)))
                     self.state.drop_pending(run.run_id)
+                    self.failed.pop(run.key(), None)  # verified after all: no cooldown
                     continue
             self.state.drop_pending(run.run_id)  # nothing was submitted: eligible again
 
@@ -1763,88 +1839,129 @@ class Watcher:
         self.state.drop_pending(pr.run_id)
         return True
 
-    def _review(self, pr: PR) -> bool:
-        return self._review_batch([pr])[0]
+    def _tag(self, cat: int) -> str:
+        return f" [cat-{cat}]" if self.cats > 1 else ""
 
-    def _review_batch(self, batch: list[PR]) -> list[bool]:
-        """Review `batch` concurrently, wait for all of it, then record the successes."""
-        if self.discussion is not None:  # one nonce per run: proves which run submitted a review
-            batch = [replace(pr, run_id=secrets.token_hex(8)) for pr in batch]
-        tag = (lambda n: f" [cat-{n}]") if self.cats > 1 else (lambda n: "")
-        _log_review_separator()
-        for n, pr in enumerate(batch, 1):
+    def _stopping(self) -> bool:
+        return bool(self._stop or self.fatal())
+
+    def _check_fatal(self) -> None:
+        """On an unrecoverable reviewer error: assign nothing more, record the reviews still
+        running, then stop the watch."""
+        message = self._stop or self.fatal()
+        if not message:
+            return
+        if not self._stop:
+            self._stop = message
+            log.error("stopping: %s; no new reviews, waiting for %d running cat(s)",
+                      message, len(self.running))
+        while self.running:
+            self._finish(self.events.get())
+        raise MissCatError(message)
+
+    def _drain_nowait(self) -> None:
+        """Record every review that has already finished. Never polls, never blocks."""
+        while True:
+            try:
+                done = self.events.get_nowait()
+            except queue.Empty:
+                return
+            self._finish(done)
+
+    def _dispatch(self, batch: list[PR]) -> bool:
+        """Start `batch` on cats that were idle when the poll began. Returns True when the
+        workspace sync failed.
+
+        Preparation (sync, prepare) comes before anything is written to State, so a failed
+        attempt leaves no pending run. Between steps finished reviews are recorded, so a slow
+        Git step never delays them.
+        """
+        if self._stopping():
+            return False
+        available = list(self.idle)  # a cat that finishes meanwhile waits for the next poll
+        if self.workspaces is not None:
+            try:
+                self.workspaces.sync(skip=frozenset(self.running))
+            except WorkspaceError as exc:
+                log.error("workspace sync failed: %s; next check in at least %s",
+                          exc, _fmt(FAILURE_WAIT))
+                return True  # not the HEADs' fault: no cooldown, running cats go on
+        first = True
+        for pr in batch:
+            self._drain_nowait()
+            if self._stopping():
+                break
+            cat = available.pop(0)
+            path = None
+            if self.workspaces is not None:
+                try:
+                    path = self.workspaces.prepare(pr, cat)
+                except WorkspaceError as exc:
+                    log.error("PR #%d: workspace preparation failed: %s", pr.number, exc)
+                    self.failed[self._key(pr)] = self.clock()
+                    continue
+            self._drain_nowait()
+            if self._stopping():  # a reviewer may have hit a fatal error while preparing
+                break
+            if self.discussion is not None:  # one nonce per run: proves which run submitted a review
+                pr = replace(pr, run_id=secrets.token_hex(8))
+            if first:
+                _log_review_separator()
+                first = False
             log.info("PR #%d: %s start (%s)%s", pr.number,
-                     "re-review after author reply" if pr.reply else "review", pr.head[:7], tag(n))
-        if self.discussion is not None:
-            for pr in batch:  # written down before anything runs: a crash cannot lose the attempt
+                     "re-review after author reply" if pr.reply else "review", pr.head[:7],
+                     self._tag(cat))
+            if self.discussion is not None:  # written down before anything runs: a crash cannot lose the attempt
                 self.state.add_pending(PendingRun(pr.number, pr.head, self.profile, pr.run_id,
                                                   pr.reply.comment_ids if pr.reply else ()))
-        started = [time.monotonic() for _ in batch]
-        workspaces: list[Path | None] = [None] * len(batch)
-        results: list[bool | None] = [None] * len(batch)  # None = not run yet
-        elapsed: list[float | None] = [None] * len(batch)
-
-        # Shared Git metadata (control clone fetches, worktree creation) is only touched here,
-        # one step at a time; a preparation failure fails only that PR.
-        try:
-            if self.workspaces is not None:
-                self.workspaces.sync()
-        except WorkspaceError as exc:
-            log.error("workspace preparation failed: %s", exc)
-            results = [False] * len(batch)
-        for i, pr in enumerate(batch):
-            if results[i] is not None or self.workspaces is None:
+            started = self.clock()
+            self.idle.remove(cat)
+            self.running[cat] = Run(pr, started)
+            self._started += 1
+            try:
+                threading.Thread(target=self._work, args=(cat, pr, path, started),
+                                 name=f"cat-{cat}", daemon=True).start()
+            except (RuntimeError, OSError) as exc:  # no worker will ever report: undo the start
+                log.error("PR #%d: cannot start the cat worker: %s", pr.number, exc)
+                del self.running[cat]
+                self.idle.append(cat)
+                self.idle.sort()
+                self._started -= 1
+                if self.discussion is not None:
+                    self.state.drop_pending(pr.run_id)
+                self.failed[self._key(pr)] = self.clock()
                 continue
-            try:
-                workspaces[i] = self.workspaces.prepare(pr, i + 1)
-            except WorkspaceError as exc:
-                log.error("PR #%d: workspace preparation failed: %s", pr.number, exc)
-                results[i] = False
+        self._drain_nowait()
+        return False
 
-        def run(i: int) -> None:
-            try:
-                results[i] = bool(self.reviewer(self.s, self.repo, batch[i], workspaces[i]))
-            except Exception:
-                log.exception("PR #%d: reviewer crashed", batch[i].number)
-                results[i] = False
-            elapsed[i] = time.monotonic() - started[i]
+    def _work(self, cat: int, pr: PR, path: Path | None, started: float) -> None:
+        """Cat worker thread: runs the reviewer only. State, Git and GitHub are not touched."""
+        try:
+            ok = bool(self.reviewer(self.s, self.repo, pr, path))
+        except Exception:
+            log.exception("PR #%d: reviewer crashed", pr.number)
+            ok = False
+        self.events.put(Done(cat, pr, ok, self.clock() - started))
 
-        pending = [i for i, r in enumerate(results) if r is None]
-        if len(pending) == 1:
-            run(pending[0])
-        elif pending:
-            threads = [threading.Thread(target=run, args=(i,), name=f"cat-{i + 1}", daemon=True)
-                       for i in pending]
-            for thread in threads:
-                thread.start()
-            for thread in threads:  # batch barrier: nobody is replaced while others still review
-                thread.join()
-        for i in range(len(batch)):
-            if elapsed[i] is None:  # failed before a reviewer started
-                elapsed[i] = time.monotonic() - started[i]
-
+    def _finish(self, done: Done) -> None:
+        """Decide and record one finished review, then free its cat and PR."""
+        pr, ok = done.pr, done.ok
         if self.discussion is not None:
-            results = [self._settle(pr, bool(ok)) for pr, ok in zip(batch, results)]
-
-        self.failed = set()
-        for n, (pr, ok) in enumerate(zip(batch, results), 1):
-            if ok:
-                if self.discussion is None:  # no GitHub check available: a clean exit is the record
-                    self.state.add(self._key(pr), self.profile)
-                log.info("PR #%d: review done in %s%s", pr.number, _fmt_elapsed(elapsed[n - 1]),
-                         tag(n))
-            else:
-                self.failed.add(self._key(pr))
-                log.warning("PR #%d: review failed after %s, HEAD stays eligible%s", pr.number,
-                            _fmt_elapsed(elapsed[n - 1]), tag(n))
-        return [bool(ok) for ok in results]
-
-    def _sleep_adaptive(self) -> None:
-        seq = self.s.active if self.mode == ACTIVE else self.s.idle
-        delay = seq[min(self.step, len(seq) - 1)]
-        log.info("nothing to review (%s), next check in %s", self.mode, _fmt(delay))
-        self.sleep(delay)
-        self.step = min(self.step + 1, len(seq) - 1)
+            ok = self._settle(pr, ok)
+        elif ok:  # no GitHub check available: a clean exit is the record
+            self.state.add(self._key(pr), self.profile)
+        if ok:
+            self.failed.pop(self._key(pr), None)
+            log.info("PR #%d: review done in %s%s", pr.number, _fmt_elapsed(done.elapsed),
+                     self._tag(done.cat))
+        else:
+            self.failed[self._key(pr)] = self.clock()
+            log.warning("PR #%d: review failed after %s, HEAD stays eligible (retry after %s)%s",
+                        pr.number, _fmt_elapsed(done.elapsed), _fmt(FAILURE_WAIT),
+                        self._tag(done.cat))
+        del self.running[done.cat]  # only now may the PR be assigned again
+        self.idle.append(done.cat)
+        self.idle.sort()
 
 
 # --------------------------------------------------------------------------- interactive state UI
@@ -2105,8 +2222,8 @@ def main(argv: list[str] | None = None) -> int:
         type=_positive_int,
         default=1,
         metavar="N",
-        help="review up to N waiting PR HEADs at once in a batch (default: 1); the whole "
-        "batch must finish before the next PR check",
+        help="review up to N PR HEADs concurrently (default: 1); each cat takes new work "
+        "only at the regular poll",
     )
     parser.add_argument(
         "-v",
@@ -2141,21 +2258,14 @@ def main(argv: list[str] | None = None) -> int:
             workspaces = Workspaces(repo, args.cat)
             try:
                 workspaces.sync()
-            except WorkspaceError as exc:  # retried before every batch, like a failed review
+            except WorkspaceError as exc:  # retried before every assignment
                 log.warning("workspace not ready yet: %s", exc)
             reviewer = CliReviewer(profile_path(args.profile) if args.profile else "the bundled defaults")
 
-            def list_prs(name: str) -> list[PR]:
-                reviewer.check()  # a non-retryable reviewer error ends the watch
-                return gh_open_prs(name)
-
-            def sleep(seconds: float) -> None:
-                reviewer.check()
-                time.sleep(seconds)
-
-            Watcher(repo, args.profile, settings, state, list_prs, reviewer, sleep=sleep,
-                    cats=args.cat, workspaces=workspaces,
-                    discussion=GhDiscussion(repo)).run_forever()
+            # a non-retryable reviewer error ends the watch once running reviews are recorded
+            Watcher(repo, args.profile, settings, state, gh_open_prs, reviewer,
+                    cats=args.cat, workspaces=workspaces, discussion=GhDiscussion(repo),
+                    fatal=lambda: reviewer.fatal).run_forever()
     except MissCatError as exc:
         print(f"misscat: {exc}", file=sys.stderr)
         return 2
