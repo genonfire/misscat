@@ -122,6 +122,51 @@ class KeepIdsTests(StateFileBase):
         write.assert_not_called()
 
 
+class LateEvidenceTests(StateFileBase):
+    def test_late_evidence_does_not_reorder_latest_head(self):
+        self.write([
+            {"pr": 7, "head": "A", "profile": "luna", "reviewed_at": "2026-10-01T09:00:00Z", "review_ids": [1]},
+            {"pr": 7, "head": "B", "profile": "luna", "reviewed_at": "2026-10-01T10:00:00Z"},
+        ])
+        state = m.State(self.path)
+        state.add(m.Key(7, "A"), "sol", (2,))  # late recovery of A's pending, "now" > 10:00
+        for st in (state, m.State(self.path)):
+            self.assertEqual(st.review_ids(m.Key(7, "A")), {1, 2})
+            self.assertTrue(st.is_latest(m.Key(7, "B")))
+            self.assertFalse(st.is_latest(m.Key(7, "A")))
+            self.assertFalse(st.remove_latest(m.Key(7, "A")))
+        by = {r.profile: r for r in state.records() if r.head == "A"}
+        self.assertEqual(by["sol"].reviewed_at, "2026-10-01T09:00:00Z")
+
+    def test_deleted_head_is_not_resurrected_by_pending_recovery(self):
+        reply = {"pr": 7, "head": HEAD, "profile": "luna", "comment_id": 10,
+                 "handled_at": "2026-10-01T12:00:00Z", "review_id": 5}
+        self.write(rows(("luna", "2026-10-01T10:00:00Z", [1])), [reply])
+        state = m.State(self.path)
+        self.assertTrue(state.remove_latest(m.Key(7, HEAD)))
+        state.add_replies([m.ReplyKey(7, HEAD, 10)], "sol", 6)
+        self.assertEqual(state.reviewed(), set())
+        self.assertEqual(state.records(), [])
+        self.assertIn(6, state.review_ids(m.Key(7, HEAD)))
+        # the next normal review of the HEAD records it once, and the file stays loadable
+        state.add(m.Key(7, HEAD), "luna", (7,))
+        reloaded = m.State(self.path)
+        self.assertEqual(reloaded.reviewed(), {m.Key(7, HEAD)})
+        self.assertEqual(reloaded.review_ids(m.Key(7, HEAD)), {5, 6, 7})
+        self.assertEqual(len(reloaded.records()), 1)
+
+    def test_deleted_head_same_profile_reply_row_cannot_hold_another_id(self):
+        reply = {"pr": 7, "head": HEAD, "profile": "luna", "comment_id": 10,
+                 "handled_at": "2026-10-01T12:00:00Z", "review_id": 5}
+        self.write(rows(("luna", "2026-10-01T10:00:00Z", None)), [reply])
+        state = m.State(self.path)
+        state.remove_latest(m.Key(7, HEAD))
+        with self.assertLogs("misscat", "WARNING"):
+            state.add_replies([m.ReplyKey(7, HEAD, 10)], "luna", 6)
+        self.assertEqual(state.reviewed(), set())
+        m.State(self.path)  # still loads
+
+
 class StateManagerTests(StateFileBase):
     def test_remove_latest_clears_all_profiles_and_keeps_replies(self):
         self.write(

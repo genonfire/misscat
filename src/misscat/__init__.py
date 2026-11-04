@@ -1357,8 +1357,9 @@ class State:
                   ids: tuple[int, ...]) -> list[ReviewRecord]:
         """Records with verified review ids kept for (pr, head); unchanged if all are known.
 
-        Completion is not touched: ids merge into this profile's existing row (its reviewed_at
-        stays) or form a new row, and every other row and id is preserved.
+        Only for a HEAD that is already complete. Ids merge into this profile's existing row
+        (its reviewed_at stays) or form a new row that takes the HEAD's latest existing
+        reviewed_at, so late evidence never changes the logical completion order of HEADs.
         """
         new = tuple(sorted(set(ids) - self.review_ids(Key(pr, head))))
         if not new:
@@ -1367,7 +1368,8 @@ class State:
             if (r.pr, r.head, r.profile) == (pr, head, profile):
                 merged = replace(r, review_ids=tuple(sorted({*r.review_ids, *new})))
                 return [*self._records[:n], merged, *self._records[n + 1:]]
-        return [*self._records, ReviewRecord(pr, head, profile, self._now(), new)]
+        logical = max((r.reviewed_at for r in self._records if r.key() == Key(pr, head)), key=_instant)
+        return [*self._records, ReviewRecord(pr, head, profile, logical, new)]
 
     def _keep_ids(self, pr: int, head: str, profile: str | None, ids: tuple[int, ...]) -> None:
         records = self._with_ids(pr, head, profile, ids)
@@ -1425,8 +1427,21 @@ class State:
                                                  review_id) for k in new)]
         records = self._records
         if not new and keys and review_id:
-            records = self._with_ids(keys[0].pr, keys[0].head, profile, (review_id,))
-        if not new and records is self._records:
+            pr, head = keys[0].pr, keys[0].head
+            if Key(pr, head) in self._reviewed:
+                records = self._with_ids(pr, head, profile, (review_id,))
+            elif review_id not in self.review_ids(Key(pr, head)):
+                # The HEAD's completion was deleted by the user: do not bring it back. Keep the
+                # verified id on an extra reply row of this profile (reply rows survive deletion
+                # and count in review_ids) when its identity is free.
+                free = next((k for k in dict.fromkeys(keys) if (k.pr, k.head, profile, k.comment_id)
+                             not in {(r.pr, r.head, r.profile, r.comment_id) for r in replies}), None)
+                if free is None:
+                    log.warning("PR #%d: review id %d of a deleted HEAD could not be kept", pr, review_id)
+                else:
+                    replies = [*replies, ReplyRecord(free.pr, free.head, profile, free.comment_id,
+                                                     timestamp, review_id)]
+        if not new and records is self._records and replies == self._replies:
             return
         self._write(records, replies, self._pending)
         self._records, self._replies = records, replies
