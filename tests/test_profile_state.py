@@ -155,16 +155,26 @@ class LateEvidenceTests(StateFileBase):
         self.assertEqual(reloaded.review_ids(m.Key(7, HEAD)), {5, 6, 7})
         self.assertEqual(len(reloaded.records()), 1)
 
-    def test_deleted_head_same_profile_reply_row_cannot_hold_another_id(self):
+    def test_deleted_head_same_profile_same_comment_keeps_extra_id(self):
         reply = {"pr": 7, "head": HEAD, "profile": "luna", "comment_id": 10,
                  "handled_at": "2026-10-01T12:00:00Z", "review_id": 5}
         self.write(rows(("luna", "2026-10-01T10:00:00Z", None)), [reply])
         state = m.State(self.path)
         state.remove_latest(m.Key(7, HEAD))
-        with self.assertLogs("misscat", "WARNING"):
-            state.add_replies([m.ReplyKey(7, HEAD, 10)], "luna", 6)
+        state.add_replies([m.ReplyKey(7, HEAD, 10)], "luna", 6)
         self.assertEqual(state.reviewed(), set())
-        m.State(self.path)  # still loads
+        for st in (state, m.State(self.path)):
+            self.assertEqual(st.review_ids(m.Key(7, HEAD)), {5, 6})
+        self.assertEqual(len(self.stored()["replies"]), 1)
+
+    def test_pending_blocks_deletion_until_settled(self):
+        self.write(rows(("luna", "2026-10-01T10:00:00Z", [1])))
+        state = m.State(self.path)
+        state.add_pending(m.PendingRun(7, HEAD, "sol", "rid"))
+        self.assertFalse(state.remove_latest(m.Key(7, HEAD)))
+        self.assertEqual(len(state.records()), 1)
+        state.drop_pending("rid")
+        self.assertTrue(state.remove_latest(m.Key(7, HEAD)))
 
 
 class StateManagerTests(StateFileBase):

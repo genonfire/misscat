@@ -1184,6 +1184,7 @@ class ReplyRecord:
     comment_id: int
     handled_at: str  # UTC ISO 8601, recorded when the triggered review was verified
     review_id: int = 0  # the verified review that answered it
+    extra_review_ids: tuple[int, ...] = ()  # further verified reviews kept for the same comment
 
     def key(self) -> ReplyKey:
         return ReplyKey(self.pr, self.head, self.comment_id)
@@ -1296,9 +1297,12 @@ class State:
                 parsed = datetime.fromisoformat(item["handled_at"].replace("Z", "+00:00"))
                 if parsed.tzinfo is None or parsed.utcoffset() is None:
                     raise ValueError("handled_at must have a timezone")
+                extra = item.get("extra_review_ids", [])
+                if not isinstance(extra, list) or not all(type(i) is int and i > 0 for i in extra):
+                    raise ValueError("extra_review_ids must be a list of ids")
                 self._replies.append(ReplyRecord(item["pr"], item["head"], item["profile"],
                                                  item["comment_id"], item["handled_at"],
-                                                 item.get("review_id", 0)))
+                                                 item.get("review_id", 0), tuple(extra)))
             pending = raw.get("pending", [])
             if not isinstance(pending, list):
                 raise ValueError("pending must be a list")
@@ -1332,7 +1336,8 @@ class State:
         if replies:
             data["replies"] = [
                 {"pr": r.pr, "head": r.head, "profile": r.profile, "comment_id": r.comment_id,
-                 "handled_at": r.handled_at, "review_id": r.review_id}
+                 "handled_at": r.handled_at, "review_id": r.review_id,
+                 **({"extra_review_ids": list(r.extra_review_ids)} if r.extra_review_ids else {})}
                 for r in sorted(replies, key=lambda r: (r.pr, r.head, r.profile or "", r.comment_id))
             ]
         if pending:
@@ -1411,8 +1416,9 @@ class State:
     def review_ids(self, key: Key) -> set[int]:
         """GitHub reviews known to have been submitted for this PR HEAD, by any profile."""
         ids = {i for r in self._records if r.key() == key for i in r.review_ids}
-        ids.update(r.review_id for r in self._replies
-                   if (r.pr, r.head) == (key.pr, key.head) and r.review_id)
+        for r in self._replies:
+            if (r.pr, r.head) == (key.pr, key.head):
+                ids.update(i for i in (r.review_id, *r.extra_review_ids) if i)
         return ids
 
     def add_replies(self, keys: list[ReplyKey], profile: str | None, review_id: int) -> None:
@@ -1432,15 +1438,18 @@ class State:
                 records = self._with_ids(pr, head, profile, (review_id,))
             elif review_id not in self.review_ids(Key(pr, head)):
                 # The HEAD's completion was deleted by the user: do not bring it back. Keep the
-                # verified id on an extra reply row of this profile (reply rows survive deletion
-                # and count in review_ids) when its identity is free.
-                free = next((k for k in dict.fromkeys(keys) if (k.pr, k.head, profile, k.comment_id)
-                             not in {(r.pr, r.head, r.profile, r.comment_id) for r in replies}), None)
-                if free is None:
-                    log.warning("PR #%d: review id %d of a deleted HEAD could not be kept", pr, review_id)
+                # verified id on a reply row of this profile (reply rows survive deletion and
+                # count in review_ids): a new row, or the existing one's extra ids.
+                same = next((n for n, r in enumerate(replies) if (r.pr, r.head, r.profile) ==
+                             (pr, head, profile) and r.comment_id in {k.comment_id for k in keys}), None)
+                if same is not None:
+                    r = replies[same]
+                    replies = [*replies[:same], replace(r, extra_review_ids=tuple(sorted(
+                        {*r.extra_review_ids, review_id}))), *replies[same + 1:]]
                 else:
-                    replies = [*replies, ReplyRecord(free.pr, free.head, profile, free.comment_id,
-                                                     timestamp, review_id)]
+                    k = keys[0]
+                    replies = [*replies, ReplyRecord(k.pr, k.head, profile, k.comment_id, timestamp,
+                                                     review_id)]
         if not new and records is self._records and replies == self._replies:
             return
         self._write(records, replies, self._pending)
@@ -1454,9 +1463,16 @@ class State:
             return False
         return max(group, key=lambda r: _instant(r.reviewed_at)).key() == key
 
+    def has_pending(self, key: Key) -> bool:
+        return any(r.key() == key for r in self._pending)
+
     def remove_latest(self, key: Key) -> bool:
-        """Remove every profile's record of the PR's most recently reviewed HEAD."""
-        if not self.is_latest(key):
+        """Remove every profile's record of the PR's most recently reviewed HEAD.
+
+        Refused while an unsettled review attempt exists for that HEAD: the watcher would
+        settle it into a fresh completion and silently undo the deletion.
+        """
+        if not self.is_latest(key) or self.has_pending(key):
             return False
         records = [r for r in self._records if r.key() != key]
         self._write(records, self._replies, self._pending)
@@ -1951,6 +1967,9 @@ def run_state_ui(state: State, repo: str) -> int:
             return
         if not state.is_latest(r.key()):
             message = "Only the most recently reviewed HEAD of this PR can be removed."
+        elif state.has_pending(r.key()):
+            message = ("This HEAD has an unsettled review attempt. Run the watcher once to settle "
+                       "it, then remove the HEAD.")
         else:
             message = ""
             mode = "confirm"
