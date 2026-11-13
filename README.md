@@ -150,6 +150,46 @@ misscat . sol --cat 3
 - A PR that is being reviewed is not assigned again, even if its HEAD changes meanwhile; the new HEAD is picked up by the first poll after the run was recorded.
 - A HEAD whose review failed is not retried for 5 minutes, and then goes after the other waiting PRs of its priority. A failed workspace sync delays the next poll by at least 5 minutes without penalizing any HEAD; running cats are unaffected.
 
+### Title-based profile routing: `--route`
+
+```bash
+misscat . luna --route=s2:sonnet,s3:terra
+misscat . luna --route=docs:opus
+misscat . luna                    # unchanged: every PR uses luna
+```
+
+`--route=NAME:PROFILE[,NAME:PROFILE...]` reviews a PR with `PROFILE` when its title matches the route's `title_regex`. Every other PR uses the default profile (the positional `profile`, or the bundled defaults). Route names mean nothing to MissCat. Each route's regex is defined under the optional `routes` key of the **default profile's** YAML (here `~/.config/misscat/luna.yml`):
+
+```yaml
+routes:
+  s2:
+    title_regex: '^\[S2/[^]]+\]'
+  s3:
+    title_regex: '^\[S3/[^]]+\]'
+  docs:
+    title_regex: '^\[Docs\]'
+```
+
+With `--route=s2:sonnet,s3:terra`:
+
+| PR title | Reviewer profile |
+| --- | --- |
+| `[S2/Codex] 063_02 Part 01` | sonnet |
+| `[S3/Claude] 063` | terra |
+| `[C/Codex] 063_02`, implementation, everything else | luna |
+
+- Routes are tried **in the order given on the command line**, and the first match wins. The order of keys in the YAML does not matter. Matching uses `re.search` against the current PR title, so anchor your regex (`^`) if you need to.
+- The route is chosen when the PR is dispatched. The matching profile supplies its own `reviewer` (provider, model, args) and `prompt`. Polling schedule, draft inclusion and everything else stay those of the default profile. `--cat N` may run different profiles at the same time.
+- Completion stays per PR + HEAD. The profile that actually ran is recorded as metadata in pending and completed records. Changing a title or a route never re-reviews a completed HEAD.
+- Only the routes named on the command line are validated, at startup. Each of these is a clear error with exit code 2, and MissCat never falls back to the default profile:
+  - a malformed `NAME:PROFILE` or a duplicated name
+  - an unknown route
+  - a missing or invalid `title_regex`
+  - a missing or invalid target profile
+  - a missing reviewer CLI
+- Without `--route`, `routes` is ignored and not validated.
+- A title match is only a hint for choosing the reviewer. The reviewer must still check the PR's actual changes under the repository's `REVIEW.md`.
+
 ### Using `.` for the current repository
 
 `.` **always means the GitHub repository of the current Git checkout's `origin` remote**; `upstream` and other remotes are never used.
@@ -265,7 +305,7 @@ reviewer:
     - model_reasoning_effort=medium
 ```
 
-The selected local profile overrides the bundled defaults.
+The selected local profile overrides the bundled defaults. A profile may also define optional `routes` used only by [`--route`](#title-based-profile-routing---route).
 
 When creating a local profile, use `default.yml` as the reference and specify `provider`, `model`, and `args` explicitly for that reviewer CLI. Do not rely on `args` inherited from a different provider.
 
