@@ -52,7 +52,7 @@ from urllib.parse import urlsplit
 
 import yaml
 
-__version__ = "1.7.0"
+__version__ = "1.7.1"
 
 log = logging.getLogger("misscat")
 # Reviewer tool activity (exec/MCP/tool/web search). Successful lines show only with --loud;
@@ -190,11 +190,70 @@ def _load_default_config() -> dict:
     return data
 
 
-def load_settings(profile: str | None) -> Settings:
+def load_config(profile: str | None) -> dict:
+    """The bundled defaults with the named profile merged over them."""
     cfg = _load_default_config()
     if profile is not None:
         cfg = deep_merge(cfg, _load_yaml(profile_path(profile)))
-    return build_settings(cfg)
+    return cfg
+
+
+def load_settings(profile: str | None) -> Settings:
+    return build_settings(load_config(profile))
+
+
+# --------------------------------------------------------------------------- title routes
+
+
+class Route(NamedTuple):
+    """`--route NAME:PROFILE`: PRs whose title matches `pattern` are reviewed with `profile`.
+    Route names have no built-in meaning; their regexes come from the default profile."""
+    name: str
+    pattern: re.Pattern
+    profile: str
+    settings: Settings
+    reviewer: "Callable[[Settings, str, PR, Path | None], bool] | None" = None  # None: the Watcher's
+
+
+def parse_route_arg(value: str) -> list[tuple[str, str]]:
+    """`s2:sonnet,s3:terra` -> [("s2", "sonnet"), ("s3", "terra")], in the given order."""
+    pairs: list[tuple[str, str]] = []
+    for item in value.split(","):
+        name, sep, profile = item.partition(":")
+        if not sep or not name or not profile or ":" in profile or any(c.isspace() for c in item):
+            raise argparse.ArgumentTypeError(
+                f"expected NAME:PROFILE[,NAME:PROFILE...], got {item!r}")
+        if name in {n for n, _ in pairs}:
+            raise argparse.ArgumentTypeError(f"route {name!r} is given more than once")
+        pairs.append((name, profile))
+    return pairs
+
+
+def load_routes(cfg: dict, wanted: list[tuple[str, str]], source: str) -> tuple[Route, ...]:
+    """Validate and load only the routes named on the command line, in that order.
+    `cfg` is the default profile's config, `source` names where its `routes` must be defined."""
+    defined = cfg.get("routes")
+    if not isinstance(defined, dict) or not defined:
+        raise ConfigError(f"--route needs a `routes` mapping in {source}")
+    routes = []
+    for name, profile in wanted:
+        entry = defined.get(name)
+        if entry is None:
+            raise ConfigError(f"unknown route {name!r}: {source} defines "
+                              + ", ".join(sorted(str(k) for k in defined)))
+        regex = entry.get("title_regex") if isinstance(entry, dict) else None
+        if not isinstance(regex, str) or not regex:
+            raise ConfigError(f"routes.{name}.title_regex in {source} must be a non-empty string")
+        try:
+            pattern = re.compile(regex)
+        except re.error as exc:
+            raise ConfigError(f"routes.{name}.title_regex in {source} is not a valid regex: {exc}") from exc
+        try:
+            settings = load_settings(profile)
+        except ConfigError as exc:
+            raise ConfigError(f"route {name}: {exc}") from exc
+        routes.append(Route(name, pattern, profile, settings))
+    return tuple(routes)
 
 
 # --------------------------------------------------------------------------- bundled profiles
@@ -1570,6 +1629,7 @@ class Done(NamedTuple):
     pr: PR
     ok: bool
     elapsed: float
+    profile: str | None  # the profile that actually ran this review (metadata)
 
 
 class Watcher:
@@ -1608,8 +1668,11 @@ class Watcher:
         discussion: GhDiscussion | None = None,
         clock: Callable[[], float] = time.monotonic,
         fatal: Callable[[], str | None] = lambda: None,
+        routes: tuple[Route, ...] = (),
     ):
+        # `profile`/`settings` are the default reviewer and the only scheduling settings
         self.repo, self.profile, self.s, self.state = repo, profile, settings, state
+        self.routes = routes  # checked in order at dispatch; the first title match wins
         self.discussion = discussion  # None disables same-HEAD reply re-reviews
         self._checked: dict[tuple[int, str], str] = {}  # (PR, HEAD) -> updated_at with no reply due
         self.list_prs, self.reviewer, self.clock, self.fatal = list_prs, reviewer, clock, fatal
@@ -1678,6 +1741,14 @@ class Watcher:
         else:
             log.info("nothing to review (%s), next check in %s", self.mode, _fmt(delay))
         return delay
+
+    def _select(self, pr: PR) -> tuple[str | None, Settings, Callable[[Settings, str, PR, Path | None], bool]]:
+        """Profile, settings and reviewer for one dispatched PR: the first route whose
+        title regex matches, else the default profile."""
+        for route in self.routes:
+            if route.pattern.search(pr.title):
+                return route.profile, route.settings, route.reviewer or self.reviewer
+        return self.profile, self.s, self.reviewer
 
     def _key(self, pr: PR) -> Key:
         return Key(pr.number, pr.head)  # self.profile is only recorded as metadata
@@ -1802,9 +1873,9 @@ class Watcher:
                     continue
             self.state.drop_pending(run.run_id)  # nothing was submitted: eligible again
 
-    def _settle(self, pr: PR, cli_ok: bool) -> bool:
+    def _settle(self, pr: PR, cli_ok: bool, profile: str | None) -> bool:
         """Decide a finished run against GitHub. True = recorded as done, False = failed/pending."""
-        run = PendingRun(pr.number, pr.head, self.profile, pr.run_id,
+        run = PendingRun(pr.number, pr.head, profile, pr.run_id,
                          pr.reply.comment_ids if pr.reply else (), cli_ok)
         if self.discussion is None:
             return cli_ok
@@ -1835,7 +1906,7 @@ class Watcher:
             log.error("PR #%d: review of %s has no submitted review carrying this run's id; "
                       "it will be retried", pr.number, pr.head[:7])
             return False
-        self.state.add(self._key(pr), self.profile, tuple(sorted(r.id for r in found)))
+        self.state.add(self._key(pr), profile, tuple(sorted(r.id for r in found)))
         self.state.drop_pending(pr.run_id)
         return True
 
@@ -1905,21 +1976,25 @@ class Watcher:
                 break
             if self.discussion is not None:  # one nonce per run: proves which run submitted a review
                 pr = replace(pr, run_id=secrets.token_hex(8))
+            profile, settings, reviewer = self._select(pr)
             if first:
                 _log_review_separator()
                 first = False
-            log.info("PR #%d: %s start (%s)%s", pr.number,
+            log.info("PR #%d: %s start (%s)%s%s", pr.number,
                      "re-review after author reply" if pr.reply else "review", pr.head[:7],
-                     self._tag(cat))
+                     self._tag(cat),
+                     f" [{profile or 'default'} {settings.provider}/{settings.model}]"
+                     if self.routes else "")
             if self.discussion is not None:  # written down before anything runs: a crash cannot lose the attempt
-                self.state.add_pending(PendingRun(pr.number, pr.head, self.profile, pr.run_id,
+                self.state.add_pending(PendingRun(pr.number, pr.head, profile, pr.run_id,
                                                   pr.reply.comment_ids if pr.reply else ()))
             started = self.clock()
             self.idle.remove(cat)
             self.running[cat] = Run(pr, started)
             self._started += 1
             try:
-                threading.Thread(target=self._work, args=(cat, pr, path, started),
+                threading.Thread(target=self._work,
+                                 args=(cat, pr, path, started, profile, settings, reviewer),
                                  name=f"cat-{cat}", daemon=True).start()
             except (RuntimeError, OSError) as exc:  # no worker will ever report: undo the start
                 log.error("PR #%d: cannot start the cat worker: %s", pr.number, exc)
@@ -1934,22 +2009,23 @@ class Watcher:
         self._drain_nowait()
         return False
 
-    def _work(self, cat: int, pr: PR, path: Path | None, started: float) -> None:
-        """Cat worker thread: runs the reviewer only. State, Git and GitHub are not touched."""
+    def _work(self, cat: int, pr: PR, path: Path | None, started: float, profile: str | None,
+              settings: Settings, reviewer: Callable[[Settings, str, PR, Path | None], bool]) -> None:
+        """Cat worker thread: runs the selected reviewer only. State, Git and GitHub are not touched."""
         try:
-            ok = bool(self.reviewer(self.s, self.repo, pr, path))
+            ok = bool(reviewer(settings, self.repo, pr, path))
         except Exception:
             log.exception("PR #%d: reviewer crashed", pr.number)
             ok = False
-        self.events.put(Done(cat, pr, ok, self.clock() - started))
+        self.events.put(Done(cat, pr, ok, self.clock() - started, profile))
 
     def _finish(self, done: Done) -> None:
         """Decide and record one finished review, then free its cat and PR."""
         pr, ok = done.pr, done.ok
         if self.discussion is not None:
-            ok = self._settle(pr, ok)
+            ok = self._settle(pr, ok, done.profile)
         elif ok:  # no GitHub check available: a clean exit is the record
-            self.state.add(self._key(pr), self.profile)
+            self.state.add(self._key(pr), done.profile)
         if ok:
             self.failed.pop(self._key(pr), None)
             log.info("PR #%d: review done in %s%s", pr.number, _fmt_elapsed(done.elapsed),
@@ -2195,7 +2271,9 @@ def main(argv: list[str] | None = None) -> int:
             "A review is complete per PR + HEAD whatever profile ran it, e.g. `misscat . opencode`\n"
             "(OpenCode: reviewer.provider: opencode in ~/.config/misscat/opencode.yml).\n"
             "'.' as the repository always means the current Git repository's `origin` remote\n"
-            "(github.com only), e.g. `misscat .`, `misscat . luna`, `misscat state .`.\n\n"
+            "(github.com only), e.g. `misscat .`, `misscat . luna`, `misscat state .`.\n"
+            "`misscat . luna --route=s2:sonnet,s3:terra` reviews PRs whose title matches\n"
+            "routes.s2.title_regex (then s3) in luna.yml with sonnet (terra); all others use luna.\n\n"
             "Requirements and limits:\n"
             "  - Git must authenticate to the repository (Git/SSH auth, or run\n"
             "    `gh auth setup-git` for HTTPS). MissCat stores no credentials.\n"
@@ -2226,6 +2304,14 @@ def main(argv: list[str] | None = None) -> int:
         "only at the regular poll",
     )
     parser.add_argument(
+        "--route",
+        type=parse_route_arg,
+        metavar="NAME:PROFILE[,NAME:PROFILE...]",
+        help="review PRs whose title matches routes.NAME.title_regex (defined in the default "
+        "profile's YAML) with PROFILE; routes are tried in the given order and the first match "
+        "wins; every other PR uses the default profile. Without --route, routes are ignored",
+    )
+    parser.add_argument(
         "-v",
         "--version",
         action="version",
@@ -2248,24 +2334,37 @@ def main(argv: list[str] | None = None) -> int:
         repo = resolve_repo_arg(args.repo)  # canonicalize once; everything below uses this form
         with repository_lock(repo):
             ensure_initial_profiles()
-            settings = load_settings(args.profile)
-            for tool in ("git", "gh", EXECUTABLES[settings.provider]):
+            cfg = load_config(args.profile)
+            settings = build_settings(cfg)
+            base_path = profile_path(args.profile) if args.profile else "the bundled defaults"
+            routes = load_routes(cfg, args.route, str(base_path)) if args.route else ()
+            tools = ["git", "gh", EXECUTABLES[settings.provider]]
+            tools += [EXECUTABLES[r.settings.provider] for r in routes]
+            for tool in dict.fromkeys(tools):
                 if shutil.which(tool) is None:
                     raise MissCatError(f"required CLI not found on PATH: {tool}")
             state = State(state_path(repo))  # v1 resets; corrupt/unknown files fail safely
             log.info("watching %s with %s/%s (profile: %s)", repo, settings.provider,
                      settings.model, args.profile or "default")
+            for r in routes:
+                log.info("route %s: /%s/ -> %s (%s/%s)", r.name, r.pattern.pattern, r.profile,
+                         r.settings.provider, r.settings.model)
             workspaces = Workspaces(repo, args.cat)
             try:
                 workspaces.sync()
             except WorkspaceError as exc:  # retried before every assignment
                 log.warning("workspace not ready yet: %s", exc)
-            reviewer = CliReviewer(profile_path(args.profile) if args.profile else "the bundled defaults")
+            # one reviewer per profile name, so fatal advice names the profile that actually ran
+            reviewers: dict[str | None, CliReviewer] = {args.profile: CliReviewer(base_path)}
+            for r in routes:
+                reviewers.setdefault(r.profile, CliReviewer(profile_path(r.profile)))
+            routes = tuple(r._replace(reviewer=reviewers[r.profile]) for r in routes)
 
             # a non-retryable reviewer error ends the watch once running reviews are recorded
-            Watcher(repo, args.profile, settings, state, gh_open_prs, reviewer,
+            Watcher(repo, args.profile, settings, state, gh_open_prs, reviewers[args.profile],
                     cats=args.cat, workspaces=workspaces, discussion=GhDiscussion(repo),
-                    fatal=lambda: reviewer.fatal).run_forever()
+                    fatal=lambda: next((r.fatal for r in reviewers.values() if r.fatal), None),
+                    routes=routes).run_forever()
     except MissCatError as exc:
         print(f"misscat: {exc}", file=sys.stderr)
         return 2
