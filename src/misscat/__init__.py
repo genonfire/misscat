@@ -2249,7 +2249,6 @@ def run_compact(repo: str) -> int:
     """Delete State rows of every PR that is not open on GitHub now. No prompt: the explicit
     `--compact` is the user's deletion. Nothing changes if the open-PR list may be incomplete."""
     with repository_lock(repo):
-        state = State(state_path(repo))
         try:
             open_prs = gh_open_prs(repo, COMPACT_LIMIT)
         except GhError as exc:
@@ -2257,6 +2256,7 @@ def run_compact(repo: str) -> int:
         if len(open_prs) >= COMPACT_LIMIT:
             raise StateError(f"{len(open_prs)} open PRs: the list may be incomplete, state unchanged")
         keep = {p.number for p in open_prs}
+        state = State(state_path(repo))  # only now: loading may rewrite a v1 file (its reset)
         prs, reviews, replies = state.compact(keep)
         kept = len({r.pr for r in state.records()})
         print(f"removed {prs} PRs ({reviews} review rows, {replies} reply rows); kept {kept} PRs")

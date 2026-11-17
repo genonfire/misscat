@@ -275,6 +275,16 @@ class CompactTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertEqual(self.path.read_bytes(), before)
 
+    def test_v1_file_is_untouched_when_open_list_fails_or_is_incomplete(self):
+        v1 = json.dumps({"version": 1, "reviewed": [{"pr": 1, "head": "a", "profile": "luna"}]})
+        self.path.write_text(v1)
+        before = self.path.read_bytes()
+        self.assertEqual(self.compact(error=misscat.GhError("HTTP 502"))[0], 2)
+        self.assertEqual(self.path.read_bytes(), before)
+        with mock.patch.object(misscat, "COMPACT_LIMIT", 1):
+            self.assertEqual(self.compact([open_pr(1)])[0], 2)
+        self.assertEqual(self.path.read_bytes(), before)
+
     def test_nothing_closed_does_not_rewrite(self):
         before = self.path.read_bytes()
         self.assertEqual(self.compact([open_pr(n) for n in (1, 2, 3)])[0], 0)
