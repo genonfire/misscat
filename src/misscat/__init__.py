@@ -461,9 +461,9 @@ URGENT_LABEL = "urgent"
 NO_REVIEW_LABEL = "no-review"
 
 
-def gh_open_prs(repo: str) -> list[PR]:
+def gh_open_prs(repo: str, limit: int = 200) -> list[PR]:
     cmd = [
-        "gh", "pr", "list", "--repo", repo, "--state", "open", "--limit", "200",
+        "gh", "pr", "list", "--repo", repo, "--state", "open", "--limit", str(limit),
         "--json", "number,headRefOid,isDraft,url,title,labels,author,updatedAt",
     ]
     try:
@@ -1543,6 +1543,25 @@ class State:
         self._reviewed.remove(key)
         return True
 
+    def compact(self, keep_prs: set[int]) -> tuple[int, int, int]:
+        """Delete every review and reply row of PRs outside `keep_prs`, in one write.
+
+        Only for an explicit user `misscat state --compact`. PRs with an unsettled review
+        attempt are always kept so the watcher can still settle them.
+        Returns (removed PRs, removed review rows, removed reply rows).
+        """
+        keep = set(keep_prs) | {r.pr for r in self._pending}
+        records = [r for r in self._records if r.pr in keep]
+        replies = [r for r in self._replies if r.pr in keep]
+        gone = {r.pr for r in (*self._records, *self._replies)} - keep
+        removed = (len(gone), len(self._records) - len(records), len(self._replies) - len(replies))
+        if gone:
+            self._write(records, replies, self._pending)
+            self._records, self._replies = records, replies
+            self._reviewed = {r.key() for r in records}
+            self._handled = {r.key() for r in replies}
+        return removed
+
 
 @contextmanager
 def repository_lock(repo: str):
@@ -2223,14 +2242,40 @@ def run_state_ui(state: State, repo: str) -> int:
     return 0
 
 
+COMPACT_LIMIT = 5000  # open PRs listed by `state --compact`; a full page means "maybe incomplete"
+
+
+def run_compact(repo: str) -> int:
+    """Delete State rows of every PR that is not open on GitHub now. No prompt: the explicit
+    `--compact` is the user's deletion. Nothing changes if the open-PR list may be incomplete."""
+    with repository_lock(repo):
+        state = State(state_path(repo))
+        try:
+            open_prs = gh_open_prs(repo, COMPACT_LIMIT)
+        except GhError as exc:
+            raise StateError(f"cannot list open PRs, state unchanged: {exc}") from exc
+        if len(open_prs) >= COMPACT_LIMIT:
+            raise StateError(f"{len(open_prs)} open PRs: the list may be incomplete, state unchanged")
+        keep = {p.number for p in open_prs}
+        prs, reviews, replies = state.compact(keep)
+        kept = len({r.pr for r in state.records()})
+        print(f"removed {prs} PRs ({reviews} review rows, {replies} reply rows); kept {kept} PRs")
+        return 0
+
+
 def run_state(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="misscat state", description="Interactively inspect/remove completed review HEADs."
     )
     parser.add_argument("repo", metavar="owner/repo|.")
+    parser.add_argument("--compact", action="store_true",
+                        help="delete the state of every PR that is no longer open on GitHub "
+                        "(runs immediately, no prompt; stop the watcher first)")
     args = parser.parse_args(argv)
     try:
         repo = resolve_repo_arg(args.repo)
+        if args.compact:
+            return run_compact(repo)
         if not (sys.stdin.isatty() and sys.stdout.isatty()):
             raise StateError("state manager needs an interactive terminal (TTY)")
         with repository_lock(repo):
@@ -2267,7 +2312,8 @@ def main(argv: list[str] | None = None) -> int:
         epilog=(
             "profile is a name: 'sol' loads ~/.config/misscat/sol.yml over the defaults.\n"
             "`misscat init [--force]` installs bundled profiles.\n"
-            "`misscat state owner/repo` opens the state manager.\n"
+            "`misscat state owner/repo` opens the state manager; `--compact` deletes the state\n"
+            "of PRs that are no longer open.\n"
             "A review is complete per PR + HEAD whatever profile ran it, e.g. `misscat . opencode`\n"
             "(OpenCode: reviewer.provider: opencode in ~/.config/misscat/opencode.yml).\n"
             "'.' as the repository always means the current Git repository's `origin` remote\n"
