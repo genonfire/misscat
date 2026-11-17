@@ -197,7 +197,7 @@ With `--route=s2:sonnet,s3:terra`:
 ```bash
 misscat .           # watch origin's repository with the default profile
 misscat . luna      # same repository, luna profile
-misscat state .     # manage that repository's review state
+misscat state .     # manage that repository's review state (--compact: drop closed PRs)
 ```
 
 MissCat prints `resolved . -> owner/repo` and then behaves exactly as if you had typed that name (same state, lock and workspace). It works from subdirectories and worktrees, and understands `git@github.com:owner/repo.git`, `https://github.com/owner/repo(.git)` and `ssh://git@github.com/owner/repo(.git)`. It fails, before touching any state, when outside a Git repository, when `origin` is missing, or when `origin` is not on `github.com` (SSH host aliases are not interpreted).
@@ -225,6 +225,16 @@ misscat state genonfire/typewriter
 The list shows the most recently completed reviews first, across all PRs and profiles (sorted by `reviewed_at`; the stored State order is unchanged). Use **↑/↓** to select any completed review, **Enter** for its full HEAD SHA, profile, and local review completion time, and **Esc/Q** to exit. **Delete** or **Backspace** only operates on the *most recently reviewed HEAD of that PR* (by `reviewed_at`), with a `[y/N]` prompt that names how many records (one per profile that recorded the HEAD) are removed; reply history is kept. A HEAD with an unsettled review attempt cannot be removed until the watcher has settled it. Older HEADs are read-only until newer ones in that PR have been removed. Nothing is deleted on Enter or when you decline confirmation.
 
 The manager works from local State JSON; it does not call GitHub. Removing a HEAD's records (all profiles) makes that PR/HEAD eligible for review again, **but only when the HEAD is the PR's current open HEAD** at the next watcher run. Removing historical HEADs does not trigger review of historical commits.
+
+### Compacting state
+
+State keeps every reviewed HEAD of every PR, so a busy repository's JSON keeps growing (and is rewritten on every review). Stop the watcher, then:
+
+```bash
+misscat state genonfire/typewriter --compact
+```
+
+This runs immediately, without a prompt: it asks GitHub for the repository's open PRs and **permanently deletes** the review and reply records of every other (closed or merged) PR, then prints how many PRs and rows were removed. Unlike the interactive manager it calls GitHub (`gh`). PRs with an unsettled review attempt are kept. If GitHub cannot be reached, or the open-PR list may be incomplete (5,000 or more open PRs), nothing is changed. If a compacted PR is reopened later, its current HEAD is reviewed again.
 
 ### State v2 and process safety
 

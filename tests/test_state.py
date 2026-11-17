@@ -202,3 +202,98 @@ class StateManagerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def open_pr(number):
+    return misscat.PR(number, "h", False, f"https://github.com/{REPO}/pull/{number}", "t")
+
+
+class CompactTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.config = Path(tmp.name) / ".config" / "misscat"
+        for name, value in (("CONFIG_DIR", self.config),
+                            ("LOCK_ROOT", Path(tmp.name) / ".cache" / "locks")):
+            patcher = mock.patch.object(misscat, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.path = misscat.state_path(REPO)
+        self.config.mkdir(parents=True)
+        self.path.write_text(json.dumps({
+            "version": 2,
+            "reviewed": [row("a", "2026-10-02T09:00:00Z", pr=1),
+                         row("b", "2026-10-02T10:00:00Z", pr=1, profile="sol"),
+                         row("c", "2026-10-02T09:00:00Z", pr=2),
+                         row("d", "2026-10-02T09:00:00Z", pr=3),
+                         row("e", "2026-10-02T09:00:00Z", pr=4)],
+            "replies": [{"pr": 2, "head": "c", "profile": "luna", "comment_id": 7,
+                         "handled_at": "2026-10-02T09:30:00Z", "review_id": 70},
+                        {"pr": 3, "head": "d", "profile": "luna", "comment_id": 8,
+                         "handled_at": "2026-10-02T09:30:00Z", "review_id": 80}],
+            "pending": [{"pr": 4, "head": "e2", "profile": "luna", "run_id": "r",
+                         "comment_ids": [], "ok": False}],
+        }))
+
+    def compact(self, prs=None, error=None):
+        fake = mock.Mock(return_value=prs, side_effect=error)
+        with mock.patch.object(misscat, "gh_open_prs", fake), \
+                mock.patch("sys.stdin.isatty", return_value=False), \
+                mock.patch("builtins.input", side_effect=AssertionError("prompted")):
+            code = misscat.main(["state", REPO, "--compact"])
+        return code, fake
+
+    def test_drops_closed_prs_and_keeps_open_and_pending_ones_without_prompt(self):
+        code, fake = self.compact([open_pr(1)])
+        self.assertEqual(code, 0)
+        fake.assert_called_once_with(REPO, misscat.COMPACT_LIMIT)
+        raw = json.loads(self.path.read_text())
+        self.assertEqual(sorted((r["pr"], r["head"]) for r in raw["reviewed"]),
+                         [(1, "a"), (1, "b"), (4, "e")])  # PR 4 has an unsettled run
+        self.assertNotIn("replies", raw)
+        self.assertEqual(len(raw["pending"]), 1)
+        with misscat.repository_lock(REPO):
+            state = misscat.State(self.path)
+        self.assertEqual(state.reviewed(), {misscat.Key(1, "a"), misscat.Key(1, "b"),
+                                            misscat.Key(4, "e")})
+
+    def test_open_pr_replies_are_kept(self):
+        self.assertEqual(self.compact([open_pr(2)])[0], 0)
+        raw = json.loads(self.path.read_text())
+        self.assertEqual([r["comment_id"] for r in raw["replies"]], [7])
+
+    def test_possibly_incomplete_open_list_changes_nothing(self):
+        before = self.path.read_bytes()
+        with mock.patch.object(misscat, "COMPACT_LIMIT", 2):
+            code, _ = self.compact([open_pr(1), open_pr(2)])
+        self.assertEqual(code, 2)
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_gh_failure_changes_nothing(self):
+        before = self.path.read_bytes()
+        code, _ = self.compact(error=misscat.GhError("boom"))
+        self.assertEqual(code, 2)
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_v1_file_is_untouched_when_open_list_fails_or_is_incomplete(self):
+        v1 = json.dumps({"version": 1, "reviewed": [{"pr": 1, "head": "a", "profile": "luna"}]})
+        self.path.write_text(v1)
+        before = self.path.read_bytes()
+        self.assertEqual(self.compact(error=misscat.GhError("HTTP 502"))[0], 2)
+        self.assertEqual(self.path.read_bytes(), before)
+        with mock.patch.object(misscat, "COMPACT_LIMIT", 1):
+            self.assertEqual(self.compact([open_pr(1)])[0], 2)
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_nothing_closed_does_not_rewrite(self):
+        before = self.path.read_bytes()
+        self.assertEqual(self.compact([open_pr(n) for n in (1, 2, 3)])[0], 0)
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_refused_while_watcher_holds_the_lock(self):
+        before = self.path.read_bytes()
+        with misscat.repository_lock(REPO):
+            code, fake = self.compact([open_pr(1)])
+        self.assertEqual(code, 2)
+        fake.assert_not_called()
+        self.assertEqual(self.path.read_bytes(), before)
