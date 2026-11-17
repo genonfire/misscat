@@ -14,7 +14,7 @@ from unittest import mock
 
 import misscat
 from badcat import cli
-from badcat.github import GhClient, OpenPR
+from badcat.github import GhClient, OpenPR, TransientGhError
 from badcat.protocol import (BLOCKED, INVALID, PLUS1, READY, WAITING, Review, evaluate,
                              parse_header)
 
@@ -191,6 +191,8 @@ class FakeClient:
 
     def merge(self, n, sha):
         self.calls.append(("merge", n, sha))
+        if isinstance(self.merge_error, Exception):
+            raise self.merge_error
         if self.merge_error:
             raise misscat.GhError(self.merge_error)
         self.raw["merged"] = True
@@ -505,6 +507,92 @@ class WatcherTests(unittest.TestCase):
         self.assertTrue(any("merged" in m for m in out))
         self.assertNotIn("7", w.state.prs)
 
+    def test_transient_merge_failure_retries_same_head_on_next_poll(self):
+        c = FakeClient()
+        c.merge_error = TransientGhError("gh: Server Error (HTTP 502)")
+        w = self.watcher(c, merge=True)
+        with self.assertLogs("badcat", level="DEBUG") as cm:
+            logging_marker()
+            d1 = w.cycle()
+            d2 = w.cycle()  # still failing: retried, but logged once
+        warnings = [m for m in cm.output if "WARNING" in m]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("merge failed temporarily, will re-verify and retry", warnings[0])
+        self.assertIn("HTTP 502", warnings[0])
+        self.assertNotIn("merge rejected", warnings[0])
+        self.assertGreaterEqual(d1, cli.POLL_INTERVAL)
+        self.assertGreaterEqual(d2, d1)
+        self.assertEqual(len(c.calls), 2)
+        self.assertEqual(w.rejected, {})
+        c.merge_error = None  # GitHub recovers; same PR, HEAD, labels and state
+        _, out = self.run_cycle(w)
+        self.assertEqual(c.calls, [("merge", 7, A)] * 3)
+        self.assertTrue(any("merged (squash" in m for m in out))
+        self.assertNotIn("7", w.state.prs)
+        self.assertEqual(w.errors, 0)
+        self.run_cycle(w)
+        self.assertEqual(len(c.calls), 3)  # merged once, never again
+
+    def test_transient_failure_after_github_merged_is_success_without_duplicate(self):
+        c = FakeClient()
+        def merged_but_502(n, sha):
+            c.calls.append(("merge", n, sha))
+            c.raw["merged"] = True
+            raise TransientGhError("gh: Server Error (HTTP 502)")
+        c.merge = merged_but_502
+        w = self.watcher(c, merge=True)
+        _, out = self.run_cycle(w)
+        self.assertTrue(any("PR #7: merged" in m for m in out))
+        self.assertFalse(any("WARNING" in m for m in out))
+        self.assertNotIn("7", w.state.prs)
+        self.run_cycle(w)
+        self.assertEqual(len(c.calls), 1)
+
+    def test_retry_after_transient_failure_rechecks_every_gate(self):
+        def blocker(c):
+            c.review_list = seq(rev("+1", A), rev("+2", A), rev("-1", A))
+        def no_review(c):
+            c.raw["labels"] = [{"name": "no-review"}]
+        def ci_failure(c):
+            c.runs[0] = {**c.runs[0], "conclusion": "failure"}
+        def head_moved(c):
+            c.raw["head"] = {"sha": B}
+        def closed(c):
+            c.raw["state"] = "closed"
+        def merged_elsewhere(c):
+            c.raw["merged"] = True
+            c.open = False
+        def not_mergeable(c):
+            c.raw.update(mergeable=False, mergeable_state="dirty")
+        for change in (blocker, no_review, ci_failure, head_moved, closed, merged_elsewhere,
+                       not_mergeable):
+            with self.subTest(change.__name__):
+                c = FakeClient()
+                c.merge_error = TransientGhError("gh: Server Error (HTTP 502)")
+                w = self.watcher(c, merge=True)
+                with self.assertLogs("badcat", level="WARNING"):
+                    w.cycle()
+                c.merge_error = None
+                change(c)
+                self.run_cycle(w)
+                self.assertEqual(len(c.calls), 1)
+
+    def test_transient_failure_on_one_pr_does_not_stop_others(self):
+        c = FakeClient()
+        c.open_prs = lambda: [OpenPR(7, A, False, "u", "t"), OpenPR(8, A, False, "u", "t")]
+        merged = []
+        def merge(n, sha):
+            c.calls.append(("merge", n, sha))
+            if n == 7:
+                raise TransientGhError("gh: Server Error (HTTP 502)")
+            merged.append(n)
+        c.merge = merge
+        w = self.watcher(c, merge=True)
+        _, out = self.run_cycle(w)
+        self.assertEqual(merged, [8])
+        self.assertTrue(any("PR #8: merged" in m for m in out))
+        self.assertTrue(any("PR #7: merge failed temporarily" in m for m in out))
+
     def test_first_sight_records_history_then_announces_new_reviews_by_first_line(self):
         first = seq(rev("+1", A))
         c = FakeClient(reviews=first)
@@ -794,10 +882,48 @@ class GhClientTests(unittest.TestCase):
 
     def test_merge_request_is_squash_with_sha_guard(self):
         client = GhClient("o/r")
-        with mock.patch.object(client, "_api") as api:
+        done = subprocess.CompletedProcess([], 0, "HTTP/2.0 200 OK\n\n{}", "")
+        with mock.patch("badcat.github.subprocess.run", return_value=done) as run_:
             client.merge(3, A)
-        api.assert_called_once_with("repos/o/r/pulls/3/merge", "-X", "PUT",
-                                    "-f", "merge_method=squash", "-f", f"sha={A}")
+        cmd = run_.call_args.args[0]
+        self.assertEqual(cmd[:3], ["gh", "api", "--include"])
+        self.assertEqual(cmd[-1], "repos/o/r/pulls/3/merge")
+        for arg in ("PUT", "merge_method=squash", f"sha={A}"):
+            self.assertIn(arg, cmd)
+
+    def test_merge_failures_are_classified_by_http_status_not_message(self):
+        def fail(stdout, code=1, stderr="gh: whatever (HTTP 999)"):
+            return subprocess.CompletedProcess([], code, stdout, stderr)
+        head = lambda status, *headers: "\n".join(
+            [f"HTTP/2.0 {status} X", "Content-Type: application/json", *headers, "", "{}"])
+        cases = {
+            "502": (fail(head(502)), True),
+            "503 http1.1": (fail(head(503).replace("HTTP/2.0", "HTTP/1.1")), True),
+            "429": (fail(head(429)), True),
+            "403 rate limit": (fail(head(403, "X-Ratelimit-Remaining: 0")), True),
+            "403 secondary limit": (fail(head(403, "Retry-After: 60")), True),
+            "no response (connection reset)": (fail("", stderr="read: connection reset by peer"), True),
+            "403 forbidden": (fail(head(403, "X-Ratelimit-Remaining: 4000")), False),
+            "405 draft/protection": (fail(head(405)), False),
+            "409 stale sha": (fail(head(409)), False),
+            "422": (fail(head(422)), False),
+            "auth required (exit 4)": (fail("", code=4), False),
+        }
+        for name, (proc, transient) in cases.items():
+            with self.subTest(name):
+                client = GhClient("o/r")
+                with mock.patch("badcat.github.subprocess.run", return_value=proc):
+                    with self.assertRaises(misscat.GhError) as cm:
+                        client.merge(3, A)
+                self.assertEqual(isinstance(cm.exception, TransientGhError), transient)
+        sp = sys.modules["badcat.github"].subprocess
+        with mock.patch("badcat.github.subprocess.run", side_effect=sp.TimeoutExpired("gh", 1)):
+            with self.assertRaises(TransientGhError):
+                GhClient("o/r").merge(3, A)
+        with mock.patch("badcat.github.subprocess.run", side_effect=FileNotFoundError("gh")):
+            with self.assertRaises(misscat.GhError) as cm:
+                GhClient("o/r").merge(3, A)
+            self.assertNotIsInstance(cm.exception, TransientGhError)
 
     def test_timeout_and_nonzero_become_gherror(self):
         client = GhClient("o/r")

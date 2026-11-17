@@ -15,7 +15,7 @@ from typing import Callable, Optional
 from misscat import GhError, MissCatError, _write_atomic, resolve_repo_arg
 
 from . import __version__
-from .github import NO_REVIEW_LABEL, GhClient, OpenPR, pr_labels
+from .github import NO_REVIEW_LABEL, GhClient, OpenPR, TransientGhError, pr_labels
 from .protocol import PLUS1, READY, WAITING, Verdict, evaluate
 
 log = logging.getLogger("badcat")
@@ -209,7 +209,7 @@ class Watcher:
         self.merge = merge is not None
         self.errors = 0
         self.last_error: Optional[str] = None
-        self.rejected: dict = {}  # PR number -> state at the last merge rejection
+        self.rejected: dict = {}  # PR number -> state at the last deterministic merge rejection
 
     def run_forever(self) -> None:
         while True:
@@ -326,6 +326,13 @@ class Watcher:
             return  # same rejected situation: no repeated requests
         try:
             self.client.merge(pr.number, pr.head)
+        except TransientGhError as exc:
+            if self._merged_now(pr.number):  # e.g. a 502 after GitHub already merged it
+                return
+            # Outcome unknown or temporarily refused: nothing is recorded, so the next poll
+            # re-verifies every gate from GitHub and retries the same HEAD. Raising lets the
+            # per-PR guard log it once and apply the usual error backoff.
+            raise GhError(f"merge failed temporarily, will re-verify and retry: {exc}") from exc
         except GhError as exc:
             if self._merged_now(pr.number):  # e.g. a timeout after GitHub already merged it
                 return
