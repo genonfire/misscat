@@ -52,7 +52,7 @@ from urllib.parse import urlsplit
 
 import yaml
 
-__version__ = "1.7.1"
+__version__ = "1.7.2"
 
 log = logging.getLogger("misscat")
 # Reviewer tool activity (exec/MCP/tool/web search). Successful lines show only with --loud;

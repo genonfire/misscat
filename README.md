@@ -373,6 +373,8 @@ badcat . --merge=2                         # merge after +1 then +2 (batch-label
 badcat . --merge --trusted-reviewer luna   # trust reviews by this login (default: your gh user)
 ```
 
+If a merge request fails temporarily (a GitHub 5xx, a rate limit, a timeout or a dropped connection), BadCat first checks whether GitHub merged the PR anyway; if not, it logs the failure once and, on the next poll, re-verifies every gate (reviews, labels, exact-HEAD CI, mergeability) before retrying the same HEAD. A deterministic refusal such as a draft or branch protection (HTTP 405) or a stale SHA (HTTP 409) is reported once and not re-requested until the PR's state changes.
+
 A PR labeled exactly `no-review` is never eligible: BadCat reports no "ready to merge" for it and never merges it, whatever its reviews or `batch`/`urgent` labels. Labels are re-read from GitHub just before a merge, so adding `no-review` after the PR was listed still blocks the merge; removing the label restores eligibility. The read-only `badcat-host` Chrome host likewise emits no `+1` event for a `no-review` PR (like a draft), and emits one again once the label is removed. MissCat skips `no-review` PRs too.
 
 A review counts only if it is a submitted `COMMENTED` review by a trusted login whose body starts with:
