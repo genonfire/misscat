@@ -17,6 +17,7 @@ reviewer:
   #   - -c
   #   - model_reasoning_effort=medium
 
+  lean: true   # token-saving Claude/Codex options; set `lean: false` in a profile to opt out
   provider: codex
   model: gpt-6-luna
   args:

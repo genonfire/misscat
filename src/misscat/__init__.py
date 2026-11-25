@@ -52,7 +52,7 @@ from urllib.parse import urlsplit
 
 import yaml
 
-__version__ = "1.7.2"
+__version__ = "1.7.3"
 
 log = logging.getLogger("misscat")
 # Reviewer tool activity (exec/MCP/tool/web search). Successful lines show only with --loud;
@@ -136,6 +136,7 @@ class Settings:
     active: tuple[float, ...]
     include_drafts: bool
     args: tuple[str, ...] = ()  # reviewer.args: extra reviewer CLI options, passed through untouched
+    lean: bool = False  # reviewer.lean: token-saving Claude/Codex options (bundled default: true)
 
 
 def _schedule(value, name: str) -> tuple[float, ...]:
@@ -152,6 +153,7 @@ def build_settings(cfg: dict, providers: tuple[str, ...] = PROVIDERS) -> Setting
         reviewer = cfg["reviewer"]
         provider, model = reviewer["provider"], reviewer["model"]
         args = reviewer["args"]
+        lean = reviewer.get("lean", False)
         prompt, include_drafts = cfg["prompt"], cfg["review"]["include_drafts"]
         idle, active = cfg["watch"]["idle"], cfg["watch"]["active"]
     except (KeyError, TypeError, AttributeError) as exc:
@@ -162,6 +164,8 @@ def build_settings(cfg: dict, providers: tuple[str, ...] = PROVIDERS) -> Setting
         raise ConfigError("reviewer.model must be a non-empty string")
     if not isinstance(args, list) or not all(isinstance(a, str) and a for a in args):
         raise ConfigError("reviewer.args must be a list of non-empty strings (quote numbers)")
+    if not isinstance(lean, bool):
+        raise ConfigError("reviewer.lean must be true or false")
     if not isinstance(prompt, str) or not prompt.strip():
         raise ConfigError("prompt must be a non-empty string")
     if not isinstance(include_drafts, bool):
@@ -174,6 +178,7 @@ def build_settings(cfg: dict, providers: tuple[str, ...] = PROVIDERS) -> Setting
         active=_schedule(active, "watch.active"),
         include_drafts=include_drafts,
         args=tuple(args),
+        lean=lean,
     )
 
 
@@ -841,6 +846,69 @@ COMMANDS: dict[str, Callable[[str, str, list[str]], list[str]]] = {
 }
 
 
+# reviewer.lean: token-saving options, applied before reviewer.args (so a profile's own
+# `-c`/`--enable` still wins) and only when the installed CLI supports them. Gemini and
+# OpenCode get none. AGENTS.md/CLAUDE.md loading, default tools, auth and permissions stay.
+CLAUDE_LEAN_ENV = {"FORCE_PROMPT_CACHING_5M": "1"}  # 5-minute cache writes cost 1.25x, not 2x
+CLAUDE_LEAN_FLAGS = (
+    "--strict-mcp-config",  # no user MCP server tool schemas; reviews use the gh CLI
+    "--exclude-dynamic-system-prompt-sections",  # system prompt cache shared across cats/HEADs
+)
+CODEX_LEAN_CONFIG = ('web_search="disabled"', "skills.include_instructions=false")
+CODEX_LEAN_FEATURES = (
+    "apps", "plugins", "remote_plugin", "multi_agent", "computer_use", "browser_use",
+    "in_app_browser", "image_generation", "tool_suggest", "sleep_tool",
+)
+_lean_cache: dict[str, tuple[str, ...]] = {}
+_lean_lock = threading.Lock()
+
+
+def _probe(cmd: list[str]) -> str | None:
+    """Stdout of a quick capability check, or None. Never raises."""
+    try:
+        result = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def _detect_lean_args(provider: str) -> tuple[str, ...]:
+    if provider == "claude":
+        out = _probe(["claude", "--help"])
+        if out is None:
+            return ()
+        return tuple(f for f in CLAUDE_LEAN_FLAGS
+                     if re.search(rf"(?<![\w-]){re.escape(f)}(?![\w-])", out))
+    out = _probe(["codex", "features", "list"])
+    if out is None:
+        return ()
+    known = {parts[0] for parts in map(str.split, out.splitlines())
+             if len(parts) >= 3 and "removed" not in parts[1:-1]}
+    args: list[str] = []
+    for item in CODEX_LEAN_CONFIG:
+        args += ["-c", item]
+    for name in CODEX_LEAN_FEATURES:
+        if name in known:
+            args += ["-c", f"features.{name}=false"]  # unlike --disable, a later -c/--enable wins
+    return tuple(args)
+
+
+def lean_args(provider: str) -> tuple[str, ...]:
+    """Supported lean options for `provider`, checked once per process."""
+    if provider not in ("claude", "codex"):
+        return ()
+    with _lean_lock:
+        if provider not in _lean_cache:
+            args = _detect_lean_args(provider)
+            if args:
+                activity_log.info("lean: %s %s", provider, " ".join(args))
+            else:
+                log.warning("lean: no supported %s options found; reviewing without them", provider)
+            _lean_cache[provider] = args
+        return _lean_cache[provider]
+
+
 def _short(value, limit: int = 120) -> str:
     """Collapse a value to one short log line."""
     text = " ".join(str(value or "").split())
@@ -869,11 +937,14 @@ def _log_codex_event(event: dict) -> None:
     if kind == "turn.completed":
         usage = event.get("usage") or {}
         if usage:
-            log.info(
-                "reviewer: turn done (input=%s, output=%s)",
-                usage.get("input_tokens", "?"),
-                usage.get("output_tokens", "?"),
-            )
+            details = [f"input={usage.get('input_tokens', '?')}"]
+            inp, cached = usage.get("input_tokens"), usage.get("cached_input_tokens")
+            if isinstance(cached, int):
+                details.append(f"cached={cached}")
+                if isinstance(inp, int):
+                    details.append(f"uncached={inp - cached}")
+            details.append(f"output={usage.get('output_tokens', '?')}")
+            log.info("reviewer: turn done (%s)", ", ".join(details))
         else:
             log.info("reviewer: turn done")
         return
@@ -967,6 +1038,11 @@ def _log_claude_event(event: dict, tool_names: dict[str, str]) -> None:
         details = []
         if turns is not None:
             details.append(f"turns={turns}")
+        usage = event.get("usage") or {}
+        for key, label in (("input_tokens", "input"), ("cache_creation_input_tokens", "cache write"),
+                           ("cache_read_input_tokens", "cache read"), ("output_tokens", "output")):
+            if isinstance(usage.get(key), int):
+                details.append(f"{label}={usage[key]}")
         if isinstance(cost, (int, float)):
             details.append(f"cost=${cost:.4f}")
         log.info("reviewer: claude done%s", f" ({', '.join(details)})" if details else "")
@@ -1002,12 +1078,14 @@ def _log_gemini_event(event: dict) -> None:
             log.info("reviewer: done")
 
 
-def _run_structured_reviewer(provider: str, cmd: list[str], workspace: Path) -> bool:
+def _run_structured_reviewer(provider: str, cmd: list[str], workspace: Path,
+                             env: dict[str, str] | None = None) -> bool:
     """Stream reviewer JSONL and expose only compact progress events."""
     try:
         proc = subprocess.Popen(
             cmd, cwd=workspace, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True, bufsize=1,
+            env=None if env is None else {**os.environ, **env},
         )
     except OSError as exc:
         log.error("cannot start %s: %s", cmd[0], exc)
@@ -1191,12 +1269,14 @@ def build_prompt(settings: Settings, repo: str, pr: PR) -> str:
 
 def run_cli_reviewer(settings: Settings, repo: str, pr: PR, workspace: Path) -> bool:
     """Run the reviewer CLI in the prepared cat worktree and wait. True only on a clean exit."""
+    lean = lean_args(settings.provider) if settings.lean else ()
     cmd = COMMANDS[settings.provider](
         settings.model,
         build_prompt(settings, repo, pr),
-        list(settings.args),
+        [*lean, *settings.args],
     )
-    return _run_structured_reviewer(settings.provider, cmd, workspace)
+    env = CLAUDE_LEAN_ENV if settings.lean and settings.provider == "claude" else None
+    return _run_structured_reviewer(settings.provider, cmd, workspace, env)
 
 
 class CliReviewer:
