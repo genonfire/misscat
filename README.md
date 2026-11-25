@@ -274,6 +274,7 @@ reviewer:
   #   - --allowedTools
   #   - "Bash(gh *)"
 
+  lean: true
   provider: codex
   model: gpt-6-luna
   args:
@@ -320,6 +321,19 @@ The selected local profile overrides the bundled defaults. A profile may also de
 When creating a local profile, use `default.yml` as the reference and specify `provider`, `model`, and `args` explicitly for that reviewer CLI. Do not rely on `args` inherited from a different provider.
 
 The `args` field under `reviewer` is passed to the selected reviewer CLI unchanged.
+
+### Token-saving lean mode
+
+`reviewer.lean` is `true` in the bundled defaults, so every profile uses it without editing your profile files. It trims the fixed prompt the Claude and Codex CLIs send on every run. The model, reasoning effort, prompt, default tools, permissions, authentication and the repository's AGENTS.md/CLAUDE.md loading are unchanged. Gemini and OpenCode are not affected.
+
+- **Claude**: runs with `FORCE_PROMPT_CACHING_5M=1` (5-minute prompt cache; cache writes cost 1.25× input instead of 2×), `--strict-mcp-config` (your configured MCP servers are not loaded; reviews use the `gh` CLI), and `--exclude-dynamic-system-prompt-sections` (the system prompt cache is shared across cats and PR HEADs).
+- **Codex**: `-c web_search="disabled"`, `-c skills.include_instructions=false`, and `-c features.<name>=false` for `apps`, `plugins`, `remote_plugin`, `multi_agent`, `computer_use`, `browser_use`, `in_app_browser`, `image_generation`, `tool_suggest` and `sleep_tool`.
+
+MissCat checks once per process which of these the installed CLI supports (`claude --help`, `codex features list`) and applies only those. If the check fails, it logs a warning and reviews without them. Lean options come before `reviewer.args`, so a profile can still override a Codex setting with its own `-c key=value` or `--enable <feature>`.
+
+To opt out, set `lean: false` under `reviewer` in a profile; the reviewer command is then exactly what it was before lean mode. Codex's AGENTS.md loading is kept on purpose; to turn it off too, add `-c` and `project_doc_max_bytes=0` to that profile's `args`.
+
+Completed reviews log the token usage the CLI reports: Claude shows input, cache write, cache read, output and cost; Codex shows input, cached, uncached and output.
 
 Reviewed state is stored per repository and keyed by PR and HEAD SHA, whichever profile ran the review (the profile is kept in each record as metadata only). A HEAD reviewed with `luna` is therefore not reviewed again by `sol` or `opencode`; a new HEAD is.
 
